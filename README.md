@@ -15,7 +15,7 @@ npx tsx apps/cli/src/index.ts serve --config ./lark-agent.toml
 
 `shadow` is the default. It records inbound messages without replying or invoking host capabilities. Change `mode` to `active` only after the Feishu listener and approval recipient pass `doctor`.
 
-The runtime binds only to `127.0.0.1`. Its SQLite database, attachments, replies, approvals, and Codex thread state stay on the deploying user's computer. Every external host write creates a Feishu approval record and card. Trusted senders, approval recipient, prompts, and message settings are persisted in SQLite after their initial deployment defaults are applied.
+The runtime binds only to `127.0.0.1`. Its SQLite database, attachments, replies, approvals, and Codex thread state stay on the deploying user's computer. Host writes follow the configured trust and approval policy and retain execution/authorization records; owner exemptions or automatic turn approval may avoid an interactive approval card. Trusted senders, approval recipient, prompts, and message settings are persisted in SQLite after their initial deployment defaults are applied.
 
 Keep the control plane local; it is not a multi-user or internet-facing server.
 Host capability registration and invocation require a nonempty runtime token
@@ -38,7 +38,7 @@ Do not run individual `*.test.ts` files directly or set `LARK_AGENT_DATABASE` fo
 
 ## Forge Host Integration
 
-Run Forge with `LARK_AGENT_URL=http://127.0.0.1:4780`. Forge registers private PR review, issue triage, todo, deployment-inspection, and deployment capabilities with the standalone runtime. Its message page and listener switch proxy the standalone runtime; it does not start the legacy listener while this URL is configured.
+Run Forge with `LARK_AGENT_URL=http://127.0.0.1:4780` and the shared runtime/host tokens. Forge registers PR review, issue triage and todo capabilities; deployment tools are optional and require the host's local adapter configuration. Its message page and listener switch proxy the standalone runtime; it does not start the legacy listener while this URL is configured.
 
 Registered host capabilities are exposed to each Codex thread through App Server Dynamic Tools. The tool callback carries the current thread and turn, so the runtime can bind the call to the exact Feishu message and trust scope before invoking the host. Text and media deliveries are durable and idempotent; failed media remains in `lark_delivery_outbox` for bounded retry.
 
@@ -55,7 +55,7 @@ Conversation summaries include `chatType`, `chatId` and `codexSessionIds`.
 Conversation personas are stored per Feishu `chat_id` in the runtime database.
 GET/PUT `/v1/chats/:chatId/persona` reads/saves a default or custom persona;
 POST `/v1/chats/:chatId/persona/preview` previews without saving. These routes use
-runtime-token authentication. A custom persona replaces the entire global default
+runtime-token authentication when a token is configured. A custom persona replaces the entire global default
 persona in the model input; the two style prompts are never injected together.
 Factuality, complete answers, progress privacy, permissions, approvals and tool
 protocols remain independent of persona selection. New turns capture the current
