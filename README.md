@@ -4,6 +4,21 @@ Standalone local runtime for Feishu conversations, Codex turns, approvals, deliv
 
 Requires Node.js 24, `codex`, `lark-cli`, and a configured Feishu bot identity.
 
+## Relationship to Agent Forge
+
+Lark Agent is the standalone bot runtime; **[Agent Forge](https://github.com/One-h/agent-forge)**
+is its optional web management console and a host for Todo and Git/Gitea workflows.
+You can run either project alone. For both, install them in sibling directories,
+configure shared runtime/host tokens, start Lark Agent on `4780`, then start Forge
+on `4731/4732/4734`. Each has its own dependencies, process and SQLite database;
+Forge's `npm run dev` does not install or launch this runtime.
+
+**Full-suite installation:** follow the
+[Agent Forge complete installation walkthrough](https://github.com/One-h/agent-forge/blob/main/docs/INSTALL.md#full-suite).
+It covers protected configuration, bot events/card callbacks, both shared tokens,
+activation and real-message acceptance. For bot-only use, continue below and
+leave `host_url` unset; Forge and its deployment adapter are not required.
+
 ## Start
 
 ```bash
