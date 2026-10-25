@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@lark-agent/core": ["packages/core/src/index.ts"],
+      "@lark-agent/protocol": ["packages/protocol/src/index.ts"],
+      "@lark-agent/adapter-sqlite": ["packages/adapter-sqlite/src/index.ts"],
+      "@lark-agent/adapter-lark-cli": ["packages/adapter-lark-cli/src/index.ts"],
+      "@lark-agent/adapter-codex-app-server": ["packages/adapter-codex-app-server/src/index.ts"],
+      "@lark-agent/conversation-runtime": ["packages/conversation-runtime/src/index.ts"],
+      "@lark-agent/sdk": ["packages/sdk/src/index.ts"]
+    }
+  },
+  "include": ["apps/**/*.ts", "packages/**/*.ts"]
+}

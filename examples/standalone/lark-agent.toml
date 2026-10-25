@@ -1,0 +1,8 @@
+mode = "shadow"
+database = "./lark-agent.sqlite"
+port = 4780
+listen = true
+workspace_root = "/absolute/path/to/your/workspace"
+approver_id = "ou_your_open_id"
+trusted_senders = "ou_your_open_id"
+# host_url = "http://127.0.0.1:4731"

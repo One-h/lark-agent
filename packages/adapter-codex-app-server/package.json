@@ -1,0 +1,7 @@
+{
+  "name": "@lark-agent/adapter-codex-app-server",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": "./src/index.ts"
+}

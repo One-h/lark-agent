@@ -1,0 +1,10 @@
+{
+  "name": "@lark-agent/adapter-lark-cli",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@lark-agent/core": "0.1.0"
+  }
+}

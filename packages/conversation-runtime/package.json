@@ -1,0 +1,12 @@
+{
+  "name": "@lark-agent/conversation-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@lark-agent/adapter-codex-app-server": "0.1.0",
+    "@lark-agent/adapter-lark-cli": "0.1.0",
+    "better-sqlite3": "^11.10.0"
+  }
+}
