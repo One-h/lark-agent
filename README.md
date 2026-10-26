@@ -91,6 +91,14 @@ returned by the latest search. Group history lookup is limited to trusted
 senders; private chats stay within that chat. At most four historical images
 can be opened per turn. Download failures are recorded rather than presented
 as images the model has seen.
+Generated images and documents use the same MCP service's `attach_files` tool.
+It validates and snapshots files under the current message's `output/` directory;
+registration does not send. On normal turn completion, the existing durable
+outbox delivers image groups and individual documents after the final text
+receipt, or as an attachment-only reply. Failed/cancelled turns do not send staged
+files. Valid legacy media tags remain compatible; malformed tags are reported
+rather than forwarded as reply text. See [the attachment tool contract](docs/attachment-tools.md)
+for scope, limits, retries and completion signals.
 The hash tracks the captured default prompt, even when custom mode omits its text.
 Existing saved prompt overrides are preserved and used only in default mode;
 do not store authorization requirements in the editable persona field.

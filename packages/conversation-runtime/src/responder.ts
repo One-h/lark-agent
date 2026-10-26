@@ -19,6 +19,8 @@ import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRe
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions } from "./completionReactions.js";
+import { attachmentDigest, attachmentToolPrompt, matchingAttachmentState, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment,
+  type AttachmentState, type RegisteredAttachment, type ReplyMedia } from "./replyAttachments.js";
 
 const legacyLongRunningProgressText = "还在处理，暂时没收口。我会继续跑到拿到完整结果，再回来给最终结论。";
 const untrustedReplyFallbackText = "收到。建议按分配处理；已处理的在 issue 里补充对应 PR/commit 或版本并 @ 创建人确认后再关闭；不确定的先补充现象、复现和验证结果，避免误关。";
@@ -94,13 +96,7 @@ export type LarkCodexUserInput =
   | { type: "text"; text: string }
   | { type: "localImage"; path: string };
 
-type LarkReplyMedia = {
-  relativePath: string;
-  absolutePath: string;
-  kind: "image" | "file";
-  size: number;
-  stickerId?: string;
-};
+type LarkReplyMedia = ReplyMedia;
 
 type LarkHostCapability = {
   id: string;
@@ -167,6 +163,7 @@ export function larkMessageTopicKey(
 type PreparedLarkCodexMessage = {
   executionConfig?: LarkExecutionConfig;
   stickerTools?: StickerToolState;
+  attachmentTools?: AttachmentState;
   stickerContextToken: string;
   historyImages: HistoryImageState;
   conversationStyle: ConversationStyle;
@@ -608,9 +605,7 @@ export function sanitizeLarkCodexReply(answer: string, trustedSender: boolean): 
   return cleaned;
 }
 
-export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: string | null = null): { text: string; media: LarkReplyMedia[]; errors: string[]; stickerIds: string[] } {
-  const outputDir = path.join(taskDir, "output");
-  const realOutputDir = fs.existsSync(outputDir) ? fs.realpathSync(outputDir) : outputDir;
+export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: string | null = null, registered?: RegisteredAttachment[]): { text: string; media: LarkReplyMedia[]; errors: string[]; stickerIds: string[] } {
   const media: LarkReplyMedia[] = [];
   const errors: string[] = [];
   const stickerResult = stageLarkStickerSelection(answer, taskDir, chatId);
@@ -620,6 +615,7 @@ export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: s
   const blocks = [...text.matchAll(/<(?:lark|forge)-media>([\s\S]*?)<\/(?:lark|forge)-media>/g)];
   for (const block of blocks) {
     text = text.replace(block[0], "");
+    if (registered !== undefined) continue;
     try {
       const parsed = JSON.parse(block[1]) as { files?: unknown };
       if (!Array.isArray(parsed.files) || parsed.files.length === 0) {
@@ -630,37 +626,26 @@ export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: s
         const requestedPath = entry && typeof entry === "object" && !Array.isArray(entry)
           ? (entry as { path?: unknown }).path
           : null;
-        if (typeof requestedPath !== "string" || !requestedPath.trim() || path.isAbsolute(requestedPath)) {
+        if (typeof requestedPath !== "string") {
           errors.push("附件路径必须是 output 目录下的相对路径");
           continue;
         }
-        const candidate = path.resolve(outputDir, requestedPath);
-        if (!candidate.startsWith(`${outputDir}${path.sep}`) || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
-          errors.push(`附件不存在或不在 output 目录中：${requestedPath}`);
-          continue;
-        }
-        const realCandidate = fs.realpathSync(candidate);
-        if (!realCandidate.startsWith(`${realOutputDir}${path.sep}`)) {
-          errors.push(`附件路径不安全：${requestedPath}`);
-          continue;
-        }
-        const size = fs.statSync(realCandidate).size;
-        const kind = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].includes(path.extname(realCandidate).toLowerCase()) ? "image" : "file";
-        const maxSize = kind === "image" ? 10 * 1024 * 1024 : 50 * 1024 * 1024;
-        if (size <= 0 || size > maxSize) {
-          errors.push(`附件大小不符合限制：${requestedPath}`);
-          continue;
-        }
-        media.push({
-          relativePath: path.relative(taskDir, candidate),
-          absolutePath: realCandidate,
-          kind,
-          size
-        });
+        try {
+          const resolved = resolveReplyAttachment(taskDir, requestedPath);
+          if (!media.some(file => file.absolutePath === resolved.absolutePath)) media.push(resolved);
+        } catch (error) { errors.push(error instanceof Error ? error.message : "附件路径无效"); }
       }
-    } catch {
-      errors.push("附件声明不是有效 JSON");
+    } catch (error) {
+      errors.push(error instanceof SyntaxError ? "附件声明不是有效 JSON" : error instanceof Error ? error.message : "附件声明无效");
     }
+  }
+  if (/<(?:lark|forge)-media\b/i.test(text)) {
+    text = text.replace(/<(?:lark|forge)-media\b[\s\S]*$/i, "");
+    if (registered === undefined) errors.push("附件声明不完整，请通过 attach_files 登记");
+  }
+  for (const file of registered ?? []) {
+    try { media.push(validateRegisteredAttachment(taskDir, file)); }
+    catch (error) { errors.push(error instanceof Error ? error.message : "附件校验失败"); }
   }
   return { text: text.trim(), media, errors, stickerIds: stickerResult.stickerIds };
 }
@@ -685,9 +670,7 @@ export function buildLarkCodexPrompt(
   const spontaneousParticipationInstruction = message.reply_trigger === "spontaneous"
     ? "随机参与：这条群消息没有 @ 你，系统随机让你冒出来参与。不要假装对方在询问你；结合最近群聊说 1–2 句短评、吐槽或接话即可，语气自然，别写分析报告。"
     : "";
-  const mediaOutputInstruction = attachments.mediaOutputDirectory
-    ? `附件输出：如需向飞书发送图片、文档或其他文件，只能把可公开发送的文件写入 ${attachments.mediaOutputDirectory}。最终答复末尾添加 <lark-media>{"files":[{"path":"文件名或子路径"}]}</lark-media>；path 相对该 output 目录。系统会校验并发送，禁止声明其他本机路径。`
-    : "";
+  const mediaOutputInstruction = attachmentToolPrompt(attachments.stickerContextToken, attachments.mediaOutputDirectory);
   const stickerInstruction = larkStickerPrompt(attachments.stickerContextToken, { chatId: message.chat_id });
   const historyImageInstruction = attachments.stickerContextToken && historyImagesAllowed(attachments.trustedSender ?? false, message.chat_type ?? null)
     ? `需查看未附在本轮的历史图片时，先调用 lark_stickers MCP 的 history_images_search 获取元数据，再用候选 localId 和图片序号调用 history_images_open 读取实际图片。仅限当前私聊/群聊或原生话题，每轮最多 4 张；找最近图片可省略 query，关键词只匹配消息文字，不识别图中文字。本轮 context_token=${attachments.stickerContextToken}。`
@@ -879,9 +862,7 @@ export function buildLarkCodexDeltaPrompt(
   const spontaneousParticipationInstruction = message.reply_trigger === "spontaneous"
     ? "这是一条未 @ 你的群消息，系统随机让你参与。不要假装被提问；只需结合群聊上下文自然接 1–2 句。"
     : "";
-  const mediaOutputInstruction = attachments.mediaOutputDirectory
-    ? `如需发送媒体，仅可使用 ${attachments.mediaOutputDirectory} 中生成的文件，并在最终答复末尾添加 <lark-media>{"files":[{"path":"文件名或子路径"}]}</lark-media>。`
-    : "";
+  const mediaOutputInstruction = attachmentToolPrompt(attachments.stickerContextToken, attachments.mediaOutputDirectory);
   const stickerInstruction = larkStickerPrompt(attachments.stickerContextToken, { chatId: message.chat_id });
   const historyImageInstruction = attachments.stickerContextToken && historyImagesAllowed(attachments.trustedSender ?? false, message.chat_type ?? null)
     ? `需看历史图片时先用 lark_stickers MCP 的 history_images_search 找候选，再用 history_images_open 读取像素；仅当前会话/话题，每轮最多 4 张。找最近图片可省略 query。本轮 context_token=${attachments.stickerContextToken}。`
@@ -1042,6 +1023,50 @@ export function retryPendingLarkTextReplies(limit = 10): number {
     ORDER BY reply_next_attempt_at, id LIMIT ?
   `).all(nowIso(), limit) as Array<{ id: number }>;
   for (const row of rows) deliverQueuedLarkTextReply(row.id);
+  return rows.length + retryLarkMediaFailureNotices(limit);
+}
+
+function queueLarkMediaFailureNotice(messageId: number, platformMessageId: string, turnId: string | undefined, seed: string): void {
+  const now = nowIso();
+  db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'media-notice',?,?,?,?)")
+    .run(messageId, JSON.stringify({ messageId: platformMessageId, turnId }), larkReplyIdempotencyKey("mediafail", turnId ? `${turnId}:${messageId}` : seed), now, now);
+}
+
+function retryLarkMediaFailureNotices(limit: number): number {
+  if (config.runtimeMode !== "active") return 0;
+  const rows = db.prepare("SELECT id,lark_message_id,payload,idempotency_key,attempts FROM lark_delivery_outbox WHERE kind='media-notice' AND status='pending' AND next_attempt_at<=? ORDER BY id LIMIT ?")
+    .all(nowIso(), limit) as Array<{ id: number; lark_message_id: number; payload: string; idempotency_key: string; attempts: number }>;
+  for (const row of rows) {
+    if ((db.prepare("SELECT status FROM lark_delivery_outbox WHERE id=?").get(row.id) as { status?: string } | undefined)?.status !== "pending") continue;
+    let payload: { messageId: string; turnId?: string };
+    try {
+      payload = JSON.parse(row.payload);
+      if (!payload || typeof payload.messageId !== "string") throw new Error("Invalid notification");
+    } catch {
+      db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Invalid attachment failure notice' WHERE id=?").run(row.id);
+      continue;
+    }
+    const message = db.prepare("SELECT message_id,chat_id,chat_type,sender_id,codex_turn_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as LarkMessageRow | undefined;
+    if (!message || message.message_id !== payload.messageId || payload.turnId && message.codex_turn_id !== payload.turnId) {
+      db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Attachment failure notice was superseded' WHERE id=?").run(row.id);
+      continue;
+    }
+    const text = formatLarkFinalReply(message, "本次有附件未能送达，不能视为已交付；请重试附件发送。已生成的文件不会因此删除。");
+    let sent;
+    try { sent = larkTextReplySender(payload.messageId, text, row.idempotency_key); }
+    catch { sent = { ok: false as const, error: "Attachment failure notification could not be delivered" }; }
+    if (sent.ok) {
+      db.prepare("UPDATE lark_delivery_outbox SET status='sent',sent_at=?,last_error=NULL WHERE id=?").run(nowIso(), row.id);
+      if (sent.messageId) try {
+        recordOutboundLarkMessage({ messageId: sent.messageId, chatId: sent.chatId ?? message.chat_id,
+          chatType: message.chat_type, recipientId: message.sender_id, content: text, replyToMessageId: payload.messageId, source: "reply" });
+      } catch { console.warn(`attachment_failure_notice_record_failed messageId=${row.lark_message_id}`); }
+    } else {
+      const attempts = row.attempts + 1;
+      db.prepare("UPDATE lark_delivery_outbox SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?")
+        .run(attempts >= 8 ? "failed" : "pending", attempts, new Date(Date.now() + retryDelayMs(attempts)).toISOString(), sent.error, row.id);
+    }
+  }
   return rows.length;
 }
 
@@ -1054,7 +1079,8 @@ type LarkDeliveryOutboxRow = {
   attempts: number;
 };
 
-type LarkDeliveryPayload = { messageId: string; taskDir: string; paths: string[]; stickerIds?: string[]; chatId?: string | null; afterTextKey?: string };
+type LarkDeliveryPayload = { messageId: string; taskDir: string; paths: string[]; stickerIds?: string[]; chatId?: string | null;
+  turnId?: string; afterTextKey?: string; afterTextMessageId?: number; expectedFiles?: Array<{ path: string; sha256: string }> };
 
 export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = larkMediaReplySender): { ok: boolean; sentCount: number; error?: string } {
   const current = db.prepare("SELECT status FROM lark_delivery_outbox WHERE id=?").get(row.id) as { status: string } | undefined;
@@ -1066,9 +1092,16 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
     db.prepare("UPDATE lark_delivery_outbox SET status='failed', attempts=attempts+1, last_error='Invalid delivery payload', next_attempt_at=? WHERE id=?").run(nowIso(), row.id);
     return { ok: false, sentCount: 0, error: "Invalid delivery payload" };
   }
+  if (payload.turnId) {
+    const currentMessage = db.prepare("SELECT codex_turn_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as { codex_turn_id: string } | undefined;
+    if (currentMessage?.codex_turn_id !== payload.turnId) {
+      db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Attachment delivery was superseded' WHERE id=?").run(row.id);
+      return { ok: false, sentCount: 0, error: "Attachment delivery was superseded" };
+    }
+  }
   if (payload.afterTextKey) {
-    const text = db.prepare("SELECT reply_delivery_key,reply_sent_at,reply_status FROM lark_messages WHERE id=?").get(row.lark_message_id) as { reply_delivery_key: string | null; reply_sent_at: string | null; reply_status: string } | undefined;
-    if (!text || text.reply_delivery_key !== payload.afterTextKey || (!text.reply_sent_at && text.reply_status === "failed")) {
+    const text = db.prepare("SELECT reply_delivery_key,reply_sent_at,reply_status,codex_turn_id FROM lark_messages WHERE id=?").get(payload.afterTextMessageId ?? row.lark_message_id) as { reply_delivery_key: string | null; reply_sent_at: string | null; reply_status: string; codex_turn_id: string | null } | undefined;
+    if (!text || payload.turnId && text.codex_turn_id !== payload.turnId || text.reply_delivery_key !== payload.afterTextKey || (!text.reply_sent_at && text.reply_status === "failed")) {
       db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Final text was not delivered or was superseded' WHERE id=?").run(row.id);
       return { ok: false, sentCount: 0, error: "Final text was not delivered or was superseded" };
     }
@@ -1077,9 +1110,26 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
       return { ok: true, sentCount: 0 };
     }
   }
-  const sent = row.kind === "image-post"
-    ? sendLarkImagePostReply(payload.messageId, payload.taskDir, payload.paths, row.idempotency_key)
-    : mediaSender(payload.messageId, payload.taskDir, payload.paths[0], row.idempotency_key);
+  try {
+    for (const file of payload.expectedFiles ?? []) {
+      if (!payload.paths.includes(file.path)) throw new Error("Invalid registered attachment");
+      const resolved = resolveReplyAttachment(payload.taskDir, path.relative(path.resolve(payload.taskDir, "output"), path.resolve(payload.taskDir, file.path)));
+      if (attachmentDigest(resolved.absolutePath, (resolved.kind === "image" ? 10 : 50) * 1024 * 1024) !== file.sha256) throw new Error("Registered attachment was changed");
+    }
+  } catch {
+    db.transaction(() => {
+      db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Registered attachment failed integrity validation' WHERE id=?").run(row.id);
+      db.prepare("UPDATE lark_messages SET reply_status=CASE WHEN reply_status='sent' THEN reply_status ELSE 'failed' END,reply_error='Registered attachment failed integrity validation' WHERE id=?").run(row.lark_message_id);
+      queueLarkMediaFailureNotice(row.lark_message_id, payload.messageId, payload.turnId, row.idempotency_key);
+    })();
+    return { ok: false, sentCount: 0, error: "Registered attachment failed integrity validation" };
+  }
+  let sent: { ok: true; imageCount?: number } | { ok: false; error: string };
+  try {
+    sent = row.kind === "image-post"
+      ? sendLarkImagePostReply(payload.messageId, payload.taskDir, payload.paths, row.idempotency_key)
+      : mediaSender(payload.messageId, payload.taskDir, payload.paths[0], row.idempotency_key);
+  } catch { sent = { ok: false, error: "Attachment transport failed" }; }
   if (sent.ok) {
     const sentAt = nowIso();
     db.prepare("UPDATE lark_delivery_outbox SET status='sent', sent_at=?, last_error=NULL, next_attempt_at=? WHERE id=?").run(sentAt, sentAt, row.id);
@@ -1088,8 +1138,11 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
   }
   const attempts = row.attempts + 1;
   const terminal = attempts >= 8;
-  db.prepare("UPDATE lark_delivery_outbox SET status=?, attempts=?, next_attempt_at=?, last_error=? WHERE id=?").run(terminal ? "failed" : "pending", attempts, terminal ? nowIso() : new Date(Date.now() + retryDelayMs(attempts)).toISOString(), sent.error, row.id);
-  db.prepare("UPDATE lark_messages SET reply_status=CASE WHEN reply_status='sent' THEN reply_status ELSE ? END, reply_error=? WHERE id=?").run(terminal ? "failed" : "pending", sent.error, row.lark_message_id);
+  db.transaction(() => {
+    db.prepare("UPDATE lark_delivery_outbox SET status=?, attempts=?, next_attempt_at=?, last_error=? WHERE id=?").run(terminal ? "failed" : "pending", attempts, terminal ? nowIso() : new Date(Date.now() + retryDelayMs(attempts)).toISOString(), sent.error, row.id);
+    db.prepare("UPDATE lark_messages SET reply_status=CASE WHEN reply_status='sent' THEN reply_status ELSE ? END, reply_error=? WHERE id=?").run(terminal ? "failed" : "pending", sent.error, row.lark_message_id);
+    if (terminal) queueLarkMediaFailureNotice(row.lark_message_id, payload.messageId, payload.turnId, row.idempotency_key);
+  })();
   return { ok: false, sentCount: 0, error: sent.error };
 }
 
@@ -1103,7 +1156,18 @@ function queueLarkMediaDelivery(larkMessageId: number, kind: LarkDeliveryOutboxR
 export function retryPendingLarkMediaReplies(limit = 10): number {
   const rows = db.prepare("SELECT id, lark_message_id, kind, payload, idempotency_key, attempts FROM lark_delivery_outbox WHERE kind IN ('media','image-post') AND status='pending' AND next_attempt_at <= ? ORDER BY next_attempt_at, id LIMIT ?").all(nowIso(), limit) as LarkDeliveryOutboxRow[];
   for (const row of rows) deliverLarkOutboxRow(row);
+  for (const id of new Set(rows.map(row => row.lark_message_id))) markAttachmentOnlyReplyDelivered(id);
   return rows.length;
+}
+
+function markAttachmentOnlyReplyDelivered(messageId: number): void {
+  const message = db.prepare("SELECT codex_turn_id,reply_delivery_text,reply_status FROM lark_messages WHERE id=?").get(messageId) as { codex_turn_id: string; reply_delivery_text: string | null; reply_status: string } | undefined;
+  if (!message || message.reply_delivery_text !== null || message.reply_status !== "pending") return;
+  const deliveries = db.prepare(`SELECT count(*) AS total, sum(status!='sent') AS outstanding FROM lark_delivery_outbox
+    WHERE lark_message_id=? AND kind IN ('media','image-post')
+      AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.turnId')=?`)
+    .get(messageId, message.codex_turn_id) as { total: number; outstanding: number };
+  if (deliveries.total > 0 && deliveries.outstanding === 0) db.prepare("UPDATE lark_messages SET reply_status='sent',reply_sent_at=?,reply_error=NULL WHERE id=? AND reply_delivery_text IS NULL AND reply_status='pending'").run(nowIso(), messageId);
 }
 
 function larkCodexSessionKey(chatId: string | null, trustedSender: boolean, topicKey: string | null = null, groupChat = false): string | null {
@@ -1864,6 +1928,33 @@ export function suppressPendingLarkExecutionReceipts(): number {
   return db.prepare("UPDATE lark_execution_receipts SET delivery_status='suppressed', delivery_error=NULL, updated_at=? WHERE delivery_status='pending'").run(nowIso()).changes;
 }
 
+function queuePreparedReplyMedia(target: PreparedLarkCodexMessage, turnId: string,
+  mediaResult: ReturnType<typeof extractLarkReplyMedia>, afterTextKey?: string, afterTextMessageId = target.row.id): number[] {
+  const ids: number[] = [];
+  let sentCount = 0;
+  const enqueue = (kind: LarkDeliveryOutboxRow["kind"], media: LarkReplyMedia[], key: string) => {
+    const sent = queueLarkMediaDelivery(target.row.id, kind, {
+      messageId: target.messageId, taskDir: target.taskDir, paths: media.map(file => file.relativePath),
+      stickerIds: media.flatMap(file => file.stickerId ? [file.stickerId] : []), chatId: target.row.chat_id,
+      turnId, afterTextKey, afterTextMessageId,
+      expectedFiles: media.flatMap(file => file.sha256 ? [{ path: file.relativePath, sha256: file.sha256 }] : [])
+    }, key);
+    ids.push(sent.deliveryId);
+    sentCount += sent.sentCount;
+    if (!sent.ok) mediaResult.errors.push(`附件待重试：${sent.error}`);
+  };
+  const images = mediaResult.media.filter(file => file.kind === "image" && !file.stickerId);
+  if (images.length) enqueue("image-post", images, larkReplyIdempotencyKey("codeximages", `${turnId}:${target.messageId}:${images.map(file => file.relativePath).join(",")}`));
+  const individual = mediaResult.media.filter(file => file.kind === "file" || file.stickerId && afterTextKey);
+  for (const [index, media] of individual.entries()) enqueue("media", [media],
+    larkReplyIdempotencyKey(`codexmedia${index + 1}`, `${turnId}:${target.messageId}:${media.relativePath}`));
+  if (mediaResult.media.length || mediaResult.errors.length) fs.writeFileSync(path.join(target.taskDir, "outbound-media.json"), `${JSON.stringify({
+    requested: mediaResult.media.map(file => ({ path: file.relativePath, kind: file.kind, size: file.size, stickerId: file.stickerId ?? null })),
+    stickerIds: mediaResult.stickerIds, errors: mediaResult.errors, sentCount, recordedAt: nowIso()
+  }, null, 2)}\n`);
+  return ids;
+}
+
 function finishRun(
   run: ActiveLarkCodexRun,
   status: LarkMessageRow["codex_status"],
@@ -1892,10 +1983,21 @@ function finishRun(
   const answerWithSticker = finalAnswer && sendReply && !noReplyDecision && status !== "failed"
     ? ensureLarkStickerSelection(finalAnswer, target.row.chat_id, target.row.content ?? "")
     : noReplyDecision ? null : finalAnswer;
-  const mediaResult = answerWithSticker ? extractLarkReplyMedia(answerWithSticker, target.taskDir, target.row.chat_id) : { text: "", media: [], errors: [], stickerIds: [] };
+  const canDeliverAttachments = sendReply && !noReplyDecision && status !== "failed" && !approvalOutcome;
+  const attachmentContext = { threadId: run.threadId, turnId: run.turnId, messageId: target.row.id };
+  const registered = canDeliverAttachments && matchingAttachmentState(target.attachmentTools, attachmentContext) ? registeredReplyMedia(target.attachmentTools, attachmentContext) : undefined;
+  const mediaResult = answerWithSticker || registered?.length ? extractLarkReplyMedia(answerWithSticker ?? "", target.taskDir, target.row.chat_id, registered) : { text: "", media: [], errors: [], stickerIds: [] };
+  const otherAttachments = new Map<PreparedLarkCodexMessage, ReturnType<typeof extractLarkReplyMedia>>();
+  if (canDeliverAttachments) for (const member of run.members.values()) {
+    if (member === target) continue;
+    const files = registeredReplyMedia(member.attachmentTools, { threadId: run.threadId, turnId: run.turnId, messageId: member.row.id });
+    if (files.length) otherAttachments.set(member, extractLarkReplyMedia("", member.taskDir, member.row.chat_id, files));
+  }
+  const validationErrors = [...mediaResult.errors, ...[...otherAttachments.values()].flatMap(result => result.errors)];
   let reply = mediaResult.text ? sanitizeLarkCodexReply(mediaResult.text, run.trustedSender) : null;
-  let mediaSentCount = 0;
-  const mediaDeliveryIds: number[] = [];
+  if (validationErrors.length && sendReply) reply = `${reply ? `${reply}\n\n` : ""}附件校验失败，部分附件未能发送；请重试附件发送。`;
+  let mediaDeliveryIds: number[] = [];
+  const otherDeliveryIds = new Map<PreparedLarkCodexMessage, number[]>();
   let finalStatus = status;
   let finalError = error;
   if (reply) {
@@ -1918,67 +2020,32 @@ function finishRun(
       run.sentReplyKeys.set(target.row.id, newKey);
     }
   }
-  if (sendReply && mediaResult.errors.length > 0) {
+  if (sendReply && validationErrors.length > 0) {
     finalStatus = "failed";
-    finalError = `${finalError ? `${finalError}\n\n` : ""}附件发送失败：${mediaResult.errors.join("；")}`;
+    finalError = `${finalError ? `${finalError}\n\n` : ""}附件发送失败：${validationErrors.join("；")}`;
   }
   if (sendReply) {
-    const stickerImages = mediaResult.media.filter((media) => media.kind === "image" && media.stickerId && finalTextKey);
-    const images = mediaResult.media.filter((media) => media.kind === "image" && !media.stickerId);
-    const files = mediaResult.media.filter((media) => media.kind === "file");
-    if (images.length > 0) {
-      const sent = queueLarkMediaDelivery(
-        target.row.id,
-        "image-post",
-        { messageId: target.messageId, taskDir: target.taskDir, paths: images.map((image) => image.relativePath) },
-        larkReplyIdempotencyKey("codeximages", `${run.turnId}:${target.messageId}:${images.map((image) => image.relativePath).join(",")}`)
-      );
-      mediaDeliveryIds.push(sent.deliveryId);
-      if (!sent.ok) {
-        mediaResult.errors.push(`图片组待重试：${sent.error}`);
-      } else {
-        mediaSentCount += sent.sentCount;
-      }
-    }
-    const individuallySentMedia = [...stickerImages, ...files];
-    for (let index = 0; index < individuallySentMedia.length; index += 1) {
-      const media = individuallySentMedia[index];
-      const sent = queueLarkMediaDelivery(
-        target.row.id,
-        "media",
-        { messageId: target.messageId, taskDir: target.taskDir, paths: [media.relativePath], stickerIds: media.stickerId ? [media.stickerId] : [], chatId: target.row.chat_id, afterTextKey: media.stickerId ? finalTextKey : undefined },
-        larkReplyIdempotencyKey(`codexmedia${index + 1}`, `${run.turnId}:${target.messageId}:${media.relativePath}`)
-      );
-      mediaDeliveryIds.push(sent.deliveryId);
-      if (!sent.ok) {
-        mediaResult.errors.push(`附件待重试（${path.basename(media.relativePath)}）：${sent.error}`);
-        continue;
-      }
-      mediaSentCount += sent.sentCount;
-    }
-    if (mediaResult.media.length > 0 || mediaResult.errors.length > 0) {
-      fs.writeFileSync(path.join(target.taskDir, "outbound-media.json"), `${JSON.stringify({
-        requested: mediaResult.media.map((media) => ({ path: media.relativePath, kind: media.kind, size: media.size, stickerId: media.stickerId ?? null })),
-        stickerIds: mediaResult.stickerIds,
-        errors: mediaResult.errors,
-        sentCount: mediaSentCount,
-        recordedAt: nowIso()
-      }, null, 2)}\n`);
+    mediaDeliveryIds = queuePreparedReplyMedia(target, run.turnId, mediaResult, finalTextKey);
+    for (const [member, result] of otherAttachments) {
+      if (result.errors.length) queueLarkMediaFailureNotice(member.row.id, member.messageId, run.turnId, `${run.turnId}:${member.messageId}:invalid`);
+      otherDeliveryIds.set(member, queuePreparedReplyMedia(member, run.turnId, result, finalTextKey, target.row.id));
     }
   }
   if (finalStatus !== "failed") {
     finalStatus = larkCodexTerminalStatus(
       status,
-      Boolean(reply) || mediaResult.media.length > 0 || mediaSentCount > 0 || run.memberReplies.size > 0 || run.sentReplies.has(target.row.id)
+      Boolean(reply) || mediaResult.media.length > 0 || otherAttachments.size > 0 || run.memberReplies.size > 0 || run.sentReplies.has(target.row.id)
     );
   }
   if (!reply) {
     reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
   }
   updateRunMembers(run, finalStatus, finalError);
+  if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
   if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0) {
-    queueLarkCompletionReactions([...run.members.values()].map(p => ({ id: p.row.id, messageId: p.messageId })),
+    queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
       run.turnId, target.row.id, finalTextKey ?? run.sentReplyKeys.get(target.row.id), mediaDeliveryIds);
+    for (const [member, ids] of otherDeliveryIds) queueLarkCompletionReactions([{ id: member.row.id, messageId: member.messageId }], run.turnId, member.row.id, undefined, ids);
   }
   for (const prepared of run.members.values()) recordExecutionReceipt(prepared.row.id, run.turnId);
   if (sendReply) retryPendingLarkExecutionReceipts();
@@ -2996,6 +3063,17 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
     }
   })();
   return true;
+}
+
+export function runLarkAttachmentMcpTool(contextToken: string, args: Record<string, unknown>) {
+  const run = [...activeLarkCodexRuns.values()].find(candidate => !candidate.settled && responseRunMember(candidate).stickerContextToken === contextToken);
+  if (!run) return { success: false, contentItems: [{ type: "inputText" as const, text: "Attachment context expired or does not belong to the active Lark message" }] };
+  const target = responseRunMember(run);
+  appendPreparedLog(target, { method: "mcp/tool/call", params: { server: "lark_stickers", tool: "attach_files", messageId: target.row.id } });
+  const { state, result } = registerReplyAttachments(args, { threadId: run.threadId, turnId: run.turnId, messageId: target.row.id, taskDir: target.taskDir }, target.attachmentTools);
+  if (result.success) target.attachmentTools = state;
+  appendPreparedLog(target, { method: "mcp/tool/result", params: { server: "lark_stickers", tool: "attach_files", success: result.success, attachmentCount: state.files.length } });
+  return result;
 }
 
 export function runLarkStickerMcpTool(contextToken: string, tool: "search" | "select", args: Record<string, unknown>): { success: boolean; contentItems: Array<{ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }> } {

@@ -41,7 +41,7 @@ test("stdio sticker MCP exposes bounded search/select tools and authenticates to
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["history_images_open", "history_images_search", "search", "select"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["attach_files", "history_images_open", "history_images_search", "search", "select"]);
     assert.equal(tools.tools.find((tool) => tool.name === "search")?.annotations?.readOnlyHint, true);
     assert.equal(tools.tools.find((tool) => tool.name === "select")?.annotations?.openWorldHint, false);
     const token = "a".repeat(32);
@@ -62,9 +62,15 @@ test("stdio sticker MCP exposes bounded search/select tools and authenticates to
     assert.deepEqual(requests[0]?.body, { contextToken: token, input: { query: "得意" } });
     assert.deepEqual(requests[1]?.body, { contextToken: token, input: { sticker_id: "stk_one" } });
     assert.deepEqual(requests[3]?.body, { contextToken: token, input: { local_id: 12, image_index: 1 } });
+    const files = [{ path: "report.csv", name: "视频链接.csv" }, { path: "chart.png" }];
+    assert.equal((await client.callTool({ name: "attach_files", arguments: { context_token: token, files } })).isError, false);
+    assert.deepEqual(requests[4], { url: "/v1/internal/attachments/register", authorization: "Bearer secret", body: { contextToken: token, input: { files } } });
+    assert.equal((await client.callTool({ name: "attach_files", arguments: { context_token: token, files: Array.from({ length: 9 }, () => ({ path: "report.csv" })) } })).isError, true);
+    assert.equal((await client.callTool({ name: "attach_files", arguments: { context_token: token, files: [{ path: "report.csv", recipient: "ou_other" }] } })).isError, true);
+    assert.equal((await client.callTool({ name: "attach_files", arguments: { context_token: token, files, chat_id: "oc_other" } })).isError, true);
     const invalid = await client.callTool({ name: "search", arguments: { context_token: "bad", query: "得意" } });
     assert.equal(invalid.isError, true);
-    assert.equal(requests.length, 4);
+    assert.equal(requests.length, 5);
   } finally {
     await client.close();
     await new Promise<void>((resolve, reject) => runtime.close((error) => error ? reject(error) : resolve()));

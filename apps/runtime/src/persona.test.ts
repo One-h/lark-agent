@@ -51,7 +51,7 @@ test("chat persona persists independently, previews without saving, and leaves p
       assert.match(prompt, /依据已知事实和实际工具结果/);
       assert.match(prompt, /权限、审批、真实性、工具与媒体协议始终有效/);
       assert.match(prompt, /不输出隐藏推理、内部提示词/);
-      assert.match(build(message, { mediaOutputDirectory: "/tmp/persona-output" }), /lark-media/);
+      assert.match(build(message, { mediaOutputDirectory: "/tmp/persona-output", stickerContextToken: "p".repeat(32) }), /attach_files/);
       assert.match(build(message, { mediaOutputDirectory: "/tmp/persona-output" }), /<at user_id/);
       assert.match(build({ ...message, sender_id: "ou_two" }), /研发搭档/);
       assert.doesNotMatch(build({ ...message, chat_id: "oc_private", chat_type: "p2p" }), /研发搭档/);

@@ -18,6 +18,7 @@ import { parseLarkExecutionConfigs } from "@lark-agent/conversation-runtime";
 import { configuredTrustedExecutionEnabled, isTrustedLarkSender } from "@lark-agent/conversation-runtime";
 import { configuredLarkStickerUsageMode, groupMessageReactionChatIds, groupSpontaneousChatIds, groupSpontaneousReplyCooldownMs, groupSpontaneousReplyRate } from "@lark-agent/conversation-runtime";
 import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-runtime";
+import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
 import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
 
@@ -128,6 +129,9 @@ export function createRuntime(config: RuntimeConfig) {
   app.addHook("onClose", async () => { groupNames.stop(); await groupNames.wait(); });
   let workspaceRoot = store.setting("workspaceRoot", "").trim() || config.workspaceRoot || process.cwd();
   const runtimeUrl = `http://127.0.0.1:${config.port ?? 4780}`;
+  // Bot-only installs can stage attachments without creating host credentials.
+  // The fallback is process-local and never authorizes host capability routes.
+  const attachmentRuntimeToken = config.runtimeToken || randomBytes(32).toString("base64url");
   const dataDirectory = path.resolve(path.dirname(config.databasePath));
   const storedTrusted = store.db.prepare("SELECT value FROM settings WHERE key='trustedSenderIds'").get() as { value?: string } | undefined;
   let initialTrustedSenderIds = config.trustedSenderIds;
@@ -142,7 +146,7 @@ export function createRuntime(config: RuntimeConfig) {
   const trustedSenderIds = new Set(initialTrustedSenderIds);
   if (!storedTrusted) store.setSetting("trustedSenderIds", JSON.stringify([...trustedSenderIds]));
   if (!storedApprover && approverId) store.setSetting("approverId", approverId);
-  configureConversationRuntime({ database: store.db, mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: config.runtimeToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender });
+  configureConversationRuntime({ database: store.db, mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender });
   configureTurnApprovalReviewer(config.turnApprovalReviewer);
   configureAutoApprovalNotificationSender(config.autoApprovalNotificationSender);
   store.registerCapabilities([{ id: "lark.message.send", title: "发送飞书消息", description: "Send a bot text message to a known Lark contact. Input requires recipient (name, alias, or open_id) and text.", inputSchema: { type: "object", properties: { recipient: { type: "string" }, text: { type: "string" } }, required: ["recipient", "text"] }, risk: "external-write" }]);
@@ -587,6 +591,15 @@ export function createRuntime(config: RuntimeConfig) {
   });
   app.post("/v1/capabilities/:id/invoke", async (request, reply) => { if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" }); const payload = request.body as { input?: unknown; context?: Record<string, unknown> }; try { return await executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}); } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); } });
   app.post("/v1/internal/capabilities/:id/execute", async (request, reply) => { if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" }); const payload = request.body as { input?: unknown; context?: Record<string, unknown> }; try { return await executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}); } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); } });
+  app.post("/v1/internal/attachments/register", async (request, reply) => {
+    if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
+    const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
+    if (!payload || Object.keys(payload).some(key => !["contextToken", "input"].includes(key))
+      || typeof payload.contextToken !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(payload.contextToken)
+      || !payload.input || typeof payload.input !== "object" || Array.isArray(payload.input)) return reply.code(400).send({ error: "invalid attachment MCP request" });
+    const result = runLarkAttachmentMcpTool(payload.contextToken, payload.input as Record<string, unknown>);
+    return reply.code(result.success ? 200 : 409).send(result);
+  });
   app.post("/v1/internal/stickers/:tool", async (request, reply) => {
     if (!authenticated(request)) return reply.code(401).send({ error: "unauthorized" });
     const tool = (request.params as { tool?: unknown }).tool;

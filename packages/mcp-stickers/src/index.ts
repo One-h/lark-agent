@@ -41,6 +41,15 @@ async function callRuntime(route: string, contextToken: string, input: Record<st
 }
 
 const server = new McpServer({ name: "lark-stickers", version: "0.1.0" });
+server.registerTool("attach_files", {
+  title: "为本轮回复添加图片或文件",
+  description: "登记当前消息 output 目录中已生成的图片和文档，不立即发送。追加最多八个附件；重复路径更新登记，files=[] 清空。正常结束本轮后由队列投递，最终文字无需媒体标签。",
+  inputSchema: z.object({
+    context_token: z.string().regex(/^[A-Za-z0-9_-]{32}$/),
+    files: z.array(z.object({ path: z.string().trim().min(1).max(1024), name: z.string().trim().min(1).max(160).optional() }).strict()).max(8)
+  }).strict(),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+}, async ({ context_token, files }) => callRuntime("/v1/internal/attachments/register", context_token, { files }, 25_000));
 server.registerTool("search", {
   title: "搜索飞书表情包",
   description: "为当前飞书消息搜索最多三张本地表情候选并查看预览，不会发送消息。context_token 必须使用当前提示词提供的值。",
