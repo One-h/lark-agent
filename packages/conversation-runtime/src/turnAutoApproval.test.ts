@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
-import { approvalTask, configuredTurnAutoApprovalDataSources, deploymentOperationMatchesTask, configureTurnApprovalReviewer, decideTurnAutoApproval, finishLarkTurnAutoApproval, humanApprovalHistory, reviewLarkTurnAutoApproval, type TurnApprovalInput, type TurnApprovalReviewer } from "./turnAutoApproval.js";
+import { approvalTask, configuredTurnAutoApprovalDataSources, deploymentOperationMatchesTask, configureTurnApprovalReviewer, decideTurnAutoApproval, finishLarkTurnAutoApproval, humanApprovalHistory, requiresManualTurnApproval, reviewLarkTurnAutoApproval, type TurnApprovalInput, type TurnApprovalReviewer } from "./turnAutoApproval.js";
 import { turnApprovalModelPrompt } from "./turnApprovalReviewer.js";
 import { matchesLarkExecutionApprovalTurn, shouldReuseLarkTurnApproval } from "./responder.js";
 
@@ -77,14 +77,69 @@ test("history remains isolated by sender, approver, repository and working direc
 });
 
 test("code pushes and SQL mutations never reuse a PR grant", async () => {
-  for (const override of [{ operation: "git push origin main" }, { operation: "DELETE FROM orders" }]) {
+  for (const operation of [
+    "git push origin main", "DELETE FROM orders",
+    "git -C /tmp/repo push origin main", "git -c color.ui=false --no-pager merge feature",
+    "/usr/bin/git --git-dir=/tmp/repo/.git reset --hard HEAD", "git -C'/tmp/repo with spaces' clean -fd",
+    "kubectl --context fixture delete deployment demo", "kubectl --namespace=demo edit deployment demo",
+    "/usr/local/bin/kubectl -ndemo --request-timeout=30s delete pod demo",
+    "argocd --server fixture --grpc-web app delete demo-api",
+    "/bin/zsh -lc 'git -C /tmp/repo push origin main'",
+    "/bin/bash -lc 'kubectl --context fixture delete deployment demo'",
+    "/bin/bash --noprofile --norc -lc 'git -C /tmp/repo push origin main'",
+    "/bin/zsh -l -c 'kubectl --context fixture delete deployment demo'",
+    "git status && git -C /tmp/repo push origin main",
+    "git status\nkubectl --context fixture delete deployment demo",
+    "git status # safe\ngit -C /tmp/repo push origin main",
+    "git status # safe \\\ngit -C /tmp/repo push origin main",
+    "git -C /tmp/repo pu\\\nsh origin main",
+    '"git" -C /tmp/repo "push" origin main',
+    "git --unknown-global-option fixture push origin main"
+  ]) {
     const f = fixture();
     try {
       addHuman(f.store, { id: 1 });
-      const result = await decideTurnAutoApproval({ ...input, ...override }, { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async () => { throw new Error("must not call"); } });
-      assert.equal(result.approved, false); assert.equal(result.source, "manual");
+      const result = await decideTurnAutoApproval({ ...input, operation }, { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async () => { throw new Error("must not call"); } });
+      assert.equal(result.approved, false, operation); assert.equal(result.source, "manual", operation);
     } finally { f.close(); }
   }
+});
+
+test("read-only CLI global options retain history matching", async () => {
+  const f = fixture();
+  try {
+    addHuman(f.store, { id: 1 });
+    let index = 0;
+    for (const operation of [
+    'git -C "/tmp/repo with spaces" status --short', "git -c color.ui=false --no-pager log -1",
+    "git --git-dir=/tmp/repo/.git show HEAD", 'git log --grep="push"',
+    "kubectl --context fixture --namespace demo get pods", "kubectl -ndemo get pods",
+    "argocd --server fixture --grpc-web app get demo-api",
+    "/bin/zsh -lc 'git -C /tmp/repo diff HEAD'",
+    "/bin/bash --noprofile --norc -lc 'git -C /tmp/repo log -1'",
+    "git -C /tmp/repo status # push is only a comment"
+    ]) {
+      const request = { ...input, operation, turnId: `readonly-${++index}` };
+      assert.equal(requiresManualTurnApproval(request), false, operation);
+      const result = await decideTurnAutoApproval(request, { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async () => { throw new Error("must not call"); } });
+      assert.equal(result.approved, true, operation);
+      assert.equal(result.source, "history", operation);
+    }
+  } finally { f.close(); }
+});
+
+test("a cached turn grant cannot authorize flagged mutating CLI commands", async () => {
+  const f = fixture();
+  let calls = 0;
+  configureTurnApprovalReviewer(async () => { calls++; return { decision: "approve_turn", reason: "PR review" }; });
+  try {
+    setAppSettingValue("turnAutoApprovalEnabled", "true");
+    assert.equal((await reviewLarkTurnAutoApproval(input)).approved, true);
+    for (const operation of ["git -C /tmp/repo push origin main", "kubectl --context fixture delete deployment demo"]) {
+      assert.equal((await reviewLarkTurnAutoApproval({ ...input, operation })).approved, false);
+    }
+    assert.equal(calls, 1);
+  } finally { finishLarkTurnAutoApproval(input.turnId); configureTurnApprovalReviewer(); f.close(); }
 });
 
 test("deployment uses its own human scope first and otherwise asks the model", async () => {

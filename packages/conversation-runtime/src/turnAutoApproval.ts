@@ -3,6 +3,7 @@ import path from "node:path";
 import { config, appSettingValue, db, nowIso, validLarkCodexModel } from "./context.js";
 import { reviewTurnWithCodex } from "./turnApprovalReviewer.js";
 import { queueTurnAutoApprovalNotification } from "./turnApprovalNotifications.js";
+import { requiresManualCliApproval } from "./approvalCommands.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -99,7 +100,8 @@ export function approvalTask(message: string, dataSources: readonly string[] = [
 
 export function requiresManualTurnApproval(input: TurnApprovalInput): boolean {
   return /回滚|合并|删库|删除数据|修改数据库|改代码|修复代码|\b(?:rollback|merge)\b/i.test(input.originalMessage)
-    || /\bgit\s+(?:push|merge|reset|clean)\b|\bkubectl\s+(?:delete|edit)\b|\bargocd(?:\s+--[a-z_-]+)*\s+app\s+delete\b|\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+table|truncate\s+table)\b/i.test(input.operation);
+    || requiresManualCliApproval(input.operation)
+    || /\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+table|truncate\s+table)\b/i.test(input.operation);
 }
 
 export function humanApprovalHistory(database: Database.Database, senderId: string, approverId: string): ApprovalPrecedent[] {
