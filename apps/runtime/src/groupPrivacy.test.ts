@@ -133,3 +133,15 @@ test("operation classification cannot be silently discarded even with contradict
 test("failed attention analysis is retained for owner review rather than silently lost",async()=>fixture(async({privacy,options,row,calls}:any)=>{
  options.plan=async()=>{throw new Error("triage unavailable");};privacy.ingest(message,"bot");await privacy.tick();assert.equal(row().status,"needs_owner");assert.match(row().error,/triage unavailable/);assert.equal(calls.length,1);
 }));
+
+test("new installs have no company directories; owner-chosen scopes persist locally and can be revoked",async()=>{
+ const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"lark-company-scope-")),root=fs.realpathSync(temporary),a=path.join(root,"company-a"),b=path.join(root,"company-b"),database=path.join(temporary,"runtime.sqlite");fs.mkdirSync(a);fs.mkdirSync(b);
+ let store=new SqliteAgentStore(database);
+ const options={ownerId:()=>"ou_owner",model:()=>"fixture"};let privacy=new GroupPrivacy(store,options);
+ try{
+  assert.deepEqual(privacy.roots(),[]);
+  privacy.configure({companyRoots:[a,b,a]});assert.deepEqual(privacy.roots(),[a,b]);await privacy.stop();store.close();
+  store=new SqliteAgentStore(database);privacy=new GroupPrivacy(store,options);assert.deepEqual(privacy.roots(),[a,b]);
+  privacy.configure({companyRoots:[]});assert.deepEqual(privacy.roots(),[]);assert.equal(privacy.snapshot().policy.personalAccess,false);
+ }finally{await privacy.stop();store.close();fs.rmSync(temporary,{recursive:true,force:true});}
+});
