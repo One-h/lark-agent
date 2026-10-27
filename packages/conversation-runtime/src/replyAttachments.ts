@@ -42,26 +42,99 @@ export function matchingAttachmentState(state: AttachmentState | undefined, cont
   return Boolean(state && state.threadId === context.threadId && state.turnId === context.turnId && state.messageId === context.messageId);
 }
 
-function snapshotAttachment(context: AttachmentContext, entry: { path: string; name?: string }): RegisteredAttachment {
+function sameFile(left: fs.Stats, right: fs.Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function readSnapshotSource(source: ReplyMedia, output: string): Buffer {
+  const expected = fs.lstatSync(source.absolutePath);
+  const fd = fs.openSync(source.absolutePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = fs.fstatSync(fd);
+    const realFile = fs.realpathSync(source.absolutePath);
+    if (!expected.isFile() || !before.isFile() || before.nlink !== 1 || !sameFile(expected, before)
+      || !within(realFile, output) || !sameFile(fs.lstatSync(realFile), before)) throw new Error("附件源文件发生变化或不安全");
+    const limit = (source.kind === "image" ? 10 : 50) * 1024 * 1024;
+    const chunks: Buffer[] = [], buffer = Buffer.allocUnsafe(64 * 1024);
+    let size = 0, count: number;
+    while ((count = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      size += count;
+      if (size > limit) throw new Error("附件大小不符合限制");
+      chunks.push(Buffer.from(buffer.subarray(0, count)));
+    }
+    const after = fs.fstatSync(fd);
+    if (size < 1 || size !== before.size || after.size !== before.size || after.nlink !== before.nlink
+      || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error("附件在登记期间发生变化，请重新生成并登记");
+    return Buffer.concat(chunks, size);
+  } finally { fs.closeSync(fd); }
+}
+
+function assertSnapshotDirectory(directory: string, output: string): void {
+  if (fs.realpathSync(output) !== output || fs.realpathSync(directory) !== directory || !within(directory, output)
+    || !fs.lstatSync(directory).isDirectory()) throw new Error("附件快照目录不安全");
+}
+
+function removeCreatedSnapshot(file: string, identity: fs.Stats, output: string): void {
+  try {
+    assertSnapshotDirectory(path.dirname(file), output);
+    if (!sameFile(fs.lstatSync(file), identity)) return;
+    fs.unlinkSync(file);
+    try { fs.rmdirSync(path.dirname(file)); } catch { /* Keep nonempty directories. */ }
+  } catch { /* Never follow a replaced directory to clean up another location. */ }
+}
+
+function snapshotAttachment(context: AttachmentContext, entry: { path: string; name?: string }, onCreated: (cleanup: () => void) => void): RegisteredAttachment {
   const source = resolveReplyAttachment(context.taskDir, entry.path);
   const name = entry.name?.trim() ?? path.basename(source.absolutePath);
   if (!name || name.length > 160 || /[/\\\x00-\x1f\x7f]/.test(name) || [".", ".."].includes(name)
     || path.extname(name).toLowerCase() !== path.extname(source.absolutePath).toLowerCase()) throw new Error("附件名称必须是保留原扩展名的普通文件名");
-  const digest = attachmentDigest(source.absolutePath, (source.kind === "image" ? 10 : 50) * 1024 * 1024);
+  const realOutput = fs.realpathSync(path.join(context.taskDir, "output"));
+  // Copy and hash these captured bytes; never reopen the mutable source path.
+  const contents = readSnapshotSource(source, realOutput);
+  const digest = crypto.createHash("sha256").update(contents).digest("hex");
   const id = `att_${crypto.createHash("sha256").update(JSON.stringify([context.threadId, context.turnId, context.messageId, source.absolutePath, digest, name])).digest("hex").slice(0, 24)}`;
   const relative = path.join(".attachments", id, name);
-  const realOutput = fs.realpathSync(path.join(context.taskDir, "output"));
   const root = path.join(realOutput, ".attachments");
   if (!fs.existsSync(root)) fs.mkdirSync(root, { mode: 0o700 });
-  if (!within(fs.realpathSync(root), realOutput)) throw new Error("附件快照目录不安全");
+  assertSnapshotDirectory(root, realOutput);
   const directory = path.join(root, id);
   if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
-  if (!within(fs.realpathSync(directory), realOutput)) throw new Error("附件快照目录不安全");
+  assertSnapshotDirectory(directory, realOutput);
   const target = path.join(directory, name);
-  if (!fs.existsSync(target)) fs.copyFileSync(source.absolutePath, target, fs.constants.COPYFILE_EXCL);
+  let fd: number | undefined;
+  let created: fs.Stats | undefined;
+  let complete = false;
+  try {
+    try {
+      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+      created = fs.fstatSync(fd);
+      assertSnapshotDirectory(directory, realOutput);
+      if (!created.isFile() || created.nlink !== 1 || !sameFile(fs.lstatSync(target), created)) throw new Error("附件快照文件不安全");
+      fs.writeFileSync(fd, contents);
+      fs.fsyncSync(fd);
+      fs.fchmodSync(fd, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || fd !== undefined) throw error;
+    }
+    assertSnapshotDirectory(directory, realOutput);
+    const snapshot = resolveReplyAttachment(context.taskDir, relative);
+    const stat = fs.lstatSync(target);
+    if (!stat.isFile() || stat.nlink !== 1 || created && !sameFile(stat, created)
+      || attachmentDigest(snapshot.absolutePath) !== digest) throw new Error("附件快照发生变化，请重新登记");
+    if (created) {
+      const identity = created;
+      onCreated(() => removeCreatedSnapshot(target, identity, realOutput));
+    }
+    complete = true;
+  } finally {
+    if (fd !== undefined) {
+      try { if (!complete) fs.ftruncateSync(fd, 0); }
+      catch { /* Unlink the owned file even if truncation fails. */ }
+      finally { fs.closeSync(fd); }
+    }
+    if (!complete && created) removeCreatedSnapshot(target, created, realOutput);
+  }
   const snapshot = resolveReplyAttachment(context.taskDir, relative);
-  if (attachmentDigest(snapshot.absolutePath) !== digest) throw new Error("附件在登记期间发生变化，请重新生成并登记");
-  fs.chmodSync(snapshot.absolutePath, 0o600);
   return { ...snapshot, id, name, sourcePath: source.absolutePath, sha256: digest };
 }
 
@@ -69,6 +142,7 @@ export function registerReplyAttachments(args: unknown, context: AttachmentConte
   const state: AttachmentState = matchingAttachmentState(previous, context)
     ? { ...previous!, files: [...previous!.files] }
     : { threadId: context.threadId, turnId: context.turnId, messageId: context.messageId, files: [] };
+  const cleanups: Array<() => void> = [];
   try {
     if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some(key => key !== "files")) throw new Error("只接受 files；接收对象由当前消息绑定");
     const files = (args as { files?: unknown }).files;
@@ -81,7 +155,7 @@ export function registerReplyAttachments(args: unknown, context: AttachmentConte
     const selected = new Map(state.files.map(file => [file.sourcePath, file]));
     if (parsed.length === 0) selected.clear();
     for (const entry of parsed) {
-      const attachment = snapshotAttachment(context, entry);
+      const attachment = snapshotAttachment(context, entry, (cleanup) => cleanups.push(cleanup));
       selected.set(attachment.sourcePath, attachment);
     }
     if (selected.size > 8) throw new Error("本条消息最多登记 8 个附件");
@@ -97,6 +171,7 @@ export function registerReplyAttachments(args: unknown, context: AttachmentConte
     return { state: next, result: { success: true, contentItems: [{ type: "inputText" as const, text: JSON.stringify({ status: "staged", sent: false,
       files: next.files.map(file => ({ id: file.id, name: file.name, kind: file.kind, size: file.size })), message: "附件已登记，正常结束本轮后才投递；最终回复无需媒体标签。" }) }] } };
   } catch (error) {
+    for (const cleanup of cleanups.reverse()) cleanup();
     return { state, result: { success: false, contentItems: [{ type: "inputText" as const, text: error instanceof Error ? error.message : "附件登记失败" }] } };
   }
 }

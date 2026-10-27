@@ -16,6 +16,110 @@ function fixture() {
   return { root, context, write, close: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
+function snapshotFiles(root: string): string[] {
+  const directory = path.join(root, "output", ".attachments");
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory, { recursive: true, withFileTypes: true })
+    .filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name)).sort();
+}
+
+test("source replacement at end of the read cannot copy outside bytes or leave rejected snapshots", () => {
+  for (const replace of ["symlink", "in-place"]) {
+    const f = fixture();
+    f.write("report.csv", "original generated contents");
+    const source = fs.realpathSync(path.join(f.root, "output", "report.csv"));
+    const outside = path.join(f.root, "outside.csv"); fs.writeFileSync(outside, "private fixture must remain outside output");
+    const open = fs.openSync, read = fs.readSync;
+    let sourceFd: number | undefined, swapped = false;
+    fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+      const fd = open(...args);
+      if (args[0] === source) sourceFd = fd;
+      return fd;
+    }) as typeof fs.openSync;
+    fs.readSync = ((...args: unknown[]) => {
+      const count = Reflect.apply(read, fs, args);
+      if (args[0] === sourceFd && count === 0 && !swapped) {
+        swapped = true;
+        if (replace === "symlink") { fs.unlinkSync(source); fs.symlinkSync(outside, source); }
+        else fs.writeFileSync(source, "source changed after reading");
+      }
+      return count;
+    }) as typeof fs.readSync;
+    try {
+      const result = registerReplyAttachments({ files: [{ path: "report.csv" }] }, f.context);
+      assert.equal(swapped, true);
+      assert.equal(result.result.success, false);
+      assert.deepEqual(result.state.files, []);
+      assert.deepEqual(snapshotFiles(f.root), []);
+      assert.equal(fs.readFileSync(outside, "utf8"), "private fixture must remain outside output");
+    } finally { fs.openSync = open; fs.readSync = read; f.close(); }
+  }
+});
+
+test("failed batches and unsafe registration metadata remove only newly created snapshots", () => {
+  const f = fixture();
+  try {
+    f.write("old.csv", "committed contents"); f.write("new.csv", "discarded contents");
+    const first = registerReplyAttachments({ files: [{ path: "old.csv" }] }, f.context);
+    assert.equal(first.result.success, true);
+    const existing = snapshotFiles(f.root);
+    const partial = registerReplyAttachments({ files: [{ path: "new.csv" }, { path: "missing.csv" }] }, f.context, first.state);
+    assert.equal(partial.result.success, false); assert.deepEqual(partial.state, first.state);
+    assert.deepEqual(snapshotFiles(f.root), existing);
+    assert.equal(fs.readFileSync(existing[0], "utf8"), "committed contents");
+    const outside = path.join(f.root, "outside.csv"); fs.writeFileSync(outside, "private fixture");
+    const registration = path.join(f.root, "reply-attachments.json"); fs.unlinkSync(registration); fs.symlinkSync(outside, registration);
+    const rejected = registerReplyAttachments({ files: [{ path: "new.csv" }] }, f.context, first.state);
+    assert.equal(rejected.result.success, false); assert.deepEqual(rejected.state, first.state);
+    assert.deepEqual(snapshotFiles(f.root), existing);
+    assert.equal(fs.readFileSync(outside, "utf8"), "private fixture");
+  } finally { f.close(); }
+});
+
+test("a partial snapshot write is removed before registration returns failure", () => {
+  const f = fixture(); f.write("report.csv");
+  const open = fs.openSync, write = fs.writeFileSync;
+  let destinationFd: number | undefined;
+  fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+    const fd = open(...args);
+    if (String(args[0]).includes(`${path.sep}.attachments${path.sep}`)) destinationFd = fd;
+    return fd;
+  }) as typeof fs.openSync;
+  fs.writeFileSync = ((...args: Parameters<typeof fs.writeFileSync>) => {
+    if (typeof args[0] === "number" && args[0] === destinationFd) {
+      fs.writeSync(args[0], Buffer.from("partial"));
+      throw Object.assign(new Error("fixture full storage"), { code: "ENOSPC" });
+    }
+    return write(...args);
+  }) as typeof fs.writeFileSync;
+  try {
+    assert.equal(registerReplyAttachments({ files: [{ path: "report.csv" }] }, f.context).result.success, false);
+    assert.deepEqual(snapshotFiles(f.root), []);
+  } finally { fs.openSync = open; fs.writeFileSync = write; f.close(); }
+});
+
+test("a replaced snapshot parent and hard-linked files cannot escape attachment ownership", () => {
+  const f = fixture();
+  try {
+    f.write("report.csv");
+    const outside = path.join(f.root, "outside"); fs.mkdirSync(outside);
+    const mkdir = fs.mkdirSync;
+    fs.mkdirSync = ((...args: Parameters<typeof fs.mkdirSync>) => {
+      const result = Reflect.apply(mkdir, fs, args);
+      if (path.basename(String(args[0])) === ".attachments") {
+        fs.renameSync(args[0], `${args[0]}-moved`); fs.symlinkSync(outside, args[0]);
+      }
+      return result;
+    }) as typeof fs.mkdirSync;
+    try { assert.equal(registerReplyAttachments({ files: [{ path: "report.csv" }] }, f.context).result.success, false); }
+    finally { fs.mkdirSync = mkdir; }
+    assert.deepEqual(fs.readdirSync(outside), []);
+    fs.unlinkSync(path.join(f.root, "output", ".attachments"));
+    fs.linkSync(path.join(f.root, "output", "report.csv"), path.join(outside, "linked.csv"));
+    assert.equal(registerReplyAttachments({ files: [{ path: "report.csv" }] }, f.context).result.success, false);
+  } finally { f.close(); }
+});
+
 test("attachment registration snapshots files, preserves names, deduplicates and binds the exact message/turn", () => {
   const f = fixture();
   try {
