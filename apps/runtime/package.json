@@ -7,6 +7,7 @@
     "@lark-agent/adapter-codex-app-server": "0.1.0",
     "@lark-agent/adapter-lark-cli": "0.1.0",
     "@lark-agent/adapter-sqlite": "0.1.0",
-    "@lark-agent/conversation-runtime": "0.1.0"
+    "@lark-agent/conversation-runtime": "0.1.0",
+    "ws": "^8.22.0"
   }
 }

@@ -1,3 +1,5 @@
+import { AgentMessaging, registerAgentMessagingRoutes } from "./agentMessaging.js";
+import { setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import Fastify, { type FastifyRequest } from "fastify";
 import { createHash } from "node:crypto";
 import { randomBytes } from "node:crypto";
@@ -7,6 +9,7 @@ import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { sendApprovalCard, sendLarkTextMessage, sendLarkTextReply, updateApprovalCard, type LarkSentMessage } from "@lark-agent/adapter-lark-cli";
 import { config as conversationConfig, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, configureConversationRuntime, defaultConfigurablePrompt, enqueueLarkCodexReply, ingestLarkEvent, larkCodexAppServerStatus, larkMessageWorkerStatus, listLarkCodexModels, reconcileLarkCodexResponder, reconcileOrphanedLarkCodexRuns, reconcilePendingLarkThreadArchives, recordOutboundLarkMessage, retryPendingLarkExecutionReceipts, retryPendingLarkMediaReplies, retryPendingLarkTextReplies, runLarkHistoryImageMcpTool, runLarkStickerMcpTool, setAdditionalLarkApprovalHandler, startLarkMessageWorker, stopLarkCodexResponder, stopLarkMessageWorker, suppressPendingLarkExecutionReceipts, syncLarkContactsFromCli, type LarkReactionSender, type LarkTextReplySender } from "@lark-agent/conversation-runtime";
 import { registerHostOutboundRoutes } from "./outbound.js";
+import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerPersonaRoutes } from "./personaRoutes.js";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
@@ -307,6 +310,14 @@ export function createRuntime(config: RuntimeConfig) {
     finally { activeCapabilityCalls--; }
   };
   const authenticated = (request: FastifyRequest) => !config.runtimeToken || request.headers.authorization === `Bearer ${config.runtimeToken}`;
+  const agentMessaging = new AgentMessaging(store, { ownerId: () => approverId ?? "" });
+  registerAgentMessagingRoutes(app, agentMessaging, req => Boolean(config.runtimeToken) && authenticated(req));
+  setExternalMessageHandler(event => agentMessaging.ingestEvent(event));
+  app.addHook("onClose", async () => { setExternalMessageHandler(null); });
+  if (config.mode === "active") agentMessaging.start();
+  const personalInbox = new PersonalInbox(store, { ownerId: () => approverId ?? "", model: configuredLarkCodexModel, routeMessage: message => agentMessaging.ingest(message, "user") });
+  registerPersonalInboxRoutes(app, personalInbox, request => Boolean(config.runtimeToken) && authenticated(request));
+  if (config.mode === "active") personalInbox.start();
   registerPersonaRoutes(app, authenticated);
   registerHostOutboundRoutes(app, store, authenticated, {
     sendDirect: config.proactiveMessageSender ?? sendLarkTextMessage,

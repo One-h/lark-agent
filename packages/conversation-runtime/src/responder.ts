@@ -2614,6 +2614,12 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
 }
 
 function handleAppServerNotification(notification: CodexAppServerNotification): void {
+  const lifecycle = notification.params as { threadId?: string; status?: { type?: string } } | undefined;
+  if (lifecycle?.threadId && (notification.method === "thread/closed" || notification.method === "thread/deleted"
+    || (notification.method === "thread/status/changed" && lifecycle.status?.type === "notLoaded"))) {
+    loadedLarkThreadIds.delete(lifecycle.threadId);
+    loadedLarkThreadParameters.delete(lifecycle.threadId);
+  }
   const turnId = notificationTurnId(notification);
   if (!turnId) {
     return;
@@ -3488,12 +3494,10 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
       const message = error instanceof Error ? error.message : String(error);
       appendPreparedError(prepared, `Unable to resume Codex thread ${threadId}: ${message}`);
       if (workspaceChanged) throw new Error(`Unable to bind Codex thread to the configured workspace: ${message}`);
-      if (/already has an active writer/i.test(message)) {
-        loadedLarkThreadIds.add(threadId);
-        updatePreparedPrompt(prepared, "delta");
-      } else {
-        threadId = null;
-      }
+      // Another writer does not mean this app-server has the thread loaded.
+      // Keep that writer's conversation intact and start a separate full-context
+      // bot thread, just as for other unsuccessful resumes.
+      threadId = null;
     }
   }
   if (!threadId) {
