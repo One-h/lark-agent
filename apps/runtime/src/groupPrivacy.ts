@@ -79,6 +79,11 @@ export class GroupPrivacy {
         try{
           this.update(row.id,{status:"reviewing"});
           const plan=await (this.options.plan??planGroupReply)(this.input(row),this.options.model());
+          // Ignoring can only remove work; it never grants access, sends, or executes.
+          if(plan.attention==="no_action"&&plan.category!=="operation"){
+            this.update(row.id,{status:"ignored",category:plan.category,draft:"",reason:plan.reason,error:null});
+            continue;
+          }
           this.update(row.id,{status:"needs_owner",category:plan.category,draft:plan.draft,reason:plan.reason});
           if(plan.category==="company"&&this.roots().length)await this.research(row.id,plan.queries);
         }catch(error){this.update(row.id,{status:"needs_owner",draft:"",error:errorText(error),reason:"隔离分析失败，群中未自动发送。"});}

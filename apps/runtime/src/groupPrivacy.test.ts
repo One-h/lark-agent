@@ -112,3 +112,24 @@ test("approved company commands cannot reach even a fresh loopback HTTP server",
  const server=http.createServer((_request,response)=>{requests++;response.end("unexpected");});await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
  try{const address=server.address();assert.ok(address&&typeof address!=="string");const output=await executeCompanyOperation(root,["/usr/bin/curl","--max-time","2",`http://127.0.0.1:${address.port}/`]);assert.match(output,/未成功/);assert.equal(requests,0);}finally{await new Promise<void>(resolve=>server.close(()=>resolve()));fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test("clear non-actionable chatter is silently audited without research, publication or notifications",async()=>fixture(async({privacy,options,work,calls,executed,forwarded,row}:any)=>{
+ privacy.configure({companyRoots:[work]});let plans=0;
+ options.plan=async()=>{plans++;return {attention:"no_action",category:"company",draft:"must not publish",reason:"只是闲聊，没有待办",queries:["never search"]};};
+ privacy.ingest({...message,content:"@小龙 还在睡觉吧哈哈"},"user");await privacy.tick();await privacy.tick();
+ assert.equal(row().status,"ignored");assert.equal(row().draft,"");assert.match(row().reason,/闲聊/);assert.equal(plans,1);assert.equal(calls.length,0);assert.equal(executed.length,0);assert.equal(forwarded.length,0);
+ await assert.rejects(privacy.decide(row().id,{action:"publish",text:"hi",version:row().version}),/刷新/);
+}));
+test("actionable or uncertain messages and missing attention still require owner review",async()=>fixture(async({privacy,options,calls}:any)=>{
+ for(const [index,attention] of ["needs_action","uncertain",undefined].entries()){
+  options.plan=async()=>({attention,category:"public",draft:"待确认",reason:"需要处理或不确定"});
+  privacy.ingest({...message,messageId:`om_action${index}`,content:"哈哈，另外请确认明天方案"},"bot");await privacy.tick();
+ }
+ assert.ok(privacy.snapshot().messages.every((r:any)=>r.status==="needs_owner"));assert.equal(calls.length,3);assert.ok(calls.every((c:string[])=>c.includes("--user-id")));
+}));
+test("operation classification cannot be silently discarded even with contradictory no-action output",async()=>fixture(async({privacy,options,row}:any)=>{
+ options.plan=async()=>({attention:"no_action",category:"operation",draft:"",reason:"conflicting result"});privacy.ingest(message,"bot");await privacy.tick();assert.equal(row().status,"needs_owner");
+}));
+test("failed attention analysis is retained for owner review rather than silently lost",async()=>fixture(async({privacy,options,row,calls}:any)=>{
+ options.plan=async()=>{throw new Error("triage unavailable");};privacy.ingest(message,"bot");await privacy.tick();assert.equal(row().status,"needs_owner");assert.match(row().error,/triage unavailable/);assert.equal(calls.length,1);
+}));
