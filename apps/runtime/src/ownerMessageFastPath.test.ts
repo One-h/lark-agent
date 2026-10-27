@@ -60,6 +60,7 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
       { recipient: "同名同事", original: "跟同名同事说：test", text: "test" },
       { callTurn: "different-turn" }, { status: "answered" }, { approver: "ou_new_owner" }
     ];
+    let expectedCards = 0;
     for (const [i, entry] of cases.entries()) {
       const c = entry as { enabled?: boolean; sender?: string; scope?: string; chatType?: string; messageType?: string; text?: string; original?: string; recipient?: string; callTurn?: string; status?: string; approver?: string };
       runtime.store.setSetting("ownerMessageFastPathEnabled", String(c.enabled ?? true));
@@ -78,7 +79,8 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
         context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: c.scope ?? "trusted", turnId: c.callTurn ?? turn }
       } });
       assert.notEqual(result.statusCode, 200, JSON.stringify(c));
-      assert.equal(cards, i + 1, JSON.stringify(c));
+      if (c.chatType !== "group") expectedCards++;
+      assert.equal(cards, expectedCards, JSON.stringify(c));
       assert.equal(sends, 0, JSON.stringify(c));
     }
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }

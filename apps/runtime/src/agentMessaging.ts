@@ -17,6 +17,7 @@ export class AgentMessaging {
   private readonly sending = new Set<string>();
   constructor(readonly store: SqliteAgentStore, private readonly options: {
     ownerId: () => string; bridge?: AgentReplyBridge; cli?: typeof inboxCli;
+    queueGroup?: (input: {outreachId:string;chatId:string;identity:"bot"|"user";text:string})=>number;
   }) {
     store.db.exec(`CREATE TABLE IF NOT EXISTS agent_outreach (
       id TEXT PRIMARY KEY, requestKey TEXT NOT NULL UNIQUE, sourceThreadId TEXT NOT NULL, sourceLabel TEXT NOT NULL,
@@ -64,9 +65,21 @@ export class AgentMessaging {
         const auth = await this.cli(["auth","status","--json","--verify"]), user = auth.identities?.user;
         if (!user?.verified || user.openId !== this.options.ownerId() || !String(user.scope).split(/\s+/).includes("im:message.send_as_user")) throw new Error("本人身份尚缺 im:message.send_as_user 用户授权。");
       }
+      let group=false;
+      if(chatId){
+        const {data}=await this.cli(["im","chats","get","--as",identity,"--chat-id",chatId]);
+        if(!["group","p2p"].includes(data?.chat_mode))throw new Error("无法确认目标会话类型，未发送。");
+        group=data.chat_mode==="group";
+        if(group&&!this.options.queueGroup)throw new Error("群消息必须进入隐私审批，未发送。");
+      }
       const id = randomUUID(), at = new Date().toISOString();
       this.store.db.prepare("INSERT INTO agent_outreach (id,requestKey,sourceThreadId,sourceLabel,sourceCwd,identity,recipientId,chatId,text,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?,'sending',?)")
         .run(id,requestKey,sourceThreadId,sourceLabel,path.resolve(sourceCwd),identity,recipientId,chatId,text,at);
+      if(group){
+        this.store.db.prepare("UPDATE agent_outreach SET status='awaiting_approval' WHERE id=?").run(id);
+        this.options.queueGroup!({outreachId:id,chatId,identity:identity as "bot"|"user",text});
+        return this.outreach(id);
+      }
       try {
         const args = ["im","+messages-send","--as",identity,chatId ? "--chat-id" : "--user-id",chatId || recipientId,
           "--text",`${text}\n（小龙的助手龙小祝 · ${sourceLabel}；请回复此条消息，便于交回对应任务）`,"--idempotency-key",`agent-${createHash("sha256").update(requestKey).digest("hex").slice(0,32)}`];
@@ -93,6 +106,9 @@ export class AgentMessaging {
     // Compact CLI timestamps have minute precision. Old history or an expired
     // request is still a human decision, even with a single candidate.
     return candidates.find(item => received + 60_000 >= Date.parse(item.createdAt) && received - Date.parse(item.createdAt) < 86_400_000) ?? null;
+  }
+  approvedGroupReceipt(outreachId:string,messageId:string,chatId:string){
+    this.store.db.prepare("UPDATE agent_outreach SET status='open',messageId=?,chatId=? WHERE id=? AND status='awaiting_approval'").run(messageId,chatId,outreachId);
   }
   ingest(message: AgentMessage, identity: "bot" | "user") {
     if (!/^om_[A-Za-z0-9]+$/.test(message.messageId) || !/^ou_[A-Za-z0-9]+$/.test(message.senderId) || (identity === "user" && message.senderId === this.options.ownerId())) return false;

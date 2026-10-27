@@ -468,7 +468,7 @@ test("authenticated host outbound route sends once and records the message", asy
   } finally { await runtime.app.close(); runtime.stop(); }
 });
 
-test("authenticated host outbound route replies to a group source and records the reply", async () => {
+test("authenticated legacy outbound route cannot bypass group privacy review", async () => {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "lark-agent-")), "agent.sqlite");
   let replyText = "";
   const runtime = createRuntime({
@@ -492,16 +492,10 @@ test("authenticated host outbound route replies to a group source and records th
       headers: { authorization: "Bearer runtime-secret" },
       payload: { replyToLarkMessageId: inbound.id, text: "待办已完成", idempotencyKey: "todo-complete-1" }
     });
-    assert.equal(response.statusCode, 200);
-    assert.equal(response.json().messageId, "om_host_reply");
-    assert.match(replyText, /^<at user_id="ou_requester">请求人<\/at> 待办已完成$/);
-    assert.deepEqual(runtime.store.db.prepare("SELECT direction, recipient_id, content, reply_to_message_id, outbound_source FROM lark_messages WHERE message_id='om_host_reply'").get(), {
-      direction: "outbound",
-      recipient_id: "ou_requester",
-      content: replyText,
-      reply_to_message_id: "om_host_source",
-      outbound_source: "reply"
-    });
+    assert.equal(response.statusCode, 400);
+    assert.match(response.json().error, /privacy owner review/);
+    assert.equal(replyText, "");
+    assert.equal(runtime.store.db.prepare("SELECT 1 FROM lark_messages WHERE message_id='om_host_reply'").get(), undefined);
   } finally { await runtime.app.close(); runtime.stop(); }
 });
 

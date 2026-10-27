@@ -953,6 +953,10 @@ function retryDelayMs(attempt: number): number {
 }
 
 function deliverQueuedLarkTextReply(id: number): boolean {
+  if (groupPrivacyBlocks(id)) {
+    db.prepare("UPDATE lark_messages SET reply_status='skipped',reply_error='Group privacy owner review required',reply_next_attempt_at=NULL WHERE id=?").run(id);
+    return false;
+  }
   const message = db.prepare("SELECT * FROM lark_messages WHERE id = ?").get(id) as LarkMessageRow | undefined;
   if (!message?.message_id || !message.reply_delivery_text || !message.reply_delivery_key) return false;
   const sent = larkTextReplySender(message.message_id, message.reply_delivery_text, message.reply_delivery_key);
@@ -1056,6 +1060,10 @@ type LarkDeliveryPayload = { messageId: string; taskDir: string; paths: string[]
   turnId?: string; afterTextKey?: string; afterTextMessageId?: number; expectedFiles?: Array<{ path: string; sha256: string }> };
 
 export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = larkMediaReplySender): { ok: boolean; sentCount: number; error?: string } {
+  if (groupPrivacyBlocks(row.lark_message_id)) {
+    db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Group privacy owner review required' WHERE id=? AND status='pending'").run(row.id);
+    return {ok:false,sentCount:0,error:"Group privacy owner review required"};
+  }
   const current = db.prepare("SELECT status FROM lark_delivery_outbox WHERE id=?").get(row.id) as { status: string } | undefined;
   if (current?.status === "sent") return { ok: true, sentCount: 0 };
   if (current?.status !== "pending") return { ok: false, sentCount: 0, error: "Delivery is not pending" };
@@ -1625,7 +1633,11 @@ export function shouldRecoverLarkStartupStall(
   return stallMs > 0 && !hasStartedWork && elapsedMs >= stallMs;
 }
 
+function groupPrivacyBlocks(messageId: number): boolean {
+  return config.groupPrivacyEnforced && (db.prepare("SELECT chat_type FROM lark_messages WHERE id=?").get(messageId) as {chat_type?:string}|undefined)?.chat_type !== "p2p";
+}
 export function claimLarkCodexReply(larkMessageId: number): boolean {
+  if (groupPrivacyBlocks(larkMessageId)) return false;
   const settings = getAppSettings();
   if (!settings.larkCodexRepliesEnabled) {
     return false;
@@ -3701,6 +3713,10 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
     const message = db.prepare("SELECT * FROM lark_messages WHERE id = ?").get(larkMessageId) as LarkMessageRow | undefined;
     if (!message?.message_id) {
       throw new Error("Missing Lark message_id");
+    }
+    if (groupPrivacyBlocks(larkMessageId)) {
+      updateCodexState(larkMessageId, {status:"skipped"});
+      return;
     }
     const trustedSender = isTrustedSender(message.sender_id);
     const sessionKey = preparedSessionKey(message, trustedSender);

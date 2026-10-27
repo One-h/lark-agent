@@ -269,8 +269,10 @@ function persistLarkEvent(event: LarkEvent): void {
   const rootMessageId = stringValue(event.root_id);
   const threadId = stringValue(event.thread_id);
   const spontaneous = shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
-  const replyContext = resolveReplyContext(messageId, stringValue(event.reply_to));
-  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId }) ?? false;
+  const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
+    ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
+    : resolveReplyContext(messageId, stringValue(event.reply_to));
+  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous }) ?? false;
   const shouldRespond = !externallyRouted && config.runtimeMode === "active" && (directlyMentioned || spontaneous);
   const replyTrigger = spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));

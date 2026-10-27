@@ -87,3 +87,14 @@ test("single-source fallback refuses unrelated quotes, groups, and history older
 test("closing a competing source never retroactively auto-assigns an ambiguous reply",async()=>fixture(async({router,send,delivered})=>{
  await send(a,"request_a");const second=await send(b,"request_b");router.ingest(message,"bot");router.close(second.id);await router.tick();assert.equal(delivered.length,0);
 }));
+
+test("direct group send cannot bypass privacy approval even with an authenticated source",async()=>fixture(async({router,send,bridge,calls})=>{
+ await assert.rejects(router.send({sourceThreadId:a,sourceCwd:(await bridge.inspect(a)).cwd,sourceLabel:"群发测试",recipientId:"ou_peer",chatId:"oc_group",requestKey:"group_request",text:"直接发群"}),/无法确认目标会话类型|隐私审批/);
+ assert.equal(calls.some(row=>row.includes("+messages-send")),false);
+}));
+
+test("a confirmed group target is queued and receives a routing receipt only after owner publication",async()=>fixture(async({store,bridge})=>{
+ const proposals:any[]=[],sent:string[][]=[];
+ const guarded=new AgentMessaging(store,{ownerId:()=>"ou_owner",bridge,cli:async args=>{if(args[1]==="chats")return {data:{chat_mode:"group"}};sent.push(args);return {data:{message_id:"om_should_not_send",chat_id:"oc_group"}};},queueGroup:input=>{proposals.push(input);return 1;}});
+ try{const result=await guarded.send({sourceThreadId:a,sourceCwd:(await bridge.inspect(a)).cwd,sourceLabel:"群协作",recipientId:"ou_peer",chatId:"oc_group",requestKey:"real_group_queue",text:"群消息草稿"});assert.equal(result?.status,"awaiting_approval");assert.equal(sent.length,0);assert.equal(proposals.length,1);guarded.approvedGroupReceipt(result!.id,"om_approved","oc_group");assert.equal((guarded.snapshot().outreaches as any[])[0].status,"open");}finally{await guarded.stop();}
+}));

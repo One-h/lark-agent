@@ -25,7 +25,7 @@ const input = async () => { let text='';for await(const chunk of process.stdin){
 try {
   if(command==='send') {
     const body=await input(); const result=await request('/send',{...body,sourceThreadId:threadId,sourceCwd:process.cwd()});
-    console.log(JSON.stringify(result)); if(result.status!=='open')process.exitCode=2;
+    console.log(JSON.stringify(result)); if(!['open','awaiting_approval'].includes(result.status))process.exitCode=2;
   } else if(command==='ack') console.log(JSON.stringify(await request(`/receive/${threadId}/ack`,{ids:process.argv.slice(3).map(Number)})));
   else {
     const seconds=command==='wait'?Number(process.argv[3]??300):0;
