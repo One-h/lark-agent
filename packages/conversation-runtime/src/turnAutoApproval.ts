@@ -4,6 +4,7 @@ import { config, appSettingValue, db, nowIso, validLarkCodexModel } from "./cont
 import { reviewTurnWithCodex } from "./turnApprovalReviewer.js";
 import { queueTurnAutoApprovalNotification } from "./turnApprovalNotifications.js";
 import { requiresManualCliApproval } from "./approvalCommands.js";
+import { loadApprovalTaskContext, type ApprovalTaskContext } from "./approvalTaskContext.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -25,6 +26,7 @@ export type ApprovalTask = { type: "pr_review" | "data_query" | "deployment" | "
 export type TurnApprovalInput = {
   messageId: number; turnId: string; senderId: string | null;
   originalMessage: string; operation: string; cwd: string | null;
+  taskContext?: ApprovalTaskContext;
 };
 export type ApprovalPrecedent = {
   id: number; originalMessage: string; operation: string; cwd: string | null;
@@ -210,6 +212,7 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
 
 export function reviewLarkTurnAutoApproval(input: TurnApprovalInput): Promise<TurnApprovalDecision> {
   if (!turnAutoApprovalEnabled()) return Promise.resolve({ approved: false, source: "disabled", reason: "自动审批未启用" });
+  input = { ...input, taskContext: loadApprovalTaskContext(db, input.messageId, input.senderId) };
   let current = reviews.get(db);
   if (!current) { current = new Map(); reviews.set(db, current); }
   const key = JSON.stringify([input.turnId, input.senderId, config.larkExecutionApproverId]);

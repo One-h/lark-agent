@@ -12,3 +12,6 @@ export * from "./stickers.js";
 export * from "./worker.js";
 export * from "./turnAutoApproval.js";
 export * from "./turnApprovalNotifications.js";
+export * from "./approvalLifecycle.js";
+export * from "./approvalTaskContext.js";
+export * from "./hostHttp.js";

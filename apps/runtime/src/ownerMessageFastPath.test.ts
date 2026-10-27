@@ -11,7 +11,7 @@ test("enabled owner message sends once without a card and records its narrow aut
   let sends = 0;
   const runtime = createRuntime({ runtimeToken: "test-token", databasePath: path.join(root, "runtime.sqlite"), mode: "shadow",
     trustedSenderIds: ["ou_owner"], approverId: "ou_owner",
-    approvalCardSender: () => { cards++; return { ok: false, error: "approval required" }; },
+    turnActivityProbe: async () => true, approvalCardSender: () => { cards++; return { ok: false, error: "approval required" }; },
     proactiveMessageSender: () => { sends++; return { ok: true, messageId: "om_fake_send", chatId: "oc_contact", messageAt: new Date().toISOString(), messageType: "text" }; }
   });
   try {
@@ -38,7 +38,7 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
   let sends = 0;
   const runtime = createRuntime({ runtimeToken: "test-token", databasePath: path.join(root, "runtime.sqlite"), mode: "shadow",
     trustedSenderIds: ["ou_owner", "ou_trusted"], approverId: "ou_owner",
-    approvalCardSender: () => { cards++; return { ok: false, error: "approval required" }; },
+    turnActivityProbe: async () => true, approvalCardSender: () => { cards++; return { ok: false, error: "approval required" }; },
     proactiveMessageSender: () => { sends++; return { ok: false, error: "must never send" }; }
   });
   try {
@@ -79,7 +79,7 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
         context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: c.scope ?? "trusted", turnId: c.callTurn ?? turn }
       } });
       assert.notEqual(result.statusCode, 200, JSON.stringify(c));
-      if (c.chatType !== "group") expectedCards++;
+      if (c.chatType !== "group" && !c.callTurn && c.status !== "answered") expectedCards++;
       assert.equal(cards, expectedCards, JSON.stringify(c));
       assert.equal(sends, 0, JSON.stringify(c));
     }

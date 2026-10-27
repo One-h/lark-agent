@@ -15,10 +15,10 @@ test("deployment host capability can use automatic turn approval while unrelated
   const runtime=createRuntime({databasePath:path.join(root,"test.sqlite"),mode:"shadow",trustedSenderIds:[],approverId:"ou_owner",runtimeToken:"secret",hostBaseUrl:`http://127.0.0.1:${address.port}`,
     turnApprovalReviewer:async()=>{reviews++;return {decision:"approve_turn",reason:"范围明确的部署"};},
     autoApprovalNotificationSender:async recipient=>{notifications.push(recipient);return {ok:true,messageId:"om_notice",chatId:null,messageAt:null,messageType:"interactive"};},
-    approvalCardSender:(_recipient,card)=>{cards.push(card.approvalId);return {ok:true,messageId:"om_card"};}});
+    turnActivityProbe:async()=>true, approvalCardUpdater:()=>{}, approvalCardSender:(_recipient,card)=>{cards.push(card.approvalId);return {ok:true,messageId:"om_card"};}});
   try {
     const now=new Date().toISOString();
-    runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_turn_id,raw_json,received_at,created_at) VALUES (1,'oc_test','ou_sender','部署生产 demo-api','deployment-turn','{}',?,?)").run(now,now);
+    runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (1,'oc_test','ou_sender','部署生产 demo-api','deployment-turn','running','{}',?,?)").run(now,now);
     await runtime.app.inject({ headers: { authorization: "Bearer secret" },method:"POST",url:"/v1/capabilities/register",payload:{capabilities:[{id:"forge.deploy.production",title:"部署",description:"部署指定服务",inputSchema:{},risk:"external-write"},{id:"external.send",title:"外发",description:"外发信息",inputSchema:{},risk:"external-write"}]}});
     await runtime.app.inject({method:"PATCH",url:"/v1/settings",payload:{turnAutoApprovalEnabled:true}});
     const invoke=(id:string,input:unknown)=>runtime.app.inject({method:"POST",url:`/v1/internal/capabilities/${id}/execute`,headers:{authorization:"Bearer secret"},payload:{input,context:{larkMessageId:1,chatId:"oc_test",trustScope:"untrusted",turnId:"deployment-turn"}}});
@@ -28,11 +28,11 @@ test("deployment host capability can use automatic turn approval while unrelated
     await retryPendingAutoApprovalNotifications();assert.deepEqual(notifications,["ou_owner"]);
     const wrongTarget=invoke("forge.deploy.production",{repo:"demo-worker",apps:["demo-worker"],expectedRevision:"aaaaaaa"});
     for(let i=0;!cards.length&&i<30;i++)await new Promise(resolve=>setTimeout(resolve,10));
-    assert.equal(cards.length,1);await runtime.app.inject({method:"POST",url:`/v1/approvals/${cards[0]}/reject`});
+    assert.equal(cards.length,1);await runtime.app.inject({headers:{authorization:"Bearer secret"},method:"POST",url:`/v1/approvals/${cards[0]}/reject`});
     assert.equal((await wrongTarget).statusCode,409);assert.equal(deployments,2);cards.length=0;
     const pending=invoke("external.send",{});
     for(let i=0;!cards.length&&i<30;i++)await new Promise(resolve=>setTimeout(resolve,10));
-    assert.equal(cards.length,1);await runtime.app.inject({method:"POST",url:`/v1/approvals/${cards[0]}/reject`});
+    assert.equal(cards.length,1);await runtime.app.inject({headers:{authorization:"Bearer secret"},method:"POST",url:`/v1/approvals/${cards[0]}/reject`});
     assert.equal((await pending).statusCode,409);
   } finally {await runtime.app.close();runtime.stop();await host.close();fs.rmSync(root,{recursive:true,force:true});}
 });
@@ -70,11 +70,11 @@ test("host review tools reuse one model decision per sender and turn, and extern
   const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "shadow", workspaceRoot: root,
     trustedSenderIds: [], approverId: "ou_owner", runtimeToken: "secret", hostBaseUrl: `http://127.0.0.1:${address.port}`,
     turnApprovalReviewer: async () => { reviews++; return { decision: "approve_turn", reason: "PR review only" }; },
-    approvalCardSender: (_recipient, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_card" }; }
+    turnActivityProbe:async()=>true, approvalCardUpdater:()=>{}, approvalCardSender: (_recipient, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_card" }; }
   });
   const insertMessage = (id: number, sender: string, turn: string) => {
     const now = new Date().toISOString();
-    runtime.store.db.prepare("INSERT INTO lark_messages (id,message_id,chat_id,sender_id,content,codex_turn_id,raw_json,received_at,created_at) VALUES (?,?,'oc_test',?,?,?,'{}',?,?)")
+    runtime.store.db.prepare("INSERT INTO lark_messages (id,message_id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (?,?,'oc_test',?,?,?,'running','{}',?,?)")
       .run(id, `om_${id}`, sender, "https://git.example.com/team/repo/pulls/23 please review", turn, now, now);
   };
   const invoke = (id: number, sender: string, turn: string, value: number, capability = "forge.review") => {
@@ -96,7 +96,7 @@ test("host review tools reuse one model decision per sender and turn, and extern
     const pending = invoke(5, "ou_sender", "turn-one", 5, "forge.deploy");
     for (let i = 0; !cards.length && i < 30; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(cards.length, 1); assert.equal(calls, 4);
-    await runtime.app.inject({ method: "POST", url: `/v1/approvals/${cards[0]}/reject` });
+    await runtime.app.inject({ headers:{authorization:"Bearer secret"}, method: "POST", url: `/v1/approvals/${cards[0]}/reject` });
     assert.equal((await pending).statusCode, 409); assert.equal(calls, 4);
     const audit = (await runtime.app.inject({ method: "GET", url: "/v1/approvals" })).json().autoReviews;
     assert.equal(audit.length, 3); assert(audit.every((row: { applied_at: string }) => row.applied_at));
@@ -108,17 +108,17 @@ test("failed model review returns to the existing human card and cannot execute 
   const cards: number[] = [];
   const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "shadow", trustedSenderIds: [], approverId: "ou_owner", runtimeToken: "secret",
     turnApprovalReviewer: async () => { throw new Error("reviewer timeout"); },
-    approvalCardSender: (_recipient, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_card" }; }
+    turnActivityProbe:async()=>true, approvalCardUpdater:()=>{}, approvalCardSender: (_recipient, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_card" }; }
   });
   try {
     const now = new Date().toISOString();
-    runtime.store.db.prepare("INSERT INTO lark_messages (id,chat_id,sender_id,content,codex_turn_id,raw_json,received_at,created_at) VALUES (1,'oc_test','ou_sender','review PR','turn-test','{}',?,?)").run(now, now);
+    runtime.store.db.prepare("INSERT INTO lark_messages (id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (1,'oc_test','ou_sender','review PR','turn-test','running','{}',?,?)").run(now, now);
     await runtime.app.inject({ headers: { authorization: "Bearer secret" }, method: "POST", url: "/v1/capabilities/register", payload: { capabilities: [{ id: "forge.review", title: "Review", description: "Review", inputSchema: {}, risk: "local-write" }] } });
     await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true } });
     const pending = runtime.app.inject({ method: "POST", url: "/v1/internal/capabilities/forge.review/execute", headers: { authorization: "Bearer secret" }, payload: { input: {}, context: { larkMessageId: 1, chatId: "oc_test", trustScope: "untrusted", turnId: "turn-test" } } });
     for (let i = 0; !cards.length && i < 30; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(cards.length, 1);
-    await runtime.app.inject({ method: "POST", url: `/v1/approvals/${cards[0]}/reject` });
+    await runtime.app.inject({ headers:{authorization:"Bearer secret"}, method: "POST", url: `/v1/approvals/${cards[0]}/reject` });
     assert.equal((await pending).statusCode, 409);
     const audit = (await runtime.app.inject({ method: "GET", url: "/v1/approvals" })).json().autoReviews[0];
     assert.equal(audit.decision, "manual"); assert.equal(audit.applied_at, null); assert.match(audit.reason, /timeout/);

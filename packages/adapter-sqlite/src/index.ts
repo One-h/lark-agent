@@ -26,6 +26,8 @@ export type CapabilityApproval = {
   id: number;
   lark_message_id: number;
   turn_id: string | null;
+  thread_id: string | null;
+  requester_id: string | null;
   capability_id: string | null;
   operation: string;
   approver_id: string;
@@ -34,6 +36,8 @@ export type CapabilityApproval = {
   decided_at: string | null;
   card_message_id: string | null;
   created_at: string;
+  approval_scope: "once" | "turn";
+  error: string | null;
 };
 
 export class SqliteAgentStore {
@@ -175,6 +179,12 @@ export class SqliteAgentStore {
     this.ensureColumn("lark_messages", "outbound_source", "TEXT");
     this.ensureColumn("lark_messages", "root_message_id", "TEXT");
     this.ensureColumn("lark_messages", "thread_id", "TEXT");
+    this.ensureColumn("lark_capability_approvals", "approval_scope", "TEXT NOT NULL DEFAULT 'once'");
+    this.ensureColumn("lark_capability_approvals", "error", "TEXT");
+    this.ensureColumn("lark_capability_approvals", "requester_id", "TEXT");
+    this.ensureColumn("lark_capability_approvals", "thread_id", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_capability_turn_grant ON lark_capability_approvals(turn_id, approver_id, status, approval_scope)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_execution_turn_grant ON lark_execution_approvals(turn_id, requester_id, approver_id, approval_scope, status)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_p2p_sender_time ON lark_messages(chat_type, sender_id, message_at DESC, id DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_p2p_recipient_time ON lark_messages(chat_type, recipient_id, message_at DESC, id DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_group_time ON lark_messages(chat_id, message_at DESC, id DESC) WHERE chat_type='group'");
@@ -208,7 +218,10 @@ export class SqliteAgentStore {
   }
 
   createApproval(input: { larkMessageId: number; turnId: string; capabilityId?: string | null; operation: string; approverId: string; expiresAt: string }): number {
-    return Number(this.db.prepare("INSERT INTO lark_capability_approvals (lark_message_id, turn_id, capability_id, operation, approver_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(input.larkMessageId, input.turnId, input.capabilityId ?? null, input.operation, input.approverId, input.expiresAt, new Date().toISOString()).lastInsertRowid);
+    return Number(this.db.prepare(`INSERT INTO lark_capability_approvals
+      (lark_message_id,turn_id,capability_id,operation,approver_id,expires_at,created_at,requester_id,thread_id)
+      VALUES (?,?,?,?,?,?,?,(SELECT sender_id FROM lark_messages WHERE id=?),(SELECT codex_session_id FROM lark_messages WHERE id=?))`)
+      .run(input.larkMessageId, input.turnId, input.capabilityId ?? null, input.operation, input.approverId, input.expiresAt, new Date().toISOString(), input.larkMessageId, input.larkMessageId).lastInsertRowid);
   }
 
   approval(id: number): CapabilityApproval | null {

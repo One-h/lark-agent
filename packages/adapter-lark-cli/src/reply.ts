@@ -201,17 +201,20 @@ export function sendLarkImagePostReply(
   return { ok: false, error: (result.stderr || result.stdout || `lark-cli exited with code ${result.status}`).trim() };
 }
 
-export type LarkExecutionApprovalCardInput = {
+export type LarkExecutionApprovalDetails = {
   requester: string;
   originalMessage: string;
   operation: string;
   operationCount?: number;
   cwd: string | null;
   reason: string | null;
-  approvalToken: string;
+  taskContext?: string;
 };
+export type LarkExecutionApprovalCardInput = LarkExecutionApprovalDetails & (
+  { approvalToken: string; approvalId?: never } | { approvalId: number; approvalToken?: never }
+);
 
-export type LarkExecutionApprovalResultCardInput = Omit<LarkExecutionApprovalCardInput, "approvalToken"> & {
+export type LarkExecutionApprovalResultCardInput = LarkExecutionApprovalDetails & {
   status: "approved" | "rejected" | "expired" | "failed";
   approvalScope: "once" | "turn";
   decidedAt: string;
@@ -232,6 +235,7 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
   const details = [
     `**请求人**：${compactCardText(input.requester, 120)}`,
     `**原始消息**：${compactCardText(input.originalMessage, 500)}`,
+    input.taskContext ? `**任务背景（历史）**：${compactCardText(input.taskContext, 600)}` : null,
     `${operationLabel}：${compactCardText(input.operation, 800)}`,
     input.cwd ? `**工作目录**：${compactCardText(input.cwd, 300)}` : null,
     input.reason ? `**原因**：${compactCardText(input.reason, 300)}` : null
@@ -240,7 +244,7 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
     config: { wide_screen_mode: true },
     header: {
       template: "orange",
-      title: { tag: "plain_text", content: "Codex 执行授权" }
+      title: { tag: "plain_text", content: "Lark Agent 执行授权" }
     },
     elements: [
       { tag: "div", text: { tag: "lark_md", content: details.join("\n") } },
@@ -251,19 +255,19 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
             tag: "button",
             type: "primary",
             text: { tag: "plain_text", content: "允许本次" },
-            value: { action: "approve", approval_token: input.approvalToken }
+            value: { action: "approve", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
           },
           {
             tag: "button",
             type: "default",
             text: { tag: "plain_text", content: "允许当前任务" },
-            value: { action: "approve-turn", approval_token: input.approvalToken }
+            value: { action: "approve-turn", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
           },
           {
             tag: "button",
             type: "default",
             text: { tag: "plain_text", content: "拒绝" },
-            value: { action: "reject", approval_token: input.approvalToken }
+            value: { action: "reject", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
           }
         ]
       },
@@ -283,8 +287,8 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
 export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprovalResultCardInput): Record<string, unknown> {
   const status = input.status === "approved"
     ? input.approvalScope === "turn"
-      ? { label: "已允许当前任务", template: "green", note: "当前 Codex turn 内的后续受限操作将自动放行；新 turn 会重新审批。" }
-      : { label: "已允许本次", template: "green", note: "Codex 已继续执行当前操作，后续受限操作仍需审批。" }
+      ? { label: "已允许当前任务", template: "green", note: "当前 Codex turn 内的后续受限操作将自动放行；新 turn 会重新审批。授权不代表执行成功。" }
+      : { label: "已允许本次", template: "green", note: "仅授权当前操作，不代表执行成功；后续受限操作仍需审批。" }
     : input.status === "rejected"
       ? { label: "已拒绝", template: "red", note: "该操作未执行。" }
       : input.status === "expired"
@@ -294,6 +298,7 @@ export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprova
     `**状态**：${status.label}`,
     `**请求人**：${compactCardText(input.requester, 120)}`,
     `**原始消息**：${compactCardText(input.originalMessage, 500)}`,
+    input.taskContext ? `**任务背景（历史）**：${compactCardText(input.taskContext, 600)}` : null,
     `**待执行操作**：${compactCardText(input.operation, 800)}`,
     input.cwd ? `**工作目录**：${compactCardText(input.cwd, 300)}` : null,
     input.reason ? `**原因**：${compactCardText(input.reason, 300)}` : null,
@@ -303,7 +308,7 @@ export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprova
     config: { wide_screen_mode: true },
     header: {
       template: status.template,
-      title: { tag: "plain_text", content: `Codex 执行授权 · ${status.label}` }
+      title: { tag: "plain_text", content: `Lark Agent 执行授权 · ${status.label}` }
     },
     elements: [
       { tag: "div", text: { tag: "lark_md", content: details.join("\n") } },

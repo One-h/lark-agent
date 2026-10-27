@@ -1,7 +1,7 @@
 import { GroupPrivacy, registerGroupPrivacyRoutes } from "./groupPrivacy.js";
 import { AgentMessaging, registerAgentMessagingRoutes } from "./agentMessaging.js";
 import { setExternalMessageHandler } from "@lark-agent/conversation-runtime";
-import Fastify, { type FastifyRequest } from "fastify";
+import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { createHash } from "node:crypto";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -25,11 +25,12 @@ import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-ru
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
 import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
+import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
-export type RuntimeConfig = { databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; approvalCardSender?: typeof sendApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender };
+export type RuntimeConfig = { databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
-type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout };
+type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void };
 type MessageCursor = { messageAt: string; id: number };
 
 const messageSelectColumns = `
@@ -90,7 +91,7 @@ function artifactMimeType(file: string): string {
   const extension = path.extname(file).toLowerCase();
   return extension === ".png" ? "image/png" : extension === ".jpg" || extension === ".jpeg" ? "image/jpeg" : extension === ".gif" ? "image/gif" : extension === ".webp" ? "image/webp" : extension === ".md" ? "text/markdown" : extension === ".html" || extension === ".htm" ? "text/html" : "application/octet-stream";
 }
-function capabilityApprovalAction(event: Record<string, unknown>): { id: number; decision: "approve" | "reject"; actorId?: string } | null {
+export function capabilityApprovalAction(event: Record<string, unknown>): { id: number; decision: "approve" | "approve-turn" | "reject"; actorId: string; messageId: string } | null {
   const nested = event.event && typeof event.event === "object" ? event.event as Record<string, unknown> : {};
   let value = event.action_value ?? nested.action_value;
   if (typeof value === "string") {
@@ -99,10 +100,12 @@ function capabilityApprovalAction(event: Record<string, unknown>): { id: number;
   if (!value || typeof value !== "object") return null;
   const action = value as { approval_id?: unknown; action?: unknown };
   const id = Number(action.approval_id);
-  if (!Number.isInteger(id) || (action.action !== "approve" && action.action !== "reject")) return null;
+  if (!Number.isInteger(id) || id < 1 || !["approve", "approve-turn", "reject"].includes(String(action.action))) return null;
   const operator = event.operator && typeof event.operator === "object" ? event.operator as Record<string, unknown> : nested.operator && typeof nested.operator === "object" ? nested.operator as Record<string, unknown> : {};
-  const actorId = typeof operator.open_id === "string" ? operator.open_id : typeof event.open_id === "string" ? event.open_id : typeof nested.open_id === "string" ? nested.open_id : undefined;
-  return { id, decision: action.action, actorId };
+  const actorId = typeof event.operator_id === "string" ? event.operator_id : typeof operator.open_id === "string" ? operator.open_id : typeof event.open_id === "string" ? event.open_id : typeof nested.open_id === "string" ? nested.open_id : "";
+  const messageId = typeof event.message_id === "string" ? event.message_id : typeof nested.message_id === "string" ? nested.message_id : "";
+  if (!actorId || !messageId) return null;
+  return { id, decision: action.action as "approve" | "approve-turn" | "reject", actorId, messageId };
 }
 function messageTaskDirectory(store: SqliteAgentStore, messageId: number): string | null {
   const row = store.db.prepare("SELECT codex_task_dir FROM lark_messages WHERE id=?").get(messageId) as { codex_task_dir?: string | null } | undefined;
@@ -156,54 +159,105 @@ export function createRuntime(config: RuntimeConfig) {
   store.registerCapabilities([{ id: "lark.message.send", title: "发送飞书消息", description: "Send a bot text message to a known Lark contact. Input requires recipient (name, alias, or open_id) and text.", inputSchema: { type: "object", properties: { recipient: { type: "string" }, text: { type: "string" } }, required: ["recipient", "text"] }, risk: "external-write" }]);
   reconcileLarkCodexResponder();
   const pendingApprovals = new Map<number, PendingApproval>();
+  const authorizations = new Set<{ turnId: string; controller: AbortController; started: boolean }>();
   let activeCapabilityCalls = 0;
   let listener: { stop(): void; running(): boolean } | null = null;
 
   const capabilities = (): StoredCapability[] => store.db.prepare("SELECT id, title, description, input_schema, risk FROM capabilities ORDER BY id").all() as StoredCapability[];
-  const awaitApproval = async (input: { messageId: number; turnId: string; capabilityId?: string; operation: string; originalMessage?: string }): Promise<boolean> => {
-    if (!approverId) return false;
-    const approvalId = store.createApproval({ larkMessageId: input.messageId, turnId: input.turnId, capabilityId: input.capabilityId, operation: input.operation, approverId, expiresAt: new Date(Date.now() + 600000).toISOString() });
-    const source = store.db.prepare("SELECT content FROM lark_messages WHERE id=?").get(input.messageId) as { content?: string } | undefined;
-    const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, operation: input.operation, originalMessage: input.originalMessage ?? source?.content ?? "" });
-    if (!card.ok) { store.decideApproval(approvalId, "rejected"); return false; }
-    if (card.messageId) store.setApprovalCardMessage(approvalId, card.messageId);
-    return new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        if (!pendingApprovals.delete(approvalId)) return;
-        expirePendingApprovals();
-        resolve(false);
-      }, 600000);
-      pendingApprovals.set(approvalId, { resolve, timer });
-    });
+  const liveTurn = (messageId: number, turnId: string) => {
+    const row = store.db.prepare("SELECT codex_status,codex_turn_id FROM lark_messages WHERE id=?").get(messageId) as { codex_status: string; codex_turn_id: string } | undefined;
+    return row?.codex_status === "running" && row.codex_turn_id === turnId;
   };
-  const decide = async (id: number, decision: "approve" | "reject", actorId?: string) => {
-    const approval = store.approval(id);
-    if (!approval || (actorId && actorId !== approval.approver_id) || !store.decideApproval(id, decision === "approve" ? "approved" : "rejected")) return { ok: false };
+  const confirmTurn = async (messageId: number, turnId: string) => {
+    if (!liveTurn(messageId, turnId)) return false;
+    const row = store.db.prepare("SELECT codex_session_id FROM lark_messages WHERE id=?").get(messageId) as { codex_session_id: string | null };
+    // Native-backed calls must also survive an independent native status read.
+    const active = config.turnActivityProbe ? await config.turnActivityProbe(messageId, turnId)
+      : Boolean(row.codex_session_id && await confirmLarkNativeTurnActive(row.codex_session_id, turnId));
+    return active && liveTurn(messageId, turnId);
+  };
+  const approvalDetails = (messageId: number, operation: string) => {
+    const source = store.db.prepare("SELECT m.content,m.sender_id,c.name FROM lark_messages m LEFT JOIN contacts c ON c.open_id=m.sender_id WHERE m.id=?").get(messageId) as { content?: string; sender_id?: string; name?: string } | undefined;
+    return { operation, originalMessage: source?.content ?? "", requester: source?.name ?? source?.sender_id ?? "未知发送人", cwd: workspaceRoot,
+      taskContext: formatApprovalTaskContext(loadApprovalTaskContext(store.db, messageId, source?.sender_id ?? null)) };
+  };
+  const approvalIdentityMatches = (row: NonNullable<ReturnType<typeof store.approval>>) => {
+    const source = store.db.prepare("SELECT sender_id,codex_session_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as { sender_id: string; codex_session_id: string | null } | undefined;
+    return source?.sender_id === row.requester_id && source?.codex_session_id === row.thread_id;
+  };
+  const settleApproval = (id: number, status: "approved" | "rejected" | "expired" | "failed", scope: "once" | "turn" = "once", reason: string | null = null) => {
+    const row = store.approval(id);
+    if (!row || !store.db.prepare("UPDATE lark_capability_approvals SET status=?,approval_scope=?,error=?,decided_at=? WHERE id=? AND status='pending'")
+      .run(status, scope, reason, new Date().toISOString(), id).changes) return false;
     const pending = pendingApprovals.get(id);
-    if (pending) {
-      clearTimeout(pending.timer); pendingApprovals.delete(id);
-      pending.resolve(decision === "approve");
+    if (pending) { clearTimeout(pending.timer); pending.cleanup(); pendingApprovals.delete(id); pending.resolve(status === "approved"); }
+    if (row.card_message_id) {
+      try { (config.approvalCardUpdater ?? updateApprovalCard)(row.card_message_id, { ...approvalDetails(row.lark_message_id, row.operation), status, approvalScope: scope, decidedAt: new Date().toISOString(), reason }); }
+      catch { app.log.warn("capability_approval_card_update_failed"); }
     }
-    const cardMessageId = (approval as { card_message_id?: string | null }).card_message_id;
-    if (cardMessageId) updateApprovalCard(cardMessageId, { operation: approval.operation, status: decision === "approve" ? "approved" : "rejected" });
-    return { ok: true };
+    return true;
+  };
+  const awaitApproval = async (input: { messageId: number; turnId: string; capabilityId?: string; operation: string; originalMessage?: string }, signal: AbortSignal): Promise<boolean> => {
+    if (!approverId || signal.aborted || !liveTurn(input.messageId, input.turnId)) return false;
+    const approvalId = store.createApproval({ larkMessageId: input.messageId, turnId: input.turnId, capabilityId: input.capabilityId, operation: input.operation, approverId, expiresAt: new Date(Date.now() + 600000).toISOString() });
+    const result = new Promise<boolean>(resolve => {
+      const abort = () => settleApproval(approvalId, "failed", "once", "会话已结束或调用已断开，操作未执行。");
+      const timer = setTimeout(() => settleApproval(approvalId, "expired"), 600000);
+      signal.addEventListener("abort", abort, { once: true });
+      pendingApprovals.set(approvalId, { resolve, timer, cleanup: () => signal.removeEventListener("abort", abort) });
+    });
+    try {
+      const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation), reason: "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
+      if (card.ok && card.messageId) store.setApprovalCardMessage(approvalId, card.messageId);
+      else settleApproval(approvalId, "failed", "once", "审批卡未取得发送回执，操作未执行。");
+    } catch { settleApproval(approvalId, "failed", "once", "审批卡发送失败，操作未执行。"); }
+    return result;
   };
   const expirePendingApprovals = () => {
-    for (const approval of store.expireApprovals()) {
-      const pending = pendingApprovals.get(approval.id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        pendingApprovals.delete(approval.id);
-        pending.resolve(false);
+    const rows = store.db.prepare("SELECT * FROM lark_capability_approvals WHERE status='pending'").all() as ReturnType<typeof store.approval>[];
+    for (const row of rows) {
+      if (!row) continue;
+      if (!pendingApprovals.has(row.id) || !liveTurn(row.lark_message_id, row.turn_id ?? "") || !approvalIdentityMatches(row) || row.approver_id !== approverId)
+        settleApproval(row.id, "failed", "once", "对应会话或审批等待已结束，操作未执行。");
+      else if (Date.parse(row.expires_at) <= Date.now()) settleApproval(row.id, "expired");
+      else {
+        const source = store.db.prepare("SELECT sender_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as { sender_id: string };
+        if (hasLarkManualTurnApproval(store.db, { turnId: row.turn_id!, threadId: row.thread_id, senderId: source.sender_id, approverId })) settleApproval(row.id, "approved", "turn");
       }
-      const cardMessageId = (approval as { card_message_id?: string | null }).card_message_id;
-      if (cardMessageId) updateApprovalCard(cardMessageId, { operation: approval.operation, status: "expired" });
     }
+    reconcilePendingExecutionTurnApprovals();
+  };
+  const decide = async (id: number, decision: "approve" | "approve-turn" | "reject", actorId?: string, messageId?: string) => {
+    const row = store.approval(id);
+    if (!row || row.status !== "pending" || (actorId && (actorId !== row.approver_id || messageId !== row.card_message_id))) return { ok: false };
+    if (!await confirmTurn(row.lark_message_id, row.turn_id ?? "")) {
+      settleApproval(id, "failed", "once", "无法确认原生会话仍在执行，操作未执行。"); return { ok: false };
+    }
+    if (!pendingApprovals.has(id) || !liveTurn(row.lark_message_id, row.turn_id ?? "") || !approvalIdentityMatches(row) || row.approver_id !== approverId) {
+      settleApproval(id, "failed", "once", "对应会话或审批等待已结束，操作未执行。"); return { ok: false };
+    }
+    if (Date.parse(row.expires_at) <= Date.now()) { settleApproval(id, "expired"); return { ok: false }; }
+    const ok = settleApproval(id, decision === "reject" ? "rejected" : "approved", decision === "approve-turn" ? "turn" : "once");
+    if (ok && decision === "approve-turn") expirePendingApprovals();
+    return { ok };
+  };
+  const removeTurnListener = onLarkTurnEnded(store.db, turnId => {
+    for (const call of authorizations) if (call.turnId === turnId && !call.started) call.controller.abort();
+  });
+  app.addHook("preClose", async () => {
+    stopListener();
+    for (const call of authorizations) if (!call.started) call.controller.abort();
+    for (const id of [...pendingApprovals.keys()]) settleApproval(id, "failed", "once", "服务已关闭，操作未执行。");
+    while (activeCapabilityCalls > 0) await new Promise(resolve => setTimeout(resolve, 20));
+    removeTurnListener();
+  });
+  const decideApprovalFromCard = (event: Record<string, unknown>) => {
+    const action = capabilityApprovalAction(event);
+    return action ? decide(action.id, action.decision, action.actorId, action.messageId) : Promise.resolve({ ok: false });
   };
   setAdditionalLarkApprovalHandler((event) => {
-    const action = capabilityApprovalAction(event);
-    if (!action) return false;
-    void decide(action.id, action.decision, action.actorId);
+    if (!capabilityApprovalAction(event)) return false;
+    void decideApprovalFromCard(event);
     return true;
   });
   const invokeHost = async (capability: StoredCapability, input: unknown, context: Record<string, unknown>): Promise<unknown> => {
@@ -230,17 +284,17 @@ export function createRuntime(config: RuntimeConfig) {
       return { sent: true, recipient: contact.name, messageId: sent.messageId, _receipt: { status: sent.messageId ? "verified" : "executed", summary: sent.messageId ? `已向 ${contact.name} 发送飞书消息。` : `已向 ${contact.name} 提交飞书消息发送。`, evidence: sent.messageId ? [`message_id: ${sent.messageId}`] : [] } };
     }
     if (!config.hostBaseUrl) throw new Error("Host integration is not configured");
-    const response = await fetch(`${config.hostBaseUrl.replace(/\/$/, "")}/api/lark-agent/capabilities/${encodeURIComponent(capability.id)}`, { method: "POST", headers: { "content-type": "application/json", ...(config.hostToken ? { authorization: `Bearer ${config.hostToken}` } : {}) }, body: JSON.stringify({ input, context }) });
-    const body = await response.text();
+    const response = await postHostJson(`${config.hostBaseUrl.replace(/\/$/, "")}/api/lark-agent/capabilities/${encodeURIComponent(capability.id)}`, { input, context }, config.hostToken ? { authorization: `Bearer ${config.hostToken}` } : {});
+    const body = response.body;
     if (!response.ok) throw new Error(body || `Host returned HTTP ${response.status}`);
     try { return JSON.parse(body); } catch { return body; }
   };
-  const executeCapabilityInternal = async (id: string, input: unknown, context: { larkMessageId?: unknown; chatId?: unknown; trustScope?: unknown; turnId?: unknown; callId?: unknown }): Promise<unknown> => {
+  const executeCapabilityInternal = async (id: string, input: unknown, context: { larkMessageId?: unknown; chatId?: unknown; trustScope?: unknown; turnId?: unknown; callId?: unknown }, requestSignal?: AbortSignal): Promise<unknown> => {
     const capability = capabilities().find((entry) => entry.id === id);
     if (!capability) throw new Error("Capability is not registered");
     const larkMessageId = Number(context.larkMessageId);
     const message = Number.isInteger(larkMessageId) && typeof context.chatId === "string"
-      ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_turn_id, codex_status, message_type, sender_type, direction FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string } | undefined
+      ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_session_id, codex_turn_id, codex_status, message_type, sender_type, direction FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_session_id?: string | null; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string } | undefined
       : undefined;
     if (!message || message.chat_id !== context.chatId) throw new Error("Invalid capability context");
     if (message.chat_type === "group") throw new Error("群消息不能调用旧宿主能力；请使用群聊隐私单次审批。");
@@ -257,7 +311,22 @@ export function createRuntime(config: RuntimeConfig) {
       throw new Error("The same capability invocation is already running in this turn");
     }
     const approvalRequired = capability.risk === "external-write" || (capability.risk === "local-write" && expectedScope !== "trusted");
+    const call = { turnId, controller: new AbortController(), started: false };
+    authorizations.add(call);
+    const signal = requestSignal ? AbortSignal.any([requestSignal, call.controller.signal]) : call.controller.signal;
+    const cancelled = () => {
+      if (!call.started && store.db.open) store.db.prepare("UPDATE lark_capability_invocations SET status='failed',error=?,finished_at=? WHERE turn_id=? AND capability_id=? AND input_hash=? AND status='running'")
+        .run("授权等待已取消，操作未执行。", new Date().toISOString(), turnId, id, inputHash);
+    };
+    signal.addEventListener("abort", cancelled, { once: true });
+    const assertActive = () => {
+      if (signal.aborted || !liveTurn(larkMessageId, turnId)) throw new Error("会话已结束、turn 已变化或调用已断开，未开始新的操作。");
+      const current = store.db.prepare("SELECT sender_id,chat_id,codex_session_id FROM lark_messages WHERE id=?").get(larkMessageId) as { sender_id: string; chat_id: string; codex_session_id: string | null };
+      if (current.sender_id !== message.sender_id || current.chat_id !== context.chatId || current.codex_session_id !== message.codex_session_id || (isTrustedLarkSender(current.sender_id) ? "trusted" : "untrusted") !== expectedScope)
+        throw new Error("Capability identity changed while awaiting authorization");
+    };
     try {
+      assertActive();
       let ownerMessageApproved = false;
       if (id === "lark.message.send" && message.codex_status === "running" && message.codex_turn_id === turnId) {
         const payload = input as { recipient?: unknown; text?: unknown } | null;
@@ -280,16 +349,23 @@ export function createRuntime(config: RuntimeConfig) {
           });
         }
       }
-      let automaticallyApproved = ownerMessageApproved;
+      let automaticallyApproved = ownerMessageApproved || hasLarkManualTurnApproval(store.db, { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
       const deploymentInScope=deploymentOperationMatchesTask(approvalTask(message.content ?? ""),`${capability.id}: ${textResult(input)}`);
-      if (approvalRequired && (capability.risk === "local-write" || (id === "forge.deploy.production" && deploymentInScope)) && store.setting("turnAutoApprovalEnabled", "false") === "true") {
+      if (approvalRequired && !automaticallyApproved && (capability.risk === "local-write" || (id === "forge.deploy.production" && deploymentInScope)) && store.setting("turnAutoApprovalEnabled", "false") === "true") {
         const reviewerApprover = approverId;
-        const decision = await reviewLarkTurnAutoApproval({ messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
-          originalMessage: message.content ?? "", operation: `${capability.id}: ${textResult(input)}`, cwd: workspaceRoot });
+        const decision = await waitForTurnAuthorization(reviewLarkTurnAutoApproval({ messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
+          originalMessage: message.content ?? "", operation: `${capability.id}: ${textResult(input)}`, cwd: workspaceRoot }), signal);
+        assertActive();
+        if (!await confirmTurn(larkMessageId, turnId)) throw new Error("自动审核返回时原生会话已失效，操作未执行。");
+        assertActive();
         automaticallyApproved = decision.approved && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover;
         if (automaticallyApproved && decision.reviewId) markTurnAutoApprovalApplied(decision.reviewId);
       }
-      if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id, operation: `${capability.title}: ${textResult(input)}`, originalMessage: message.content })) throw new Error("Operation was not approved");
+      if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id, operation: `${capability.title}: ${textResult(input)}`, originalMessage: message.content }, signal)) throw new Error("Operation was not approved or its turn ended");
+      assertActive();
+      if (!await confirmTurn(larkMessageId, turnId)) throw new Error("无法确认原生 turn 仍有效，未执行操作。");
+      assertActive();
+      call.started = true;
       const hostResult = await invokeHost(capability, input, {
         ...context,
         senderId: message.sender_id,
@@ -302,9 +378,9 @@ export function createRuntime(config: RuntimeConfig) {
       return result;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      store.db.prepare("UPDATE lark_capability_invocations SET status='failed', error=?, finished_at=? WHERE turn_id=? AND capability_id=? AND input_hash=?").run(messageText, new Date().toISOString(), turnId, id, inputHash);
+      if (store.db.open) store.db.prepare("UPDATE lark_capability_invocations SET status='failed', error=?, finished_at=? WHERE turn_id=? AND capability_id=? AND input_hash=?").run(messageText, new Date().toISOString(), turnId, id, inputHash);
       throw error;
-    }
+    } finally { signal.removeEventListener("abort", cancelled); authorizations.delete(call); }
   };
   const executeCapability = async (...args: Parameters<typeof executeCapabilityInternal>): Promise<unknown> => {
     activeCapabilityCalls++;
@@ -527,7 +603,7 @@ export function createRuntime(config: RuntimeConfig) {
     if (!store.db.prepare("SELECT 1 FROM lark_messages WHERE id=?").get(id)) return reply.code(404).send({ error: "not found" });
     const approvals = [
       ...store.db.prepare("SELECT * FROM lark_execution_approvals WHERE lark_message_id=?").all(id),
-        ...store.db.prepare("SELECT id, lark_message_id, approver_id, capability_id AS request_method, operation, NULL AS cwd, capability_id AS reason, status, 'once' AS approval_scope, card_message_id, NULL AS card_error, created_at, expires_at, decided_at FROM lark_capability_approvals WHERE lark_message_id=?").all(id)
+        ...store.db.prepare("SELECT id, lark_message_id, approver_id, capability_id AS request_method, operation, NULL AS cwd, capability_id AS reason, status, approval_scope, card_message_id, error AS card_error, created_at, expires_at, decided_at FROM lark_capability_approvals WHERE lark_message_id=?").all(id)
     ].sort((left, right) => Number((left as { id: number }).id) - Number((right as { id: number }).id));
     return { executionConfigs: parseLarkExecutionConfigs(messageTaskFile(store, id, "execution-configs.jsonl")), prompt: messageTaskFile(store, id, "prompt.md"), stdout: messageTaskFile(store, id, "codex.stdout.jsonl"), stderr: messageTaskFile(store, id, "codex.stderr.log"), launcher: messageTaskFile(store, id, "run-codex-lark.sh"), referencedImages: messageTaskFile(store, id, "referenced-images.json"), referencedFiles: messageTaskFile(store, id, "referenced-files.json"), imageDownloadError: messageTaskFile(store, id, "image-download-error.log"), fileDownloadError: messageTaskFile(store, id, "file-download-error.log"), trustedSender: messageTaskFile(store, id, "trusted-sender.json"), resumeSession: messageTaskFile(store, id, "resume-session.json"), outboundMedia: messageTaskFile(store, id, "outbound-media.json"), turnResult: messageTaskFile(store, id, "turn-result.json"), approvals, receipts: store.db.prepare("SELECT * FROM lark_execution_receipts WHERE lark_message_id=? ORDER BY id").all(id), deliveries: store.db.prepare("SELECT id, kind, status, attempts, last_error, sent_at, created_at FROM lark_delivery_outbox WHERE lark_message_id=? ORDER BY id").all(id), events: [] };
   });
@@ -596,8 +672,11 @@ export function createRuntime(config: RuntimeConfig) {
     const custom = store.setting("prompt.larkAssistant", "").trim(); const defaultValue = defaultConfigurablePrompt("larkAssistant");
     return { larkAssistant: custom || defaultValue, defaultLarkAssistant: defaultValue, customized: Boolean(custom) };
   });
-  app.post("/v1/approvals/:id/approve", async (request) => decide(Number((request.params as { id: string }).id), "approve"));
-  app.post("/v1/approvals/:id/reject", async (request) => decide(Number((request.params as { id: string }).id), "reject"));
+  for (const decision of ["approve", "approve-turn", "reject"] as const) app.post(`/v1/approvals/:id/${decision}`, async (request, reply) => {
+    if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" });
+    const result = await decide(Number((request.params as { id: string }).id), decision);
+    return reply.code(result.ok ? 200 : 409).send(result);
+  });
   app.post("/v1/messages", async (request, reply) => { if (!request.body || typeof request.body !== "object") return reply.code(400).send({ error: "invalid Lark event" }); return ingestLarkEvent(request.body as Record<string, unknown>); });
   app.post("/v1/messages/:id/retry", async (request, reply) => { const id = Number((request.params as { id: string }).id); const message = store.db.prepare("SELECT id, codex_status FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string } | undefined; if (!message) return reply.code(404).send({ error: "message not found" }); return enqueueLarkCodexReply(id) ? reply.code(202).send({ id, status: "queued" }) : reply.code(409).send({ error: `message status ${message.codex_status} cannot be retried` }); });
   app.post("/v1/capabilities/register", async (request, reply) => {
@@ -609,8 +688,20 @@ export function createRuntime(config: RuntimeConfig) {
       && ["read", "local-write", "external-write"].includes(entry.risk))) return reply.code(400).send({ error: "invalid capability registration or reserved builtin id" });
     store.registerCapabilities(entries); return { registered: entries.length };
   });
-  app.post("/v1/capabilities/:id/invoke", async (request, reply) => { if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" }); const payload = request.body as { input?: unknown; context?: Record<string, unknown> }; try { return await executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}); } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); } });
-  app.post("/v1/internal/capabilities/:id/execute", async (request, reply) => { if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" }); const payload = request.body as { input?: unknown; context?: Record<string, unknown> }; try { return await executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}); } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); } });
+  const capabilityRoute = async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" });
+    const controller = new AbortController();
+    const aborted = () => controller.abort();
+    const closed = () => { if (!reply.raw.writableEnded) controller.abort(); };
+    request.raw.once("aborted", aborted); reply.raw.once("close", closed);
+    if (request.raw.aborted) controller.abort();
+    const payload = request.body as { input?: unknown; context?: Record<string, unknown> };
+    try { return await executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}, controller.signal); }
+    catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); }
+    finally { request.raw.off("aborted", aborted); reply.raw.off("close", closed); }
+  };
+  app.post("/v1/capabilities/:id/invoke", capabilityRoute);
+  app.post("/v1/internal/capabilities/:id/execute", capabilityRoute);
   app.post("/v1/internal/attachments/register", async (request, reply) => {
     if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
     const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
@@ -698,7 +789,7 @@ export function createRuntime(config: RuntimeConfig) {
     }
     return allSettings();
   });
-  return { app, store, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); stopLarkCodexResponder(); store.close(); } };
+  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); stopLarkCodexResponder(); removeTurnListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {

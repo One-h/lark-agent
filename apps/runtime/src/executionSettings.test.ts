@@ -88,16 +88,17 @@ test("permission changes wait for an in-flight host call even without a native r
   await host.listen({host: "127.0.0.1", port: 0});
   const address = host.server.address(); assert(address && typeof address !== "string");
   const runtime = createRuntime({ runtimeToken: "test-token",databasePath: path.join(root, "test.sqlite"), mode: "shadow", trustedSenderIds: ["ou_trusted"], workspaceRoot: root,
-    hostBaseUrl: `http://127.0.0.1:${address.port}`});
+    turnActivityProbe: async () => true, hostBaseUrl: `http://127.0.0.1:${address.port}`});
   let pending: Promise<unknown> | undefined;
   try {
     await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {trustedExecutionEnabled: true}});
     runtime.store.registerCapabilities([{id: "local.write", title: "写入", description: "fixture", inputSchema: {}, risk: "local-write"}]);
     const now = new Date().toISOString();
-    runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,raw_json,received_at,created_at) VALUES (1,'oc','ou_trusted','fixture','{}',?,?)").run(now, now);
+    runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_status,codex_turn_id,raw_json,received_at,created_at) VALUES (1,'oc','ou_trusted','fixture','running','fixture-turn','{}',?,?)").run(now, now);
     pending = Promise.resolve(runtime.app.inject({ headers: { authorization: "Bearer test-token" },method: "POST", url: "/v1/internal/capabilities/local.write/execute", payload: {input: {}, context: {larkMessageId: 1, chatId: "oc", trustScope: "trusted", turnId: "fixture-turn"}}}));
     for (let i = 0; !entered && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(entered, true);
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='answered' WHERE id=1").run();
     for (const payload of [{trustedExecutionEnabled: false}, {trustedSenderIds: []}, {approverId: "ou_new"}]) {
       assert.equal((await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload})).statusCode, 409);
     }
@@ -113,15 +114,18 @@ test("disabling trusted execution also gates host local-write capabilities", asy
   await host.listen({host: "127.0.0.1", port: 0});
   const address = host.server.address(); assert(address && typeof address !== "string");
   const runtime = createRuntime({ runtimeToken: "test-token",databasePath: path.join(root, "test.sqlite"), mode: "shadow", trustedSenderIds: ["ou_trusted"], approverId: "ou_owner",
-    hostBaseUrl: `http://127.0.0.1:${address.port}`, approvalCardSender: () => { cards++; return {ok: false, error: "fixture rejected"}; }});
+    turnActivityProbe: async () => true, hostBaseUrl: `http://127.0.0.1:${address.port}`, approvalCardSender: () => { cards++; return {ok: false, error: "fixture rejected"}; }});
   try {
     const now = new Date().toISOString();
     runtime.store.registerCapabilities([{id: "local.write", title: "写入", description: "fixture", inputSchema: {}, risk: "local-write"}]);
     runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,raw_json,received_at,created_at) VALUES (1,'oc_test','ou_trusted','fixture','{}',?,?)").run(now, now);
     await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {trustedExecutionEnabled: true}});
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='before' WHERE id=1").run();
     const invoke = (trustScope: string, turnId: string) => runtime.app.inject({ headers: { authorization: "Bearer test-token" },method: "POST", url: "/v1/internal/capabilities/local.write/execute", payload: {input: {}, context: {larkMessageId: 1, chatId: "oc_test", trustScope, turnId}}});
     assert.equal((await invoke("trusted", "before")).statusCode, 200);
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='answered' WHERE id=1").run();
     await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {trustedExecutionEnabled: false}});
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='after' WHERE id=1").run();
     assert.notEqual((await invoke("trusted", "forged")).statusCode, 200);
     assert.notEqual((await invoke("untrusted", "after")).statusCode, 200);
     assert.equal(cards, 1);

@@ -362,7 +362,8 @@ test("proactive sends are persisted once and exposed through message DTOs", asyn
     mode: "shadow",
     trustedSenderIds: ["ou_owner"],
     approverId: "ou_approver",
-    approvalCardSender: (_approver, input) => { approvalIds.push(input.approvalId); return { ok: true, messageId: null }; },
+    turnActivityProbe: async () => true, approvalCardUpdater: () => {},
+    approvalCardSender: (_approver, input) => { approvalIds.push(input.approvalId); return { ok: true, messageId: "om_approval" }; },
     proactiveMessageSender: () => ({ ok: true, messageId: "om_proactive", chatId: "oc_contact", messageAt: "2026-09-03T04:05:06.000Z", messageType: "text" })
   });
   try {
@@ -370,10 +371,11 @@ test("proactive sends are persisted once and exposed through message DTOs", asyn
     const now = new Date().toISOString();
     runtime.store.db.prepare("INSERT INTO contacts (open_id,name,aliases,email,department,p2p_chat_id,updated_at) VALUES (?,?,?,?,?,?,?)").run("ou_contact", "Alice", "[]", null, null, "oc_contact", now);
     const inbound = (await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: { event_id: "evt-proactive", chat_id: "oc_owner", chat_type: "p2p", sender_id: "ou_owner", sender_type: "user", message_type: "text", content: "send" } })).json() as { id: number };
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='turn-proactive' WHERE id=?").run(inbound.id);
     const pending = runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: "/v1/internal/capabilities/lark.message.send/execute", payload: { input: { recipient: "Alice", text: "hello" }, context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: "trusted", turnId: "turn-proactive" } } });
     for (let index = 0; approvalIds.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(approvalIds.length, 1);
-    await runtime.app.inject({ method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
+    await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
     assert.equal((await pending).statusCode, 200);
 
     recordOutboundLarkMessage({ messageId: "om_proactive", chatId: "oc_contact", chatType: "p2p", recipientId: "ou_contact", content: "hello", replyToMessageId: null, messageAt: "2026-09-03T04:05:06.000Z", messageType: "text", source: "proactive" });
@@ -402,7 +404,8 @@ test("proactive delivery remains successful when outbound recording fails", asyn
     mode: "shadow",
     trustedSenderIds: ["ou_owner"],
     approverId: "ou_approver",
-    approvalCardSender: (_approver, input) => { approvalIds.push(input.approvalId); return { ok: true, messageId: null }; },
+    turnActivityProbe: async () => true, approvalCardUpdater: () => {},
+    approvalCardSender: (_approver, input) => { approvalIds.push(input.approvalId); return { ok: true, messageId: "om_approval" }; },
     proactiveMessageSender: () => {
       sends += 1;
       return { ok: true, messageId: "om_proactive_record_failure", chatId: "oc_contact", messageAt: "2026-09-03T04:05:06.000Z", messageType: "text" };
@@ -413,10 +416,11 @@ test("proactive delivery remains successful when outbound recording fails", asyn
     const now = new Date().toISOString();
     runtime.store.db.prepare("INSERT INTO contacts (open_id,name,aliases,email,department,p2p_chat_id,updated_at) VALUES (?,?,?,?,?,?,?)").run("ou_contact", "Alice", "[]", null, null, "oc_contact", now);
     const inbound = (await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: { event_id: "evt-proactive-record-failure", chat_id: "oc_owner", chat_type: "p2p", sender_id: "ou_owner", sender_type: "user", message_type: "text", content: "send" } })).json() as { id: number };
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='turn-proactive-record-failure' WHERE id=?").run(inbound.id);
     runtime.store.db.exec("CREATE TRIGGER reject_outbound_record BEFORE INSERT ON lark_messages WHEN NEW.direction='outbound' BEGIN SELECT RAISE(FAIL, 'simulated outbound record failure'); END");
     const pending = runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: "/v1/internal/capabilities/lark.message.send/execute", payload: { input: { recipient: "Alice", text: "hello" }, context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: "trusted", turnId: "turn-proactive-record-failure" } } });
     for (let index = 0; approvalIds.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    await runtime.app.inject({ method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
+    await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
     const response = await pending;
 
     assert.equal(response.statusCode, 200);
@@ -715,7 +719,8 @@ test("Lark messages invoke host capabilities with verified trust and approval", 
     approverId: "ou_approver",
     hostBaseUrl: `http://127.0.0.1:${hostAddress.port}`,
     runtimeToken: "test-token",
-    approvalCardSender: (_approver, input) => { cards.push(input.approvalId); return { ok: true, messageId: null }; }
+    turnActivityProbe: async () => true, approvalCardUpdater: () => {},
+    approvalCardSender: (_approver, input) => { cards.push(input.approvalId); return { ok: true, messageId: "om_approval" }; }
   });
   try {
     runtime.store.setSetting("trustedExecutionEnabled", "true");
@@ -727,7 +732,7 @@ test("Lark messages invoke host capabilities with verified trust and approval", 
     for (let index = 0; cards.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(cards.length, 1);
     assert.equal(runtime.store.approval(cards[0])?.lark_message_id, larkMessageId);
-    assert.deepEqual((await runtime.app.inject({ method: "POST", url: `/v1/approvals/${cards[0]}/approve` })).json(), { ok: true });
+    assert.deepEqual((await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${cards[0]}/approve` })).json(), { ok: true });
     assert.equal((await pending).statusCode, 200);
     assert.equal(calls, 1);
     assert.deepEqual(hostPayload, {

@@ -15,9 +15,9 @@ const records = `
   FROM lark_execution_approvals a
   WHERE a.card_message_id IS NOT NULL OR a.status IN ('pending','failed','rejected','expired')
   UNION ALL
-  SELECT a.id, 'capability', a.lark_message_id, 'manual', a.status, NULL,
-    m.sender_id, a.approver_id, NULL, a.capability_id, NULL, NULL, NULL,
-    a.created_at, a.decided_at, 'once'
+  SELECT a.id, 'capability', a.lark_message_id, 'manual', a.status, a.error,
+    COALESCE(a.requester_id,m.sender_id), a.approver_id, NULL, a.capability_id, NULL, NULL, NULL,
+    a.created_at, a.decided_at, a.approval_scope
   FROM lark_capability_approvals a LEFT JOIN lark_messages m ON m.id=a.lark_message_id
 `;
 const joins = `LEFT JOIN lark_messages m ON m.id=r.messageId
@@ -41,10 +41,10 @@ function details(store: SqliteAgentStore, kind: string, id: number, includeMatch
         NULL AS matchedApprovalId,NULL AS appliedAt,created_at AS createdAt,decided_at AS completedAt,
         approval_scope AS scope,cwd,turn_id AS turnId,NULL AS usageJson,card_error AS error,operation
        FROM lark_execution_approvals WHERE id=?`
-    : `SELECT a.id,'capability' AS kind,a.lark_message_id AS messageId,'manual' AS source,a.status,NULL AS reason,
-        m.sender_id AS requesterId,a.approver_id AS approverId,NULL AS taskType,a.capability_id AS target,NULL AS model,
+    : `SELECT a.id,'capability' AS kind,a.lark_message_id AS messageId,'manual' AS source,a.status,a.error AS reason,
+        COALESCE(a.requester_id,m.sender_id) AS requesterId,a.approver_id AS approverId,NULL AS taskType,a.capability_id AS target,NULL AS model,
         NULL AS matchedApprovalId,NULL AS appliedAt,a.created_at AS createdAt,a.decided_at AS completedAt,
-        'once' AS scope,NULL AS cwd,a.turn_id AS turnId,NULL AS usageJson,NULL AS error,a.operation
+        a.approval_scope AS scope,NULL AS cwd,a.turn_id AS turnId,NULL AS usageJson,a.error AS error,a.operation
        FROM lark_capability_approvals a LEFT JOIN lark_messages m ON m.id=a.lark_message_id WHERE a.id=?`;
   const row = store.db.prepare(`SELECT ${listColumns},m.content AS request,m.codex_session_id AS sessionId
     FROM (${select}) r ${joins}`).get(id) as Record<string, unknown> | undefined;

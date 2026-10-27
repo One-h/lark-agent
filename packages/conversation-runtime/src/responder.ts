@@ -10,6 +10,9 @@ import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, s
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
 import { PromptInstructionCache, type PromptInstructionSnapshot } from "./promptInstructionCache.js";
 import { sanitizeLarkReply } from "./replySanitization.js";
+import { hasLarkManualTurnApproval, notifyLarkTurnEnded } from "./approvalLifecycle.js";
+import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
+import { postHostJson } from "./hostHttp.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -199,6 +202,7 @@ type ActiveLarkCodexRun = {
   hasStartedSubstantiveWork: boolean;
   pendingInterim: AgentMessageEvent | null;
   pendingSteers: number;
+  hostToolCalls: Set<AbortController>;
   pendingApprovalIds: Set<number>;
   authRetryAttempted: boolean;
   authRecovering: boolean;
@@ -254,6 +258,23 @@ const pendingTurnNotifications = new Map<string, CodexAppServerNotification[]>()
 export async function larkResponderOwnsThread(threadId: string): Promise<boolean> {
   if (!codexAppServer.status().running) return false;
   return isNativeThreadLoaded((method, params) => codexAppServer.requestIfRunning(method, params), threadId);
+}
+
+export async function confirmLarkNativeTurnActive(threadId: string, turnId: string): Promise<boolean> {
+  const run = [...activeLarkCodexRuns.values()].find(row => row.threadId === threadId && row.turnId === turnId && !row.settled);
+  if (!run || !codexAppServer.status().running) return false;
+  try {
+    const state = await readNativeTurnState((method, params) => codexAppServer.requestIfRunning(method, params, 10_000), threadId, turnId);
+    if (!run.settled && run.turnId === turnId && ["completed", "failed", "interrupted"].includes(state.status)) {
+      for (const item of state.items ?? []) {
+        if (item.type === "agentMessage") handleRunNotification(run, { method: "item/completed", params: { threadId, turnId, item } });
+      }
+      handleRunNotification(run, { method: "turn/completed", params: {
+        threadId, turn: { id: turnId, status: state.status, items: state.items ?? [], error: state.error }
+      } });
+    }
+    return state.status === "active" && !run.settled && run.turnId === turnId && activeLarkCodexRuns.get(run.sessionKey) === run;
+  } catch { return false; }
 }
 const pendingExecutionApprovals = new Map<number, PendingLarkExecutionApproval>();
 const archivingLarkThreads = new Map<string, Promise<void>>();
@@ -1962,6 +1983,9 @@ function finishRun(
     return;
   }
   run.settled = true;
+  notifyLarkTurnEnded(db, run.turnId);
+  for (const controller of run.hostToolCalls) controller.abort();
+  cancelRunExecutionApprovals(run, "对应会话已结束，审批失效，未执行待审批操作。");
   clearInterval(run.timer);
   if (run.capacityRetryTimer) clearTimeout(run.capacityRetryTimer);
   run.cancelCapacityWait?.();
@@ -2431,6 +2455,10 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
     const turn = params?.turn;
     const answer = run.finalAgentMessage ?? run.lastAgentMessage;
     if (turn?.status === "completed") {
+      if (run.hostToolCalls.size > 0) {
+        finishRun(run, "failed", answer, "Codex 会话在宿主调用结束前终止，未开始的待审批操作已取消。");
+        return;
+      }
       finishRun(run, "answered", answer, null);
       return;
     }
@@ -2771,6 +2799,7 @@ function refreshPendingExecutionApprovalBatchCard(
   const result = updatePendingLarkExecutionApprovalCard(row.card_message_id, {
     requester: requester?.name ?? target.row.sender_id ?? "未知发送人",
     originalMessage: target.row.content ?? "",
+    taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, target.row.id, target.row.sender_id)),
     operation,
     operationCount: pending.requests.length,
     cwd: row.cwd,
@@ -2798,6 +2827,7 @@ function refreshExecutionApprovalCard(
   const result = updateLarkExecutionApprovalCard(row.card_message_id, {
     requester: source?.requester_name ?? source?.sender_id ?? row.requester_id ?? "未知发送人",
     originalMessage: source?.content ?? "",
+    taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, row.lark_message_id, row.requester_id)),
     operation: row.operation ?? "修改本机状态",
     cwd: row.cwd,
     reason: row.reason,
@@ -2816,6 +2846,11 @@ function completePendingExecutionApproval(
   decision: "approved_once" | "approved_turn" | "rejected" | "expired"
 ): { ok: boolean; status: string; message: string } {
   const pending = pendingExecutionApprovals.get(row.id);
+  if (pending && (pending.run.settled || activeLarkCodexRuns.get(pending.run.sessionKey) !== pending.run
+    || pending.run.turnId !== row.turn_id || row.approver_id !== config.larkExecutionApproverId)) {
+    cancelRunExecutionApprovals(pending.run, "对应会话或审批范围已变化，审批失效，操作未执行。");
+    return { ok: false, status: "failed", message: "对应会话已结束或授权范围已变化。" };
+  }
   if (!pending) {
     const decidedAt = nowIso();
     db.prepare(`
@@ -2905,6 +2940,28 @@ function completePendingExecutionApproval(
           ? `已拒绝当前批次的 ${pending.requests.length} 项操作。`
           : "审批已过期，当前批次操作未执行。"
   };
+}
+
+function cancelRunExecutionApprovals(run: ActiveLarkCodexRun, reason: string): void {
+  for (const pending of [...pendingExecutionApprovals.values()]) {
+    if (pending.run !== run) continue;
+    const row = pendingApprovalRow(pending.approvalId);
+    clearPendingExecutionApproval(pending);
+    const now = nowIso();
+    for (const request of pending.requests) {
+      db.prepare("UPDATE lark_execution_approvals SET status='failed',card_error=?,decided_at=? WHERE id=? AND status='pending'").run(reason, now, request.approvalId);
+      try { codexAppServer.respondToRequest(request.requestId, request.rejectedResponse); } catch { /* The native turn may already be closed. */ }
+    }
+    if (row) refreshExecutionApprovalCard({ ...row, reason }, "failed", now);
+  }
+}
+
+export function reconcilePendingExecutionTurnApprovals(): void {
+  for (const pending of [...pendingExecutionApprovals.values()]) {
+    const row = pendingApprovalRow(pending.approvalId);
+    if (row?.status === "pending" && hasLarkManualTurnApproval(db, { turnId: row.turn_id, threadId: row.thread_id, senderId: row.requester_id, approverId: config.larkExecutionApproverId }))
+      completePendingExecutionApproval(row, "approved_turn");
+  }
 }
 
 export function decideLarkExecutionApproval(
@@ -3033,15 +3090,11 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
     return true;
   }
   appendPreparedLog(target, { method: "item/tool/call", params });
+  const controller = new AbortController();
+  run.hostToolCalls.add(controller);
   void (async () => {
     try {
-      const response = await fetch(`${config.larkAgentRuntimeUrl.replace(/\/$/, "")}/v1/internal/capabilities/${encodeURIComponent(capability.id)}/execute`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(config.larkAgentRuntimeToken ? { authorization: `Bearer ${config.larkAgentRuntimeToken}` } : {})
-        },
-        body: JSON.stringify({
+      const response = await postHostJson(`${config.larkAgentRuntimeUrl.replace(/\/$/, "")}/v1/internal/capabilities/${encodeURIComponent(capability.id)}/execute`, {
           input: params.arguments ?? {},
           context: {
             larkMessageId: target.row.id,
@@ -3050,9 +3103,9 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
             turnId: params.turnId,
             callId: typeof params.callId === "string" ? params.callId : null
           }
-        })
-      });
-      const body = await response.text();
+        }, config.larkAgentRuntimeToken ? { authorization: `Bearer ${config.larkAgentRuntimeToken}` } : {}, controller.signal);
+      if (run.settled || run.turnId !== params.turnId) return;
+      const body = response.body;
       if (!response.ok) throw new Error(body || `Host capability returned HTTP ${response.status}`);
       let modelResult = body || "null";
       try {
@@ -3064,11 +3117,12 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
       } catch { /* Non-JSON host results are forwarded unchanged. */ }
       codexAppServer.respondToRequest(request.id, { success: true, contentItems: [{ type: "inputText", text: modelResult }] });
     } catch (error) {
+      if (run.settled || run.turnId !== params.turnId) return;
       const message = error instanceof Error ? error.message : String(error);
       appendPreparedError(target, `Host capability ${capability.id} failed: ${message}`);
       codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: message }] });
-    }
-  })();
+    } finally { run.hostToolCalls.delete(controller); }
+  })().catch(() => console.warn("lark_host_tool_callback_failed"));
   return true;
 }
 
@@ -3143,6 +3197,13 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
   }
   details.turnId = run.turnId;
   const target = responseRunMember(run);
+  if (hasLarkManualTurnApproval(db, { turnId: run.turnId, threadId: run.threadId, senderId: target.row.sender_id, approverId: config.larkExecutionApproverId })) {
+    run.turnApprovalRequesterId = target.row.sender_id;
+    run.turnApprovalApproverId = config.larkExecutionApproverId;
+    run.turnApprovalAutoReviewId = null;
+    autoApproveTurnExecution(run, request, details, target);
+    return true;
+  }
   if (shouldReuseLarkTurnApproval({
     runTurnId: run.turnId,
     requestTurnId: details.turnId,
@@ -3314,6 +3375,7 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
     {
       requester: requester?.name ?? target.row.sender_id ?? "未知发送人",
       originalMessage: target.row.content ?? "",
+      taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, target.row.id, target.row.sender_id)),
       operation: details.operation,
       cwd: details.cwd,
       reason: details.reason,
@@ -3608,6 +3670,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     hasStartedSubstantiveWork: false,
     pendingInterim: null,
     pendingSteers: 0,
+    hostToolCalls: new Set(),
     pendingApprovalIds: new Set<number>(),
     authRetryAttempted: false,
     authRecovering: false,
