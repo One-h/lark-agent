@@ -72,6 +72,7 @@ type LarkPromptAttachments = {
   backgroundMessages?: LarkGroupContextMessage[];
   recentMessages?: LarkGroupContextMessage[];
   recentMessagesOmitted?: number;
+  recentMessagesHasMore?: boolean;
   contextKind?: "main" | "topic";
   stickerContextToken?: string;
 };
@@ -425,7 +426,8 @@ function prepareRecentLarkMessages(
   headerLines = [
     "群聊上下文（同一会话，严格按时间从旧到新排列；超长时只保留最近消息）：",
     "格式说明：L<number> 是本地稳定消息 ID；“回复 L<number>”表示该消息直接引用另一条消息。"
-  ]
+  ],
+  hasMore = false
 ): { text: string; selectedIds: Set<number> } {
   if (messages.length === 0 || maxChars <= 0) {
     return { text: "", selectedIds: new Set() };
@@ -462,8 +464,8 @@ function prepareRecentLarkMessages(
     return line;
   });
   const omitted = omittedCount + Math.max(0, messages.length - selectedMessages.length);
-  const lines = omitted > 0
-    ? [`... 已省略更早的 ${omitted} 条消息`, ...selectedLines]
+  const lines = hasMore || omitted > 0
+    ? [hasMore ? "... 已省略更早的消息" : `... 已省略更早的 ${omitted} 条消息`, ...selectedLines]
     : selectedLines;
   return {
     text: [header, ...lines].join("\n"),
@@ -492,7 +494,8 @@ function prepareLarkContextPrompt(attachments: LarkPromptAttachments): { text: s
       : [
         "普通群聊上下文（不含任何话题消息，严格按时间从旧到新排列）：",
         "格式说明：L<number> 是本地稳定消息 ID；“回复 L<number>”表示该消息直接引用另一条消息。"
-      ]
+      ],
+    attachments.recentMessagesHasMore ?? false
   );
   return {
     text: [background.text, recent.text].filter(Boolean).join("\n\n"),
@@ -503,9 +506,10 @@ function prepareLarkContextPrompt(attachments: LarkPromptAttachments): { text: s
 export function formatRecentLarkMessages(
   messages: LarkPromptAttachments["recentMessages"] = [],
   maxChars = config.larkRecentMessageContextMaxChars,
-  omittedCount = 0
+  omittedCount = 0,
+  hasMore = false
 ): string {
-  return prepareRecentLarkMessages(messages, maxChars, omittedCount).text;
+  return prepareRecentLarkMessages(messages, maxChars, omittedCount, undefined, hasMore).text;
 }
 
 function larkMentionOpenIds(rawJson: string | null | undefined): string[] {
@@ -1235,7 +1239,7 @@ export function loadRecentLarkChatMessages(chatId: string | null, currentMessage
 type LarkGroupContext = {
   backgroundMessages: LarkGroupContextMessage[];
   messages: LarkGroupContextMessage[];
-  omittedCount: number;
+  hasMore: boolean;
   cursorId: number | null;
   contextKind: "main" | "topic";
 };
@@ -1303,7 +1307,7 @@ export function loadLarkGroupContext(
   includeGroupBackground = false
 ): LarkGroupContext {
   if (!message.chat_id || limit <= 0) {
-    return { backgroundMessages: [], messages: [], omittedCount: 0, cursorId: null, contextKind: "main" };
+    return { backgroundMessages: [], messages: [], hasMore: false, cursorId: null, contextKind: "main" };
   }
   const cursor = larkGroupContextCursor(message, trustedSender);
   const rootMessageId = message.root_message_id?.trim() || null;
@@ -1315,17 +1319,13 @@ export function loadLarkGroupContext(
   const scopeParams = topic
     ? [threadId!, ...(rootMessageId ? [rootMessageId] : [])]
     : [];
-  const count = db.prepare(`
-    SELECT count(*) AS count
-    FROM lark_messages AS messages
-    WHERE messages.chat_id = ? AND messages.id > ? AND messages.id < ? AND ${scopeSql}
-  `).get(message.chat_id, cursor, message.id, ...scopeParams) as { count: number };
-  const messages = db.prepare(`
+  const candidates = db.prepare(`
     ${larkGroupMessageSelect()}
     WHERE messages.chat_id = ? AND messages.id > ? AND messages.id < ? AND ${scopeSql}
     ORDER BY COALESCE(messages.message_at, messages.received_at, messages.created_at) DESC, messages.id DESC
     LIMIT ?
-  `).all(message.chat_id, cursor, message.id, ...scopeParams, limit).reverse() as LarkGroupContextMessage[];
+  `).all(message.chat_id, cursor, message.id, ...scopeParams, limit + 1) as LarkGroupContextMessage[];
+  const messages = candidates.slice(0, limit).reverse();
   let backgroundMessages: LarkGroupContextMessage[] = [];
   if (topic && includeGroupBackground) {
     const root = rootMessageId
@@ -1342,7 +1342,7 @@ export function loadLarkGroupContext(
   return {
     backgroundMessages,
     messages,
-    omittedCount: Math.max(0, count.count - messages.length),
+    hasMore: candidates.length > limit,
     cursorId: message.id,
     contextKind: topic ? "topic" : "main"
   };
@@ -3385,7 +3385,7 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
   }
   const groupContext = prepared.row.chat_type && prepared.row.chat_type !== "p2p"
     ? loadLarkGroupContext(prepared.row, prepared.trustedSender, getAppSettings().larkGroupContextMessageLimit, promptMode === "full")
-    : { backgroundMessages: [], messages: [], omittedCount: 0, cursorId: null, contextKind: "main" as const };
+    : { backgroundMessages: [], messages: [], hasMore: false, cursorId: null, contextKind: "main" as const };
   const attachments: LarkPromptAttachments = {
     conversationStyle: prepared.conversationStyle,
     referencedImagePaths: prepared.referencedImagePaths,
@@ -3395,7 +3395,7 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
     trustedSender: prepared.trustedSender,
     backgroundMessages: groupContext.backgroundMessages,
     recentMessages: groupContext.messages,
-    recentMessagesOmitted: groupContext.omittedCount,
+    recentMessagesHasMore: groupContext.hasMore,
     contextKind: groupContext.contextKind,
     stickerContextToken: prepared.stickerContextToken
   };

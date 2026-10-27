@@ -179,6 +179,9 @@ export class SqliteAgentStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_p2p_recipient_time ON lark_messages(chat_type, recipient_id, message_at DESC, id DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_group_time ON lark_messages(chat_id, message_at DESC, id DESC) WHERE chat_type='group'");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_group_topic ON lark_messages(chat_id, root_message_id, thread_id, message_at DESC, id DESC) WHERE chat_type='group'");
+    // Context queries also include historical rows without a populated chat_type.
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_context_time ON lark_messages(chat_id, COALESCE(message_at, received_at, created_at) DESC, id DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_context_root ON lark_messages(chat_id, root_message_id, thread_id)");
 
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_contact_aliases_alias ON contact_aliases(alias)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_stickers_content_hash ON stickers(content_hash) WHERE content_hash IS NOT NULL");

@@ -225,9 +225,10 @@ test("conversation runtime responder preserves bounded group context and stable 
     const current = { id: currentId, chat_id: "oc_group", chat_type: "group", root_message_id: null, thread_id: null };
     const context = loadLarkGroupContext(current, false, 3);
     assert.deepEqual(context.messages.map((item) => item.content), ["第4条", "第5条", "第6条"]);
-    const formatted = formatRecentLarkMessages(context.messages, 1000, context.omittedCount);
+    const formatted = formatRecentLarkMessages(context.messages, 1000, 0, context.hasMore);
     const [fourth, fifth, sixth] = context.messages;
-    assert.match(formatted, /已省略更早的 3 条/);
+    assert.equal(context.hasMore, true);
+    assert.match(formatted, /已省略更早的消息/);
     assert.match(formatted, new RegExp(`\\[L${fourth.id}\\] \\[[^\\]]+\\] 林小夏：第4条`));
     assert.match(formatted, new RegExp(`\\[L${fifth.id}\\] \\[[^\\]]+\\] ou_5（回复 L${fourth.id}）：第5条`));
     assert.doesNotMatch(formatted, new RegExp(`回复 L${fourth.id}「第4条」`));
@@ -236,7 +237,7 @@ test("conversation runtime responder preserves bounded group context and stable 
     assert.ok(formatted.indexOf(`[L${fifth.id}]`) < formatted.indexOf(`[L${sixth.id}]`));
 
     const outsideParentContext = loadLarkGroupContext(current, false, 2);
-    const outsideParentFormatted = formatRecentLarkMessages(outsideParentContext.messages, 1000, outsideParentContext.omittedCount);
+    const outsideParentFormatted = formatRecentLarkMessages(outsideParentContext.messages, 1000, 0, outsideParentContext.hasMore);
     assert.match(outsideParentFormatted, new RegExp(`回复窗口外的 L${fourth.id}「第4条」`));
 
     const delta = buildLarkCodexDeltaPrompt({
@@ -249,7 +250,7 @@ test("conversation runtime responder preserves bounded group context and stable 
       reply_to_message_id: "om-5",
       reply_to_message_type: "text",
       reply_to_content: "第5条"
-    }, { recentMessages: context.messages, recentMessagesOmitted: context.omittedCount });
+    }, { recentMessages: context.messages, recentMessagesHasMore: context.hasMore });
     assert.ok(delta.indexOf(`[L${sixth.id}]`) < delta.indexOf("最新追加消息："));
     assert.match(delta, new RegExp(`\\[L${currentId}\\] ou_current（回复 L${fifth.id}）：当前`));
     assert.doesNotMatch(delta, /reply_to_message_id: om-5|reply_to_content: 第5条/);
@@ -303,7 +304,7 @@ test("conversation runtime isolates Lark topics and bootstraps them with ordinar
     }, {
       backgroundMessages: topicContext.backgroundMessages,
       recentMessages: topicContext.messages,
-      recentMessagesOmitted: topicContext.omittedCount,
+      recentMessagesHasMore: topicContext.hasMore,
       contextKind: topicContext.contextKind
     });
     assert.ok(topicPrompt.indexOf("话题创建前的群聊背景") < topicPrompt.indexOf("当前话题上下文"));
