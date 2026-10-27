@@ -8,6 +8,8 @@ import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegi
 import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
 import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection } from "./stickers.js";
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
+import { PromptInstructionCache, type PromptInstructionSnapshot } from "./promptInstructionCache.js";
+import { sanitizeLarkReply } from "./replySanitization.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -24,30 +26,9 @@ import { attachmentDigest, attachmentToolPrompt, matchingAttachmentState, regist
   type AttachmentState, type RegisteredAttachment, type ReplyMedia } from "./replyAttachments.js";
 
 const legacyLongRunningProgressText = "还在处理，暂时没收口。我会继续跑到拿到完整结果，再回来给最终结论。";
-const untrustedReplyFallbackText = "收到。建议按分配处理；已处理的在 issue 里补充对应 PR/commit 或版本并 @ 创建人确认后再关闭；不确定的先补充现象、复现和验证结果，避免误关。";
 const larkExecutionApprovalTtlMs = 10 * 60 * 1000;
 const larkThreadArchiveDelayMs = 30_000;
-const untrustedReplySensitivePatterns = [
-  /\/(?:Users|home)\/[^/\s]+\//i,
-  /\bAGENTS\.md\b/i,
-  /\bSKILL\.md\b/i,
-  /docs\/skills/i,
-  /knowledge\/topics/i,
-  /(?:本机|当前|项目)?\s*工作区/i,
-  /工作区规则/i,
-  /内部上下文/i,
-  /\bcontext\b/i,
-  /可信校验/i,
-  /可信用户/i,
-  /不可信/i,
-  /权限边界/i,
-  /执行边界/i,
-  /read-only/i,
-  /sandbox/i,
-  /Codex exec/i,
-  /当前发送人/i,
-  /线上 mutation/i
-];
+const promptInstructionCache = new PromptInstructionCache();
 
 type LarkGroupContextMessage = {
   id: number;
@@ -65,6 +46,7 @@ type LarkGroupContextMessage = {
 
 type LarkPromptAttachments = {
   conversationStyle?: ConversationStyle;
+  includeStableInstructions?: boolean;
   referencedImagePaths?: string[];
   missingImageCount?: number;
   referencedFiles?: LarkReferencedFile[];
@@ -169,6 +151,7 @@ type PreparedLarkCodexMessage = {
   stickerContextToken: string;
   historyImages: HistoryImageState;
   conversationStyle: ConversationStyle;
+  promptInstructions?: PromptInstructionSnapshot;
   row: LarkMessageRow;
   messageId: string;
   taskDir: string;
@@ -591,25 +574,8 @@ export function isLarkNoReplyDecision(answer: string | null | undefined): boolea
   return /^<(?:lark|forge)-no-reply\s*\/>$/i.test(answer?.trim() ?? "");
 }
 
-function containsUntrustedReplySensitiveText(text: string): boolean {
-  return untrustedReplySensitivePatterns.some((pattern) => pattern.test(text));
-}
-
 export function sanitizeLarkCodexReply(answer: string, trustedSender: boolean): string {
-  const trimmed = answer.trim();
-  if (trustedSender || !trimmed || !containsUntrustedReplySensitiveText(trimmed)) {
-    return trimmed;
-  }
-  const cleaned = trimmed
-    .split(/\r?\n/)
-    .filter((line) => !containsUntrustedReplySensitiveText(line))
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  if (!cleaned || containsUntrustedReplySensitiveText(cleaned)) {
-    return untrustedReplyFallbackText;
-  }
-  return cleaned;
+  return sanitizeLarkReply(answer, trustedSender, [config.workspaceRoot, config.repoRoot, config.taskOutputDir]);
 }
 
 export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: string | null = null, registered?: RegisteredAttachment[]): { text: string; media: LarkReplyMedia[]; errors: string[]; stickerIds: string[] } {
@@ -879,8 +845,8 @@ export function buildLarkCodexDeltaPrompt(
   const style = attachments.conversationStyle ?? captureConversationStyle(message.chat_id);
   return [
     "这是同一飞书 Codex 会话中的新增消息。此前角色说明、权限范围、技能和历史上下文已经在当前 thread 中，不要重新陈述它们。优先处理以下新增内容。",
-    style.effectiveInstructions,
-    groupMentionInstruction,
+    attachments.includeStableInstructions === false ? "" : style.effectiveInstructions,
+    attachments.includeStableInstructions === false ? "" : groupMentionInstruction,
     spontaneousParticipationInstruction,
     mediaOutputInstruction,
     stickerInstruction,
@@ -1735,6 +1701,8 @@ function writeSessionArtifact(
     persona: prepared.conversationStyle.persona,
     globalPromptHash: prepared.conversationStyle.globalPromptHash,
     promptMode: prepared.promptMode,
+    stableInstructions: prepared.promptInstructions ? (prepared.promptInstructions.included ? "included" : "reused") : "pending",
+    stableInstructionFingerprint: prepared.promptInstructions?.fingerprint ?? null,
     configuredModel: prepared.executionConfig?.model ?? configuredLarkCodexModel(),
     appliedModel: prepared.executionConfig?.model ?? null,
     reasoningEffort: prepared.executionConfig?.reasoningEffort ?? null,
@@ -1761,6 +1729,19 @@ function recordAcceptedExecutionConfig(prepared: PreparedLarkCodexMessage, snaps
   recordLarkExecutionConfig(prepared.taskDir, snapshot);
   prepared.executionConfig = snapshot;
   appendPreparedLog(prepared, { method: "turn/execution-config", params: snapshot });
+}
+
+function acceptPreparedPrompt(prepared: PreparedLarkCodexMessage, threadId: string, turnId: string): void {
+  if (!prepared.promptInstructions) return;
+  promptInstructionCache.accept(prepared.promptInstructions);
+  try {
+    appendPreparedLog(prepared, { method: "turn/prompt-context", params: {
+      threadId, turnId, stableInstructions: prepared.promptInstructions.included ? "included" : "reused",
+      fingerprint: prepared.promptInstructions.fingerprint, promptChars: prepared.prompt.length
+    } });
+  } catch {
+    console.warn(`lark_prompt_context_log_failed messageId=${prepared.row.id}`);
+  }
 }
 
 function appendPreparedLog(prepared: PreparedLarkCodexMessage, notification: CodexAppServerNotification): void {
@@ -2563,6 +2544,7 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
   run.turnApprovalRequesterId = null;
   run.turnApprovalApproverId = null;
   run.turnApprovalAutoReviewId = null;
+  promptInstructionCache.clear();
   codexAppServer.stop();
   try {
     const threadParams = buildLarkCodexThreadParams(run.trustedSender, "resume");
@@ -2572,8 +2554,10 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
     });
     const threadId = resumed.thread.id;
     loadedLarkThreadParameters.set(threadId, threadParams);
+    updatePreparedPrompt(prepared, prepared.promptMode ?? "full", threadId);
     const turnParams = buildLarkCodexTurnParams(prepared, threadId);
     const turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
+    acceptPreparedPrompt(prepared, threadId, turn.turn.id);
 
     pendingTurnNotifications.delete(previousTurnId);
     unregisterCodexAppServerTurn(previousTurnId);
@@ -2616,7 +2600,11 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
 }
 
 function handleAppServerNotification(notification: CodexAppServerNotification): void {
-  const lifecycle = notification.params as { threadId?: string; status?: { type?: string } } | undefined;
+  const lifecycle = notification.params as { threadId?: string; status?: { type?: string }; item?: { type?: string } } | undefined;
+  if (lifecycle?.threadId && (notification.method === "thread/deleted" || notification.method === "thread/compacted"
+    || (["item/started", "item/completed"].includes(notification.method) && lifecycle.item?.type === "contextCompaction"))) {
+    promptInstructionCache.invalidate(lifecycle.threadId);
+  }
   if (lifecycle?.threadId && (notification.method === "thread/closed" || notification.method === "thread/deleted"
     || (notification.method === "thread/status/changed" && lifecycle.status?.type === "notLoaded"))) {
     loadedLarkThreadParameters.delete(lifecycle.threadId);
@@ -3372,6 +3360,7 @@ function failPendingExecutionApprovals(error: string): void {
 }
 
 codexAppServer.onExit((error) => {
+  promptInstructionCache.clear();
   loadedLarkThreadParameters.clear();
   failPendingExecutionApprovals(error.message);
   for (const run of [...activeLarkCodexRuns.values()]) {
@@ -3379,8 +3368,18 @@ codexAppServer.onExit((error) => {
   }
 });
 
-function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: LarkPromptMode): void {
-  if (prepared.promptMode === promptMode && prepared.prompt) {
+function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: LarkPromptMode, threadId?: string): void {
+  const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ version: 1,
+    instructions: prepared.conversationStyle.effectiveInstructions,
+    globalPromptHash: prepared.conversationStyle.globalPromptHash,
+    group: prepared.row.chat_type !== "p2p", trusted: prepared.trustedSender,
+    chatId: prepared.row.chat_id, workspace: config.workspaceRoot, repoRoot: config.repoRoot
+  })).digest("hex");
+  const snapshot = threadId ? promptInstructionCache.prepare(threadId, fingerprint, promptMode === "full") : undefined;
+  const sameInstructions = prepared.promptInstructions?.fingerprint === snapshot?.fingerprint
+    && prepared.promptInstructions?.included === snapshot?.included;
+  prepared.promptInstructions = snapshot;
+  if (prepared.promptMode === promptMode && prepared.prompt && sameInstructions) {
     return;
   }
   const groupContext = prepared.row.chat_type && prepared.row.chat_type !== "p2p"
@@ -3388,6 +3387,7 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
     : { backgroundMessages: [], messages: [], hasMore: false, cursorId: null, contextKind: "main" as const };
   const attachments: LarkPromptAttachments = {
     conversationStyle: prepared.conversationStyle,
+    includeStableInstructions: snapshot?.included ?? true,
     referencedImagePaths: prepared.referencedImagePaths,
     missingImageCount: prepared.missingImageCount,
     referencedFiles: prepared.referencedFiles,
@@ -3488,7 +3488,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
         threadId = resumed.thread.id;
         loadedLarkThreadParameters.set(threadId, resumeParams);
       }
-      updatePreparedPrompt(prepared, workspaceChanged ? "full" : "delta");
+      updatePreparedPrompt(prepared, workspaceChanged ? "full" : "delta", threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendPreparedError(prepared, `Unable to resume Codex thread ${threadId}: ${message}`);
@@ -3507,6 +3507,8 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     loadedLarkThreadParameters.set(threadId, startParams);
     createdThread = true;
   }
+
+  updatePreparedPrompt(prepared, prepared.promptMode ?? "full", threadId);
 
     upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
   updateCodexState(prepared.row.id, { status: "running", sessionId: threadId, heartbeatAt: nowIso(), taskDir: prepared.taskDir });
@@ -3532,6 +3534,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
         throw new Error("Codex app-server lost workspace access while another Lark turn is active; retry the message after the active turn finishes");
       }
       appendPreparedError(prepared, "Codex app-server lost workspace access; restarting it before retrying the turn.");
+      promptInstructionCache.clear();
       codexAppServer.stop();
       const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", {
         threadId,
@@ -3540,7 +3543,8 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
       threadId = resumed.thread.id;
       loadedLarkThreadParameters.set(threadId, resumeParams);
       upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
-      turnParams = { ...turnParams, threadId };
+      updatePreparedPrompt(prepared, prepared.promptMode ?? "full", threadId);
+      turnParams = { ...turnParams, threadId, input: prepared.input };
       turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
     } else if (recovery === "without-cwd") {
       appendPreparedError(prepared, "Codex rejected the per-turn cwd; retrying with the thread cwd.");
@@ -3553,6 +3557,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   }
 
   updateCodexState(prepared.row.id, { status: "running", sessionId: threadId, turnId: turn.turn.id, heartbeatAt: nowIso(), taskDir: prepared.taskDir });
+  acceptPreparedPrompt(prepared, threadId, turn.turn.id);
 
   markLarkGroupContextDelivered(prepared);
 
@@ -3642,7 +3647,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
 }
 
 async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedLarkCodexMessage): Promise<void> {
-  updatePreparedPrompt(prepared, "delta");
+  updatePreparedPrompt(prepared, "delta", run.threadId);
   run.members.set(prepared.row.id, prepared);
   run.pendingSteers += 1;
   updateCodexState(prepared.row.id, {
@@ -3660,6 +3665,7 @@ async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedL
       input: prepared.input,
       clientUserMessageId: prepared.messageId
     });
+    acceptPreparedPrompt(prepared, run.threadId, run.turnId);
     recordAcceptedExecutionConfig(prepared, { ...run.executionConfig, action: "turn/steer", recordedAt: nowIso() });
     writeSessionArtifact(prepared, { action: "turn/steer", previousThreadId: run.threadId, threadId: run.threadId, turnId: run.turnId });
     markLarkGroupContextDelivered(prepared);
@@ -3904,6 +3910,7 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
 }
 
 export function stopLarkCodexResponder(): void {
+  promptInstructionCache.clear();
   stopLarkTurnAutoApprovalReviews();
   failPendingExecutionApprovals("Codex responder stopped before approval was decided");
   for (const run of [...activeLarkCodexRuns.values()]) {
