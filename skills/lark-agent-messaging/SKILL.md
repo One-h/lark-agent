@@ -15,7 +15,7 @@ Send one JSON object on stdin:
 
 Optional `chatId` sends into a known group, with `recipientId` specifying whose replies belong to this request. The bot must be a group member. Use `identity:"user"` only when the human authorized speaking in their identity and the matching user grant exists. Default is 龙小祝 bot. The message includes the assistant identity and asks the colleague to quote-reply.
 
-Reuse the same requestKey only when retrying the exact same request. An `open` response with a platform message ID means sent. `send_unknown` means inspect Feishu before any retry; never generate a new key to bypass this state.
+Reuse the same requestKey only when retrying the exact same request. An `open` response with a platform message ID means sent. A group request returns `awaiting_approval`: it is only a proposal in the owner’s group privacy review page, not a sent message. Tell the owner it needs approval; do not claim delivery before a platform receipt exists. `send_unknown` means inspect Feishu before any retry; never generate a new key to bypass this state.
 
 Receive in the original conversation:
 
@@ -34,3 +34,5 @@ node <skill-directory>/scripts/agent-messaging.mjs ack 123 124
 Claiming prevents duplicate automatic delivery. Do not acknowledge before the result has been received in this conversation. Claims surviving a runtime restart require human verification in Forge.
 
 Quote-replies route to the originating task. Recent unquoted personal replies also route automatically when all eligible open requests belong to one source conversation. Multiple sources, unrelated quotes, old messages and group replies without explicit references ask 小龙 to assign them in http://127.0.0.1:4732/agent-messaging. Do not guess attribution or claim receipt before the source actually receives it.
+
+Group messages and replies are protected by the privacy gateway. A group reply needs the owner’s explicit approval before it is forwarded into the source Agent. Company research is confined to approved roots, and neither company results nor model drafts are automatically published to a group. Do not use raw CLI or another route to bypass this queue.

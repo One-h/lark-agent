@@ -6,7 +6,7 @@ import {
   sendLarkTextMessage,
   sendLarkTextReply
 } from "@lark-agent/adapter-lark-cli";
-import { recordOutboundLarkMessage } from "@lark-agent/conversation-runtime";
+import { config as conversationConfig, recordOutboundLarkMessage } from "@lark-agent/conversation-runtime";
 
 type OutboundInput = {
   text?: unknown;
@@ -85,6 +85,7 @@ export function sendHostOutboundMessage(
       sender_name: string | null;
     } | undefined;
     if (!source?.message_id) throw new Error("source Lark message was not found");
+    if (source.chat_type !== "p2p" && conversationConfig.groupPrivacyEnforced) throw new Error("Group replies require the privacy owner review queue");
     const mention = source.chat_type === "group" && /^ou_[a-zA-Z0-9]+$/.test(source.sender_id ?? "")
       ? `${larkAtTag(source.sender_id!, source.sender_name ?? "")} `
       : "";

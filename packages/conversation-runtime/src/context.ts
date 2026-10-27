@@ -38,7 +38,7 @@ export type LarkMessageRow = Record<string, unknown> & { id: number; event_id: s
 export type LarkCodexSessionRow = { session_key: string; chat_id: string; trust_scope: "trusted" | "untrusted"; codex_session_id: string; created_at: string; updated_at: string };
 export type LarkExecutionApprovalRow = { id: number; token: string; lark_message_id: number; requester_id: string | null; approver_id: string; request_method: string; server_request_id: string; thread_id: string; turn_id: string; item_id: string; operation: string | null; cwd: string | null; reason: string | null; status: "pending" | "approved" | "rejected" | "expired" | "failed"; approval_scope: "once" | "turn"; card_message_id: string | null; card_error: string | null; created_at: string; expires_at: string; decided_at: string | null };
 
-export const config = { runtimeMode: "shadow" as "shadow" | "active", workspaceRoot: "", larkStickerDirectory: "", repoRoot: "", taskOutputDir: "", larkAgentRuntimeUrl: "", larkAgentRuntimeToken: "", larkGroupSpontaneousReplyCooldownMs: 600_000, larkGroupSpontaneousReplyRate: 0.08, larkCodexInterimReplyDelayMs: 30_000, larkCodexMaxInterimReplies: 1, larkCodexModel: "gpt-5.6-terra", larkCodexOrphanRecoveryMs: 120_000, larkCodexReasoningEffort: "low", larkCodexStartupStallMs: 60_000, larkCodexStreamReplyMinIntervalMs: 15_000, larkExecutionApproverId: "", larkRecentMessageContextMaxChars: 6000, larkRecentMessageFetchLimit: 50, trustedLarkCodexSenderIds: [] as string[] };
+export const config = { groupPrivacyEnforced: false, runtimeMode: "shadow" as "shadow" | "active", workspaceRoot: "", larkStickerDirectory: "", repoRoot: "", taskOutputDir: "", larkAgentRuntimeUrl: "", larkAgentRuntimeToken: "", larkGroupSpontaneousReplyCooldownMs: 600_000, larkGroupSpontaneousReplyRate: 0.08, larkCodexInterimReplyDelayMs: 30_000, larkCodexMaxInterimReplies: 1, larkCodexModel: "gpt-5.6-terra", larkCodexOrphanRecoveryMs: 120_000, larkCodexReasoningEffort: "low", larkCodexStartupStallMs: 60_000, larkCodexStreamReplyMinIntervalMs: 15_000, larkExecutionApproverId: "", larkRecentMessageContextMaxChars: 6000, larkRecentMessageFetchLimit: 50, trustedLarkCodexSenderIds: [] as string[] };
 export let db: Database.Database;
 export type LarkTextReplySender = (messageId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 export type LarkReactionSender = (messageId: string, emojiType: string) => { ok: true } | { ok: false; error: string };
@@ -46,8 +46,9 @@ export let larkTextReplySender: LarkTextReplySender = sendLarkTextReply;
 export let larkMediaReplySender: typeof sendLarkMediaReply = sendLarkMediaReply;
 export let larkReactionSender: LarkReactionSender = sendLarkReaction;
 
-export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender }): void {
+export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender; groupPrivacyEnforced?: boolean }): void {
   db = input.database;
+  config.groupPrivacyEnforced = input.groupPrivacyEnforced ?? false;
   config.runtimeMode = input.mode ?? "shadow";
   config.larkStickerDirectory = input.larkStickerDirectory;
   config.repoRoot = input.repoRoot;
