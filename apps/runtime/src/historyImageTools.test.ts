@@ -18,6 +18,7 @@ const send=x=>process.stdout.write(JSON.stringify(x)+"\\n");
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line);
  if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"image-thread"},model:m.params.model}});
+ else if(m.method==="thread/loaded/list")send({id:m.id,result:{data:["image-thread"],nextCursor:null}});
  else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"image-turn",status:"inProgress"}}});send({method:"turn/started",params:{threadId:"image-thread",turn:{id:"image-turn",status:"inProgress"}}});}
  else if(m.method)send({id:m.id,result:{}});
 });

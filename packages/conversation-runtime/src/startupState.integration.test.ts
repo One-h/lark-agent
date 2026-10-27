@@ -7,7 +7,7 @@ import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { codexAppServer } from "./codexRuntime.js";
-import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
+import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, reconcilePendingLarkThreadArchives, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
 import { ingestLarkEvent } from "./worker.js";
 import { retryPendingLarkCompletionReactions } from "./completionReactions.js";
 
@@ -28,13 +28,16 @@ const send = x => process.stdout.write(JSON.stringify(x)+"\\n");
 const counter=${JSON.stringify(path.join(root, "counter"))};
 let turn=fs.existsSync(counter)?Number(fs.readFileSync(counter,"utf8")):0;
 let held=null;
+let missingRejections=0;
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line), s=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},"utf8"));
  fs.appendFileSync(${JSON.stringify(log)},line+"\\n");
- if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
+ if(m.method==="thread/loaded/list") {if(s.listError)send({id:m.id,error:{code:-1,message:"fixture list timed out"}});else send({id:m.id,result:{data:s.loaded===false||s.resumeWriterConflict?[]:["thread-fixture"],nextCursor:null}});}
+ else if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
  else if(m.method==="thread/start"||m.method==="thread/resume") send({id:m.id,result:{thread:{id:s.resumeWriterConflict?"thread-fixture-new":"thread-fixture"}}});
  else if(m.method==="turn/start" && s.resumeWriterConflict && m.params.threadId!=="thread-fixture-new")send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
- else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
+ else if(m.method==="turn/start" && s.missingThread && (s.missingAlways||missingRejections++===0))send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
+ else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:typeof s.startError==="string"?s.startError:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
  else if(m.method==="thread/read") {const result={thread:{id:"thread-fixture",status:{type:s.threadStatus}}};if(s.readError)send({id:m.id,error:{code:-1,message:"fixture read failure"}});else if(s.defer)held={id:m.id,result};else send({id:m.id,result});}
  else if(m.method==="thread/turns/list") send({id:m.id,result:{data:s.missing?[]:[{id:s.turnId??${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:s.status,error:s.error,items:s.items??[]}]}});
  else if(m.method==="fixture/release") {if(held)send(held);held=null;send({id:m.id,result:{}});}
@@ -256,7 +259,78 @@ test("native capacity error readback retains recovery without replaying recovere
   }
 });
 
-test("closed cached bot thread owned by another writer starts a new full-context conversation", async () => {
+test("idle archive unload checks native state without retaining a loaded flag", async () => {
+  for (const loaded of [false, true]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state({ loaded });
+      await immediate();
+      await until(() => (f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as { n: number }).n === 1);
+      assert.equal(await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString()), 1);
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "thread/archive").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/loaded/list").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/unsubscribe").length, loaded ? 1 : 0);
+      assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as { n: number }).n, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test("bot reuse consults native loaded state even without a close notification", async () => {
+  for (const loaded of [false, true]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state({ loaded });
+      ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+      await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
+      assert.equal(row().codex_status, "running", row().codex_error);
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "thread/loaded/list").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/resume").length, loaded ? 0 : 1);
+      assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(row().codex_session_id, "thread-fixture");
+      await f.complete(row().codex_turn_id);
+      await until(() => row().codex_status === "answered");
+    } finally { await f.close(); }
+  }
+});
+
+test("a thread unloaded after native lookup is resumed once with identical input", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); f.state({ loaded: true, missingThread: true });
+    ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
+    assert.equal(row().codex_status, "running", row().codex_error);
+    const calls = f.records(), starts = calls.filter(r => r.method === "turn/start");
+    assert.equal(starts.length, 3);
+    assert.deepEqual(starts[1].params, starts[2].params);
+    assert.equal(calls.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+    assert.equal(calls.filter(r => r.method === "turn/interrupt").length, 0);
+    assert.equal(row().codex_session_id, "thread-fixture");
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+    assert.deepEqual(f.delivered, ["fixture done", "fixture done"]);
+  } finally { await f.close(); }
+});
+
+test("unknown loaded state and ambiguous startup failures do not create or replay turns", async () => {
+  for (const state of [{ listError: true }, { startError: "request timed out: turn/start" }, { missingThread: true, missingAlways: true }]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state(state);
+      ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+      await until(() => row()?.codex_status === "failed");
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "turn/start").length, "listError" in state ? 1 : "missingAlways" in state ? 3 : 2);
+      assert.equal(calls.filter(r => r.method === "thread/resume").length, "missingAlways" in state ? 1 : 0);
+      assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(row().reply_status, "sent");
+      assert.match(f.delivered.at(-1)!, /本次 Codex 执行失败/);
+    } finally { await f.close(); }
+  }
+});
+
+test("unloaded bot thread owned by another writer starts a new full-context conversation", async () => {
  const f=fixture();try{
   await f.ready();await f.complete();
   await f.emit([{method:"thread/closed",params:{threadId:"thread-fixture"}}]);

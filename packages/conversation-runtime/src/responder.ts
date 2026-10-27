@@ -16,6 +16,7 @@ import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
+import { isNativeThreadLoaded, isNativeThreadMissingError } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions } from "./completionReactions.js";
@@ -261,14 +262,16 @@ type TurnStartResponse = {
 };
 
 const activeLarkCodexRuns = new Map<string, ActiveLarkCodexRun>();
-const loadedLarkThreadIds = new Set<string>();
 const loadedLarkThreadParameters = new Map<string, Record<string, unknown>>();
 const larkSessionActivityVersions = new Map<string, number>();
 const preparingLarkMessages = new Set<number>();
 const dispatchChains = new Map<string, Promise<void>>();
 const pendingTurnNotifications = new Map<string, CodexAppServerNotification[]>();
 
-export function larkResponderOwnsThread(threadId: string): boolean { return loadedLarkThreadIds.has(threadId); }
+export async function larkResponderOwnsThread(threadId: string): Promise<boolean> {
+  if (!codexAppServer.status().running) return false;
+  return isNativeThreadLoaded((method, params) => codexAppServer.requestIfRunning(method, params), threadId);
+}
 const pendingExecutionApprovals = new Map<number, PendingLarkExecutionApproval>();
 const archivingLarkThreads = new Map<string, Promise<void>>();
 const larkCodexRunnerGeneration = crypto.randomUUID();
@@ -2168,14 +2171,13 @@ async function archiveLarkThreadIfIdle(row: PendingLarkThreadArchive): Promise<v
     }
   }
   if (!currentArchiveToken(row) || (larkSessionActivityVersions.get(sessionKey) !== undefined && larkSessionActivityVersions.get(sessionKey) !== activityVersion)) return;
-  if (loadedLarkThreadIds.has(threadId)) {
-    try {
+  try {
+    if (await larkResponderOwnsThread(threadId)) {
       await codexAppServer.requestIfRunning("thread/unsubscribe", { threadId }, 10_000);
-      loadedLarkThreadIds.delete(threadId);
-      loadedLarkThreadParameters.delete(threadId);
-    } catch (error) {
-      console.warn(`Unable to unload completed Lark Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
     }
+    loadedLarkThreadParameters.delete(threadId);
+  } catch (error) {
+    console.warn(`Unable to unload completed Lark Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
   }
   db.prepare("DELETE FROM lark_codex_archive_queue WHERE thread_id=? AND token=?").run(threadId, row.token);
   if (larkSessionActivityVersions.get(sessionKey) === activityVersion) larkSessionActivityVersions.delete(sessionKey);
@@ -2617,7 +2619,6 @@ function handleAppServerNotification(notification: CodexAppServerNotification): 
   const lifecycle = notification.params as { threadId?: string; status?: { type?: string } } | undefined;
   if (lifecycle?.threadId && (notification.method === "thread/closed" || notification.method === "thread/deleted"
     || (notification.method === "thread/status/changed" && lifecycle.status?.type === "notLoaded"))) {
-    loadedLarkThreadIds.delete(lifecycle.threadId);
     loadedLarkThreadParameters.delete(lifecycle.threadId);
   }
   const turnId = notificationTurnId(notification);
@@ -3371,7 +3372,6 @@ function failPendingExecutionApprovals(error: string): void {
 }
 
 codexAppServer.onExit((error) => {
-  loadedLarkThreadIds.clear();
   loadedLarkThreadParameters.clear();
   failPendingExecutionApprovals(error.message);
   for (const run of [...activeLarkCodexRuns.values()]) {
@@ -3476,17 +3476,16 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     const previousWorkspace = appSettingValue(`codex.threadWorkspace:${threadId}`);
     const workspaceChanged = previousWorkspace !== undefined && previousWorkspace !== config.workspaceRoot;
     cancelLarkThreadArchive(threadId);
+    const appServerHasThread = await isNativeThreadLoaded((method, params) => codexAppServer.request(method, params), threadId);
+    appendPreparedLog(prepared, { method: "thread/reuse-check", params: { threadId, appServerHasThread, source: "thread/loaded/list" } });
     try {
       await unarchiveLarkThread(threadId);
-      const appServerHasThread = loadedLarkThreadIds.has(threadId);
-      appendPreparedLog(prepared, { method: "thread/reuse-check", params: { threadId, appServerHasThread } });
       if (!appServerHasThread || workspaceChanged) {
         const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", {
           threadId,
           ...resumeParams
         });
         threadId = resumed.thread.id;
-        loadedLarkThreadIds.add(threadId);
         loadedLarkThreadParameters.set(threadId, resumeParams);
       }
       updatePreparedPrompt(prepared, workspaceChanged ? "full" : "delta");
@@ -3505,7 +3504,6 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     const startParams = buildLarkCodexThreadParams(prepared.trustedSender, "new");
     const started = await codexAppServer.request<ThreadResponse>("thread/start", startParams);
     threadId = started.thread.id;
-    loadedLarkThreadIds.add(threadId);
     loadedLarkThreadParameters.set(threadId, startParams);
     createdThread = true;
   }
@@ -3519,7 +3517,17 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
   } catch (error) {
     const recovery = larkCwdRecoveryStrategy(error);
-    if (recovery === "restart-app-server") {
+    if (isNativeThreadMissingError(error, threadId)) {
+      // An explicit missing-thread rejection means no turn was accepted.
+      appendPreparedLog(prepared, { method: "thread/start-recovery", params: { threadId, reason: "thread-not-found", attempt: 1 } });
+      loadedLarkThreadParameters.delete(threadId);
+      const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", { threadId, ...resumeParams });
+      threadId = resumed.thread.id;
+      loadedLarkThreadParameters.set(threadId, resumeParams);
+      upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
+      turnParams = buildLarkCodexTurnParams(prepared, threadId);
+      turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
+    } else if (recovery === "restart-app-server") {
       if (activeLarkCodexRuns.size > 0) {
         throw new Error("Codex app-server lost workspace access while another Lark turn is active; retry the message after the active turn finishes");
       }
@@ -3530,7 +3538,6 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
         ...resumeParams
       });
       threadId = resumed.thread.id;
-      loadedLarkThreadIds.add(threadId);
       loadedLarkThreadParameters.set(threadId, resumeParams);
       upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
       turnParams = { ...turnParams, threadId };
