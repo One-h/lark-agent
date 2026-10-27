@@ -34,6 +34,7 @@ readline.createInterface({input: process.stdin}).on("line", line => {
   const m = JSON.parse(line);
   fs.appendFileSync(${JSON.stringify(log)}, line + "\\n");
   if (m.method === "thread/start" || m.method === "thread/resume") send({id: m.id, result: {thread: {id: ${JSON.stringify(threadId)}}}});
+  else if (m.method === "thread/loaded/list") send({id:m.id,result:{data:[${JSON.stringify(threadId)}],nextCursor:null}});
   else if (m.method === "turn/start") { fs.writeFileSync(counter, String(++turn)); send({id: m.id, result: {turn: {id: "turn-" + turn, status: "inProgress"}}}); }
   else if (m.method === "turn/steer") {
     send({id: m.id, result: {}});

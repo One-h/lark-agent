@@ -7,9 +7,10 @@ import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { codexAppServer } from "./codexRuntime.js";
-import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
+import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, reconcilePendingLarkThreadArchives, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
 import { ingestLarkEvent } from "./worker.js";
 import { retryPendingLarkCompletionReactions } from "./completionReactions.js";
+import { saveConversationPersona } from "./persona.js";
 
 async function until(predicate: () => boolean) {
   const deadline = performance.now() + 5000;
@@ -28,13 +29,16 @@ const send = x => process.stdout.write(JSON.stringify(x)+"\\n");
 const counter=${JSON.stringify(path.join(root, "counter"))};
 let turn=fs.existsSync(counter)?Number(fs.readFileSync(counter,"utf8")):0;
 let held=null;
+let missingRejections=0;
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line), s=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},"utf8"));
  fs.appendFileSync(${JSON.stringify(log)},line+"\\n");
- if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
+ if(m.method==="thread/loaded/list") {if(s.listError)send({id:m.id,error:{code:-1,message:"fixture list timed out"}});else send({id:m.id,result:{data:s.loaded===false||s.resumeWriterConflict?[]:["thread-fixture"],nextCursor:null}});}
+ else if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
  else if(m.method==="thread/start"||m.method==="thread/resume") send({id:m.id,result:{thread:{id:s.resumeWriterConflict?"thread-fixture-new":"thread-fixture"}}});
  else if(m.method==="turn/start" && s.resumeWriterConflict && m.params.threadId!=="thread-fixture-new")send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
- else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
+ else if(m.method==="turn/start" && s.missingThread && (s.missingAlways||missingRejections++===0))send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
+ else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:typeof s.startError==="string"?s.startError:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
  else if(m.method==="thread/read") {const result={thread:{id:"thread-fixture",status:{type:s.threadStatus}}};if(s.readError)send({id:m.id,error:{code:-1,message:"fixture read failure"}});else if(s.defer)held={id:m.id,result};else send({id:m.id,result});}
  else if(m.method==="thread/turns/list") send({id:m.id,result:{data:s.missing?[]:[{id:s.turnId??${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:s.status,error:s.error,items:s.items??[]}]}});
  else if(m.method==="fixture/release") {if(held)send(held);held=null;send({id:m.id,result:{}});}
@@ -256,7 +260,78 @@ test("native capacity error readback retains recovery without replaying recovere
   }
 });
 
-test("closed cached bot thread owned by another writer starts a new full-context conversation", async () => {
+test("idle archive unload checks native state without retaining a loaded flag", async () => {
+  for (const loaded of [false, true]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state({ loaded });
+      await immediate();
+      await until(() => (f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as { n: number }).n === 1);
+      assert.equal(await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString()), 1);
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "thread/archive").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/loaded/list").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/unsubscribe").length, loaded ? 1 : 0);
+      assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as { n: number }).n, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test("bot reuse consults native loaded state even without a close notification", async () => {
+  for (const loaded of [false, true]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state({ loaded });
+      ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+      await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
+      assert.equal(row().codex_status, "running", row().codex_error);
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "thread/loaded/list").length, 1);
+      assert.equal(calls.filter(r => r.method === "thread/resume").length, loaded ? 0 : 1);
+      assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(row().codex_session_id, "thread-fixture");
+      await f.complete(row().codex_turn_id);
+      await until(() => row().codex_status === "answered");
+    } finally { await f.close(); }
+  }
+});
+
+test("a thread unloaded after native lookup is resumed once with identical input", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); f.state({ loaded: true, missingThread: true });
+    ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
+    assert.equal(row().codex_status, "running", row().codex_error);
+    const calls = f.records(), starts = calls.filter(r => r.method === "turn/start");
+    assert.equal(starts.length, 3);
+    assert.deepEqual(starts[1].params, starts[2].params);
+    assert.equal(calls.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+    assert.equal(calls.filter(r => r.method === "turn/interrupt").length, 0);
+    assert.equal(row().codex_session_id, "thread-fixture");
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+    assert.deepEqual(f.delivered, ["fixture done", "fixture done"]);
+  } finally { await f.close(); }
+});
+
+test("unknown loaded state and ambiguous startup failures do not create or replay turns", async () => {
+  for (const state of [{ listError: true }, { startError: "request timed out: turn/start" }, { missingThread: true, missingAlways: true }]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); f.state(state);
+      ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+      await until(() => row()?.codex_status === "failed");
+      const calls = f.records();
+      assert.equal(calls.filter(r => r.method === "turn/start").length, "listError" in state ? 1 : "missingAlways" in state ? 3 : 2);
+      assert.equal(calls.filter(r => r.method === "thread/resume").length, "missingAlways" in state ? 1 : 0);
+      assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(row().reply_status, "sent");
+      assert.match(f.delivered.at(-1)!, /本次 Codex 执行失败/);
+    } finally { await f.close(); }
+  }
+});
+
+test("unloaded bot thread owned by another writer starts a new full-context conversation", async () => {
  const f=fixture();try{
   await f.ready();await f.complete();
   await f.emit([{method:"thread/closed",params:{threadId:"thread-fixture"}}]);
@@ -271,4 +346,111 @@ test("closed cached bot thread owned by another writer starts a new full-context
   await f.emit([{method:"item/completed",params:{threadId:"thread-fixture-new",turnId:row().codex_turn_id,item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture recovered"}}},{method:"turn/completed",params:{threadId:"thread-fixture-new",turn:{id:row().codex_turn_id,status:"completed"}}}]);
   await until(()=>row().codex_status==="answered");assert.equal(f.delivered.at(-1),"fixture recovered");
  }finally{await f.close();}
+});
+
+test("native inputs reuse stable instructions but refresh settings, compaction and per-message tool bindings", async () => {
+  const f = fixture();
+  try {
+    setAppSettingValue("prompt.larkAssistant", "GLOBAL_STYLE_ONE");
+    setAppSettingValue("stickerUsageMode", "always");
+    await f.ready();
+    const first = f.records().find(r => r.method === "turn/start").params.input[0].text as string;
+    assert.match(first, /GLOBAL_STYLE_ONE/);
+    const firstToken = first.match(/context_token=([A-Za-z0-9_-]{32})/)![1];
+    setAppSettingValue("prompt.larkAssistant", "GLOBAL_STYLE_TWO");
+    const add = async (key: string) => {
+      ingestLarkEvent({ ...f.message, event_id: `event-${key}`, message_id: `om_${key}`, content: `request ${key}` });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(`om_${key}`) as any;
+      await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
+      assert.equal(row().codex_status, "running", row().codex_error);
+      return row;
+    };
+    const second = await add("steered");
+    await until(() => f.records().some(r => r.method === "turn/steer"));
+    const steered = f.records().find(r => r.method === "turn/steer").params.input[0].text as string;
+    assert.doesNotMatch(steered, /GLOBAL_STYLE_ONE|GLOBAL_STYLE_TWO|通用执行与消息规则/);
+    assert.match(steered, /每次准备产生可见的最终文字回复时，都必须调用/);
+    assert.match(steered, /attach_files|history_images/);
+    assert.ok(!steered.includes(firstToken));
+    assert.ok(steered.includes(path.join(second().codex_task_dir, "output")));
+    await f.complete(); await until(() => second().codex_status === "answered");
+    const third = await add("changed");
+    const thirdInput = f.records().filter(r => r.method === "turn/start").at(-1).params.input[0].text as string;
+    assert.match(thirdInput, /GLOBAL_STYLE_TWO/);
+    await f.complete(third().codex_turn_id); await until(() => third().codex_status === "answered");
+    await f.emit([{ method: "item/completed", params: { threadId: "thread-fixture", item: { type: "contextCompaction", id: "compact" } } }]);
+    const fourth = await add("compacted");
+    assert.match(f.records().filter(r => r.method === "turn/start").at(-1).params.input[0].text, /GLOBAL_STYLE_TWO/);
+    await f.complete(fourth().codex_turn_id); await until(() => fourth().codex_status === "answered");
+    saveConversationPersona("oc_fixture", { mode: "custom", name: "Test persona", instructions: "PERSONA_STYLE_THREE" });
+    const fifth = await add("persona");
+    assert.match(f.records().filter(r => r.method === "turn/start").at(-1).params.input[0].text, /PERSONA_STYLE_THREE/);
+    await f.complete(fifth().codex_turn_id); await until(() => fifth().codex_status === "answered");
+    f.state({ loaded: false });
+    const sixth = await add("resumed");
+    const last = f.records().filter(r => r.method === "turn/start").at(-1).params.input[0].text as string;
+    assert.doesNotMatch(last, /PERSONA_STYLE_THREE|通用执行与消息规则/);
+    assert.match(last, /每次准备产生可见的最终文字回复时，都必须调用/);
+    assert.equal(f.records().filter(r => r.method === "thread/resume").at(-1).params.sandbox, "read-only");
+    const artifact = JSON.parse(fs.readFileSync(path.join(sixth().codex_task_dir, "resume-session.json"), "utf8"));
+    assert.equal(artifact.stableInstructions, "reused");
+    await f.complete(sixth().codex_turn_id); await until(() => sixth().codex_status === "answered");
+  } finally { await f.close(); }
+});
+
+test("rejected inputs never commit changed instructions and a responder restart refreshes them", async () => {
+  const f = fixture();
+  try {
+    setAppSettingValue("prompt.larkAssistant", "STYLE_BEFORE_FAILURE");
+    await f.ready(); await f.complete();
+    setAppSettingValue("prompt.larkAssistant", "STYLE_AFTER_FAILURE");
+    f.state({ startError: true });
+    ingestLarkEvent({ ...f.message, event_id: "event-failed", message_id: "om_failed", content: "rejected input" });
+    const failed = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_failed'").get() as any;
+    await until(() => failed()?.codex_status === "failed");
+    f.state({});
+    for (const key of ["retry", "restart"]) {
+      if (key === "restart") { stopLarkCodexResponder(); await immediate(); }
+      ingestLarkEvent({ ...f.message, event_id: `event-${key}`, message_id: `om_${key}`, content: `request ${key}` });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(`om_${key}`) as any;
+      await until(() => Boolean(row()?.codex_turn_id));
+      assert.match(f.records().filter(r => r.method === "turn/start").at(-1).params.input[0].text, /STYLE_AFTER_FAILURE/);
+      await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+    }
+  } finally { await f.close(); }
+});
+
+test("reply delivery keeps business results around private clauses and retains the raw native answer locally", async () => {
+  const f = fixture();
+  try {
+    await f.ready();
+    const text = "已核实 3 个服务健康，依据 AGENTS.md 和本机工作区规则。部署尚未执行；等待审批后继续。";
+    await f.emit([
+      { method: "item/completed", params: { threadId: "thread-fixture", turnId: f.row().codex_turn_id, item: { id: "answer", type: "agentMessage", phase: "final_answer", text } } },
+      { method: "turn/completed", params: { threadId: "thread-fixture", turn: { id: f.row().codex_turn_id, status: "completed" } } }
+    ]);
+    await until(() => f.row().codex_status === "answered");
+    assert.equal(f.delivered.length, 1);
+    assert.match(f.delivered[0], /已核实 3 个服务健康/);
+    assert.match(f.delivered[0], /部署尚未执行；等待审批后继续/);
+    assert.doesNotMatch(f.delivered[0], /AGENTS\.md|工作区规则/);
+    assert.ok(fs.readFileSync(path.join(f.row().codex_task_dir, "codex.stdout.jsonl"), "utf8").includes(text));
+  } finally { await f.close(); }
+});
+
+test("optional prompt diagnostics cannot fail or replay an already accepted turn", async () => {
+  const f = fixture();
+  const append = fs.appendFileSync;
+  try {
+    fs.appendFileSync = (...args: Parameters<typeof fs.appendFileSync>) => {
+      if (String(args[1]).includes('"method":"turn/prompt-context"')) throw new Error("simulated log write failure");
+      return append(...args);
+    };
+    await f.ready();
+    fs.appendFileSync = append;
+    assert.equal(f.row().codex_status, "running");
+    assert.equal(f.records().filter(r => r.method === "turn/start").length, 1);
+    await f.complete();
+    assert.deepEqual(f.delivered, ["fixture done"]);
+  } finally { fs.appendFileSync = append; await f.close(); }
 });

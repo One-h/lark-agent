@@ -154,6 +154,25 @@ test("conversation runtime responder preserves no-reply, sanitization and recove
   assert.equal(isLikelyMutatingCommand("rg -n TODO src"), false);
 });
 
+test("incremental prompt reuse removes only stable instructions, not current request data or sticker policy", (t) => {
+  const { root, store } = fixture();
+  try {
+    setAppSettingValue("stickerUsageMode", "always");
+    const message = { id: 5, message_id: "om_current", chat_id: "oc_group", chat_type: "group", sender_id: "ou_sender",
+      content: "继续核对当前结果", reply_to_message_id: "om_parent", reply_to_message_type: "text", reply_to_content: "此前已确认 A" };
+    const attachments = { trustedSender: true, stickerContextToken: "current-context-token", mediaOutputDirectory: path.join(root, "output"), referencedImagePaths: ["/tmp/current.png"] };
+    const initial = buildLarkCodexDeltaPrompt(message, attachments);
+    const reused = buildLarkCodexDeltaPrompt(message, { ...attachments, includeStableInstructions: false });
+    assert.match(initial, /通用执行与消息规则|最终回复会自动真实/);
+    assert.doesNotMatch(reused, /通用执行与消息规则|最终回复会自动真实/);
+    for (const text of [message.content, message.reply_to_content, message.message_id, message.sender_id,
+      attachments.stickerContextToken, attachments.mediaOutputDirectory, "/tmp/current.png", "attach_files", "每次准备产生可见的最终文字回复时，都必须调用"])
+      assert.ok(reused.includes(text), `missing current input: ${text}`);
+    assert.ok(initial.length > reused.length);
+    t.diagnostic(`stable instruction reuse: ${initial.length} -> ${reused.length} characters; current input and tool policy preserved`);
+  } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("full and incremental prompts refresh one compact timestamp while preserving the original send time", t => {
   const { root, store } = fixture();
   try {
