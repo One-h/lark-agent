@@ -31,7 +31,9 @@ let held=null;
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line), s=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},"utf8"));
  fs.appendFileSync(${JSON.stringify(log)},line+"\\n");
- if(m.method==="thread/start"||m.method==="thread/resume") send({id:m.id,result:{thread:{id:"thread-fixture"}}});
+ if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
+ else if(m.method==="thread/start"||m.method==="thread/resume") send({id:m.id,result:{thread:{id:s.resumeWriterConflict?"thread-fixture-new":"thread-fixture"}}});
+ else if(m.method==="turn/start" && s.resumeWriterConflict && m.params.threadId!=="thread-fixture-new")send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
  else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
  else if(m.method==="thread/read") {const result={thread:{id:"thread-fixture",status:{type:s.threadStatus}}};if(s.readError)send({id:m.id,error:{code:-1,message:"fixture read failure"}});else if(s.defer)held={id:m.id,result};else send({id:m.id,result});}
  else if(m.method==="thread/turns/list") send({id:m.id,result:{data:s.missing?[]:[{id:s.turnId??${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:s.status,error:s.error,items:s.items??[]}]}});
@@ -252,4 +254,21 @@ test("native capacity error readback retains recovery without replaying recovere
       }
     } finally { t.mock.timers.reset(); await f.close(); }
   }
+});
+
+test("closed cached bot thread owned by another writer starts a new full-context conversation", async () => {
+ const f=fixture();try{
+  await f.ready();await f.complete();
+  await f.emit([{method:"thread/closed",params:{threadId:"thread-fixture"}}]);
+  f.state({resumeWriterConflict:true});
+  ingestLarkEvent({...f.message,event_id:"event-second",message_id:"om_second",content:"second request"});
+  const row=()=>f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
+  await until(()=>Boolean(row()?.codex_turn_id)||row()?.codex_status==="failed");
+  assert.equal(row().codex_status,"running",row().codex_error);
+  assert.equal(row().codex_session_id,"thread-fixture-new");
+  const turns=f.records().filter(r=>r.method==="turn/start");assert.equal(turns.length,2);assert.equal(turns[1].params.threadId,"thread-fixture-new");
+  assert.ok(f.records().some(r=>r.method==="thread/resume"));
+  await f.emit([{method:"item/completed",params:{threadId:"thread-fixture-new",turnId:row().codex_turn_id,item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture recovered"}}},{method:"turn/completed",params:{threadId:"thread-fixture-new",turn:{id:row().codex_turn_id,status:"completed"}}}]);
+  await until(()=>row().codex_status==="answered");assert.equal(f.delivered.at(-1),"fixture recovered");
+ }finally{await f.close();}
 });
