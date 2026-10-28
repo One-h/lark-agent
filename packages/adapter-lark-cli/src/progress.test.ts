@@ -3,7 +3,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { sendLarkProgressCard, updateLarkProgressCard } from "./progress.js";
+import { buildLarkProgressCard, sendLarkProgressCard, updateLarkProgressCard, type LarkProgressState } from "./progress.js";
+
+test("progress status colors stay compact, readable without color and distinct across states", () => {
+  const states: Array<[LarkProgressState, string, string]> = [
+    ["running", "blue", "处理中"], ["completed", "green", "已结束"], ["failed", "red", "失败"],
+    ["cancelled", "grey", "已取消"], ["interrupted", "orange", "已中断"]
+  ];
+  for (const [state, color, label] of states) {
+    const card = buildLarkProgressCard({ state, entries: [] });
+    assert.deepEqual(card.body.elements[0], { tag: "markdown", content: `<font color='${color}'>&#9679; ${label}</font>`, text_size: "notation" });
+    assert.equal(card.config.width_mode, "compact"); assert.equal(card.body.vertical_spacing, "4px");
+    assert.doesNotMatch(JSON.stringify(card), /background_style|column_set|\*\*|"header"/);
+  }
+});
 
 test("progress CLI transport uses interactive replies and PATCH, accepts notices and rejects API error envelopes", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-progress-cli-"));

@@ -6,6 +6,7 @@ export type LarkProgressState = "running" | "completed" | "failed" | "cancelled"
 export type LarkProgressEntry = { id: string; at: string; text: string };
 export type LarkProgressContent = { state: LarkProgressState; entries: LarkProgressEntry[] };
 const labels: Record<LarkProgressState, string> = { running: "处理中", completed: "已结束", failed: "失败", cancelled: "已取消", interrupted: "已中断" };
+const colors: Record<LarkProgressState, string> = { running: "blue", completed: "green", failed: "red", cancelled: "grey", interrupted: "orange" };
 const escape = (text: string) => text.replace(/[&<>*_\[\]`~]/g, c => `&#${c.charCodeAt(0)};`);
 
 export function buildLarkProgressCard(input: LarkProgressContent) {
@@ -15,7 +16,7 @@ export function buildLarkProgressCard(input: LarkProgressContent) {
   }).join("\n");
   return { schema: "2.0", config: { update_multi: true, width_mode: "compact", summary: { content: `任务进度 · ${labels[input.state]}` } },
     body: { direction: "vertical", padding: "8px", vertical_spacing: "4px", elements: [
-      { tag: "markdown", content: `<font color='grey'>${labels[input.state]}</font>`, text_size: "notation" },
+      { tag: "markdown", content: `<font color='${colors[input.state]}'>&#9679; ${labels[input.state]}</font>`, text_size: "notation" },
       { tag: "markdown", content: entries || "已开始处理。", text_size: "notation" }
     ] } };
 }

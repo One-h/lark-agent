@@ -45,7 +45,7 @@ test("compact progress cards have no header or buttons, bound recent lines and n
   assert.doesNotMatch(text, /"header"|"button"|<at|line-0|line-1|line-2/);
   assert.match(text, /13:00/); assert.match(text, /已结束/); assert.match(text, /line-7/);
   assert.equal(card.body.vertical_spacing, "4px");
-  assert.deepEqual(card.body.elements[0], { tag: "markdown", content: "<font color='grey'>已结束</font>", text_size: "notation" });
+  assert.deepEqual(card.body.elements[0], { tag: "markdown", content: "<font color='green'>&#9679; 已结束</font>", text_size: "notation" });
   assert.doesNotMatch(text, /background_style|column_set|\*\*/);
   assert.equal(card.body.elements[1].content.split("\n").length, 5);
   assert.ok(!card.body.elements[1].content.includes("\n\n"));
