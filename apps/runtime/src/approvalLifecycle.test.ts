@@ -91,6 +91,28 @@ test("single-call authorization is not reused; human turn permission is scoped a
   } finally { await f.close(); }
 });
 
+test("ordinary groups retain capability approval while privacy-enabled groups cannot invoke host tools", async () => {
+  const f = await fixture();
+  try {
+    f.seed();
+    f.runtime.store.db.prepare("UPDATE lark_messages SET chat_type='group' WHERE id=1").run();
+    const pending = f.invoke();
+    await until(() => f.cards.length === 1);
+    assert.equal(f.writes(), 0);
+    assert.equal((await f.decide(f.cards[0].approvalId)).statusCode, 200);
+    assert.equal((await pending).status, 200);
+    assert.equal(f.writes(), 1);
+    f.runtime.store.db.prepare("UPDATE lark_messages SET codex_status='answered' WHERE id=1").run();
+    assert.equal((await f.runtime.app.inject({ method: "PATCH", url: "/v1/group-privacy", headers: { authorization: "Bearer fixture-token" }, payload: { enabled: true } })).statusCode, 200);
+    f.runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running' WHERE id=1").run();
+    const blocked = await f.invoke("bbbbbbb");
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.body, /群聊隐私/);
+    assert.equal(f.cards.length, 1);
+    assert.equal(f.writes(), 1);
+  } finally { await f.close(); }
+});
+
 test("terminal turns, replacement turns and expired cards cannot start deployment on a late click", async () => {
   for (const reason of ["completed", "replaced", "expired", "identity-changed"]) {
     const f = await fixture();

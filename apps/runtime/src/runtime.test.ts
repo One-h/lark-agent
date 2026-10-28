@@ -486,6 +486,7 @@ test("authenticated legacy outbound route cannot bypass group privacy review", a
     }
   });
   try {
+    assert.equal((await runtime.app.inject({method:"PATCH",url:"/v1/group-privacy",headers:{authorization:"Bearer runtime-secret"},payload:{enabled:true}})).statusCode,200);
     const now = new Date().toISOString();
     runtime.store.db.prepare("INSERT INTO contacts (open_id,name,aliases,updated_at) VALUES (?,?,?,?)")
       .run("ou_requester", "请求人", "[]", now);

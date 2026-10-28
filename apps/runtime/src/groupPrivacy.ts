@@ -16,6 +16,7 @@ const errorText=(error:unknown)=>error instanceof Error?error.message:"处理失
 export class GroupPrivacy {
   private timer?:ReturnType<typeof setInterval>;private busy=false;private closing=false;private locks=new Set<number>();
   constructor(readonly store:SqliteAgentStore,private options:{ownerId:()=>string;model:()=>string;cli?:typeof inboxCli;
+    canChangeEnabled?:()=>boolean;enabledChanged?:(enabled:boolean)=>void;
     plan?:(input:unknown,model:string)=>Promise<GroupPlan>;execute?:(root:string,argv:string[])=>Promise<string>;
     approvedReceipt?:(outreachId:string,messageId:string,chatId:string)=>void;
     forward?:(message:PersonalMessage,identity:"bot"|"user")=>boolean}){
@@ -30,33 +31,46 @@ export class GroupPrivacy {
     store.db.prepare("UPDATE group_privacy SET status='send_unknown',error='发送时服务重启，请先核对群消息。',version=version+1 WHERE status='sending'").run();
   }
   private get cli(){return this.options.cli??inboxCli;}
+  enabled():boolean{return this.store.setting("groupPrivacy.enabled","false")==="true";}
   roots():string[]{try{return JSON.parse(this.store.setting("groupPrivacy.companyRoots","[]"));}catch{return [];}}
-  snapshot(){return {policy:{enabled:true,companyRoots:this.roots(),autoPublishGenerated:false,autoExecute:false,personalAccess:false},messages:this.store.db.prepare("SELECT * FROM group_privacy ORDER BY id DESC LIMIT 200").all()};}
+  snapshot(){return {policy:{enabled:this.enabled(),companyRoots:this.roots(),autoPublishGenerated:false,autoExecute:false,personalAccess:false},messages:this.store.db.prepare("SELECT * FROM group_privacy ORDER BY id DESC LIMIT 200").all()};}
   configure(body:Record<string,unknown>){
-    if(Object.keys(body).some(key=>key!=="companyRoots")||!Array.isArray(body.companyRoots)||body.companyRoots.length>8)throw new Error("仅允许配置公司资料目录。");
-    const roots=body.companyRoots.map(value=>{
+    if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(key=>!["enabled","companyRoots"].includes(key)))throw new Error("仅允许配置隐私保护开关和公司资料目录。");
+    if(Object.hasOwn(body,"enabled")&&typeof body.enabled!=="boolean")throw new Error("enabled 必须是布尔值。");
+    if(Object.hasOwn(body,"companyRoots")&&(!Array.isArray(body.companyRoots)||body.companyRoots.length>8))throw new Error("公司资料目录必须是最多 8 项的数组。");
+    const roots=body.companyRoots===undefined?undefined:(body.companyRoots as unknown[]).map(value=>{
       if(typeof value!=="string"||!path.isAbsolute(value)||value.length>1000)throw new Error("公司目录必须是绝对路径。");
       const root=path.resolve(value);
       if(root===path.parse(root).root||root===os.homedir()||root.split(path.sep).filter((part,index)=>!(process.platform==="darwin"&&index===1&&part==="private")).some(part=>/^(personal|private|\.codex|\.ssh|\.aws|\.kube|\.config)$/i.test(part))
         ||fs.realpathSync(root)!==root||!fs.statSync(root).isDirectory())throw new Error("目录过宽、属于个人范围或包含符号链接。");
       return root;
     });
-    this.store.setSetting("groupPrivacy.companyRoots",JSON.stringify([...new Set(roots)]));return this.snapshot();
+    const changed=typeof body.enabled==="boolean"&&body.enabled!==this.enabled();
+    if(changed&&(this.busy||this.locks.size>0||this.options.canChangeEnabled?.()===false))throw Object.assign(new Error("请等待正在执行或排队的任务结束后再切换群聊隐私保护。"),{statusCode:409});
+    this.store.db.transaction(()=>{
+      if(roots!==undefined)this.store.setSetting("groupPrivacy.companyRoots",JSON.stringify([...new Set(roots)]));
+      if(typeof body.enabled==="boolean")this.store.setSetting("groupPrivacy.enabled",String(body.enabled));
+    })();
+    if(changed)this.options.enabledChanged?.(body.enabled as boolean);
+    return this.snapshot();
   }
   private row(id:number){return this.store.db.prepare("SELECT * FROM group_privacy WHERE id=?").get(id) as GroupRow|undefined;}
   private update(id:number,patch:Partial<GroupRow>){const entries=Object.entries(patch);this.store.db.prepare(`UPDATE group_privacy SET ${entries.map(([key])=>key+"=?").join(",")},version=version+1 WHERE id=?`).run(...entries.map(([,value])=>value),id);}
   propose(input:{outreachId:string;chatId:string;identity:"bot"|"user";text:string}){
+    if(!this.enabled())throw new Error("群聊隐私保护未开启。");
     const result=this.store.db.prepare("INSERT INTO group_privacy(messageId,chatId,senderId,content,identity,receivedAt,outreachId,status,category,draft,reason) VALUES(?,?,?,?,?,?,?,'needs_owner','company',?,?)")
       .run(`proposal:${input.outreachId}`,input.chatId,this.options.ownerId(),input.text,input.identity,new Date().toISOString(),input.outreachId,input.text,"Agent 提议发送到群聊，请审核准确文本后单次批准。");
     return Number(result.lastInsertRowid);
   }
   ingest(message:PersonalMessage,identity:"bot"|"user"){
+    if(!this.enabled())return false;
     if(message.chatType!=="group")return false;
     if(!/^om_[A-Za-z0-9]+$/.test(message.messageId)||!/^oc_[A-Za-z0-9]+$/.test(message.chatId))return true;
     this.store.db.prepare("INSERT OR IGNORE INTO group_privacy(messageId,chatId,senderId,content,identity,receivedAt) VALUES(?,?,?,?,?,?)")
       .run(message.messageId,message.chatId,message.senderId,message.content.slice(0,12000),identity,new Date().toISOString());return true;
   }
   ingestEvent(event:Record<string,unknown>){
+    if(!this.enabled())return false;
     if(event.chat_type==="p2p")return false;
     if(event.chat_type!=="group")return true;
     // All group events are claimed, including the owner's. No legacy tools or
@@ -71,7 +85,7 @@ export class GroupPrivacy {
     return {request:row.content,groupContext:context.reverse(),companyRoots:new CompanyFiles(()=>this.roots()).listRoots()};
   }
   async tick(){
-    if(this.busy||this.closing)return;this.busy=true;
+    if(!this.enabled()||this.busy||this.closing)return;this.busy=true;
     try{
       const pending=this.store.db.prepare("SELECT * FROM group_privacy WHERE status='pending' ORDER BY id LIMIT 5").all() as GroupRow[];
       for(const row of pending){
@@ -111,6 +125,7 @@ export class GroupPrivacy {
     this.update(id,{status:"needs_owner",category:plan.category,draft:plan.draft,reason:plan.reason,notified:0,error:null});
   }
   async decide(id:number,body:Record<string,unknown>){
+    if(!this.enabled()&&body.action!=="dismiss")throw new Error("群聊隐私保护已关闭；历史请求不会自动执行或发送。请先开启保护后再审核。");
     const row=this.row(id);if(!row||row.version!==body.version||!['needs_owner','operation_unknown'].includes(row.status)||this.locks.has(id))throw new Error("状态已变化或正在处理，请刷新。");
     this.locks.add(id);
     try{
@@ -154,7 +169,7 @@ export function registerGroupPrivacyRoutes(app:FastifyInstance,privacy:GroupPriv
   app.route({method:["GET","PATCH"],url:"/v1/group-privacy",handler:async(request,reply)=>{
     if(!authenticated(request))return reply.code(401).send({error:"unauthorized"});
     try{return request.method==='PATCH'?privacy.configure((request.body??{}) as Record<string,unknown>):privacy.snapshot();}
-    catch(error){return reply.code(400).send({error:errorText(error)});}
+    catch(error){return reply.code(error instanceof Error&&"statusCode" in error&&error.statusCode===409?409:400).send({error:errorText(error)});}
   }});
   app.post("/v1/group-privacy/:id/decision",async(request,reply)=>{
     if(!authenticated(request))return reply.code(401).send({error:"unauthorized"});

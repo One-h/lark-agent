@@ -79,7 +79,7 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
         context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: c.scope ?? "trusted", turnId: c.callTurn ?? turn }
       } });
       assert.notEqual(result.statusCode, 200, JSON.stringify(c));
-      if (c.chatType !== "group" && !c.callTurn && c.status !== "answered") expectedCards++;
+      if (!c.callTurn && c.status !== "answered") expectedCards++;
       assert.equal(cards, expectedCards, JSON.stringify(c));
       assert.equal(sends, 0, JSON.stringify(c));
     }

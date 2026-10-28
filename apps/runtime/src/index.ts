@@ -153,7 +153,7 @@ export function createRuntime(config: RuntimeConfig) {
   const trustedSenderIds = new Set(initialTrustedSenderIds);
   if (!storedTrusted) store.setSetting("trustedSenderIds", JSON.stringify([...trustedSenderIds]));
   if (!storedApprover && approverId) store.setSetting("approverId", approverId);
-  configureConversationRuntime({ database: store.db, groupPrivacyEnforced: true, mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender });
+  configureConversationRuntime({ database: store.db, groupPrivacyEnforced: store.setting("groupPrivacy.enabled", "false") === "true", mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender });
   configureTurnApprovalReviewer(config.turnApprovalReviewer);
   configureAutoApprovalNotificationSender(config.autoApprovalNotificationSender);
   store.registerCapabilities([{ id: "lark.message.send", title: "发送飞书消息", description: "Send a bot text message to a known Lark contact. Input requires recipient (name, alias, or open_id) and text.", inputSchema: { type: "object", properties: { recipient: { type: "string" }, text: { type: "string" } }, required: ["recipient", "text"] }, risk: "external-write" }]);
@@ -297,7 +297,7 @@ export function createRuntime(config: RuntimeConfig) {
       ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_session_id, codex_turn_id, codex_status, message_type, sender_type, direction FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_session_id?: string | null; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string } | undefined
       : undefined;
     if (!message || message.chat_id !== context.chatId) throw new Error("Invalid capability context");
-    if (message.chat_type === "group") throw new Error("群消息不能调用旧宿主能力；请使用群聊隐私单次审批。");
+    if (message.chat_type === "group" && conversationConfig.groupPrivacyEnforced) throw new Error("群消息不能调用旧宿主能力；请使用群聊隐私单次审批。");
     const expectedScope = isTrustedLarkSender(message.sender_id) ? "trusted" : "untrusted";
     if (context.trustScope !== expectedScope) throw new Error("Capability trust scope does not match the current sender");
     const turnId = typeof context.turnId === "string" && context.turnId ? context.turnId : message.codex_turn_id ?? `capability:${id}`;
@@ -390,9 +390,13 @@ export function createRuntime(config: RuntimeConfig) {
   const authenticated = (request: FastifyRequest) => !config.runtimeToken || request.headers.authorization === `Bearer ${config.runtimeToken}`;
   let groupPrivacy: GroupPrivacy;
   const agentMessaging = new AgentMessaging(store, { ownerId: () => approverId ?? "",
+    groupReviewRequired: () => groupPrivacy.enabled(),
     queueGroup: input => groupPrivacy.propose(input) });
   registerAgentMessagingRoutes(app, agentMessaging, req => Boolean(config.runtimeToken) && authenticated(req));
   groupPrivacy = new GroupPrivacy(store, { ownerId: () => approverId ?? "", model: configuredLarkCodexModel,
+    canChangeEnabled: () => activeCapabilityCalls === 0 && larkCodexAppServerStatus().activeTurns === 0
+      && !store.db.prepare("SELECT 1 FROM lark_messages WHERE codex_status IN ('queued','running') LIMIT 1").get(),
+    enabledChanged: enabled => { conversationConfig.groupPrivacyEnforced = enabled; },
     approvedReceipt: (outreachId, messageId, chatId) => agentMessaging.approvedGroupReceipt(outreachId, messageId, chatId),
     forward: (message, identity) => agentMessaging.ingest(message, identity) });
   registerGroupPrivacyRoutes(app, groupPrivacy, request => Boolean(config.runtimeToken) && authenticated(request));

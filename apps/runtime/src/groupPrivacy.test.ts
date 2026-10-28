@@ -17,6 +17,7 @@ async function fixture(run:(f:any)=>Promise<void>){
   plan:async(input:unknown,_model:string)=>{inputs.push({input});return {category:"public" as const,draft:"这是一段草稿",reason:"需要审核"};},
   execute:async(root:string,argv:string[])=>{executed.push({root,argv});return "执行成功";},forward:(m:unknown,identity:string)=>{forwarded.push({m,identity});return true;}};
  const privacy=new GroupPrivacy(store,options);
+ privacy.configure({enabled:true});
  try{await run({root,work,store,calls,inputs,executed,forwarded,options,privacy,row:()=>privacy.snapshot().messages[0] as any});}
  finally{await privacy.stop();store.close();fs.rmSync(root,{recursive:true,force:true});}
 }

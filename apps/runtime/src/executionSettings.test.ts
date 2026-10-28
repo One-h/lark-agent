@@ -99,6 +99,7 @@ test("permission changes wait for an in-flight host call even without a native r
     for (let i = 0; !entered && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(entered, true);
     runtime.store.db.prepare("UPDATE lark_messages SET codex_status='answered' WHERE id=1").run();
+    assert.equal((await runtime.app.inject({method:"PATCH",url:"/v1/group-privacy",headers:{authorization:"Bearer test-token"},payload:{enabled:true}})).statusCode,409);
     for (const payload of [{trustedExecutionEnabled: false}, {trustedSenderIds: []}, {approverId: "ou_new"}]) {
       assert.equal((await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload})).statusCode, 409);
     }

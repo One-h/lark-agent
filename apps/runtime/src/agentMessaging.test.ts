@@ -98,3 +98,13 @@ test("a confirmed group target is queued and receives a routing receipt only aft
  const guarded=new AgentMessaging(store,{ownerId:()=>"ou_owner",bridge,cli:async args=>{if(args[1]==="chats")return {data:{chat_mode:"group"}};sent.push(args);return {data:{message_id:"om_should_not_send",chat_id:"oc_group"}};},queueGroup:input=>{proposals.push(input);return 1;}});
  try{const result=await guarded.send({sourceThreadId:a,sourceCwd:(await bridge.inspect(a)).cwd,sourceLabel:"群协作",recipientId:"ou_peer",chatId:"oc_group",requestKey:"real_group_queue",text:"群消息草稿"});assert.equal(result?.status,"awaiting_approval");assert.equal(sent.length,0);assert.equal(proposals.length,1);guarded.approvedGroupReceipt(result!.id,"om_approved","oc_group");assert.equal((guarded.snapshot().outreaches as any[])[0].status,"open");}finally{await guarded.stop();}
 }));
+
+test("disabled privacy restores direct group outreach without creating review proposals",async()=>fixture(async({store,bridge})=>{
+ const sent:string[][]=[],proposals:unknown[]=[];
+ const router=new AgentMessaging(store,{ownerId:()=>"ou_owner",bridge,groupReviewRequired:()=>false,
+  queueGroup:input=>{proposals.push(input);return 1;},cli:async args=>{if(args[1]==="chats")return {data:{chat_mode:"group"}};sent.push(args);return {data:{message_id:"om_sent_group",chat_id:"oc_group"}};}});
+ try{
+  const result=await router.send({sourceThreadId:a,sourceCwd:(await bridge.inspect(a)).cwd,sourceLabel:"group",recipientId:"ou_peer",chatId:"oc_group",requestKey:"normal_group_send",text:"hello"});
+  assert.equal(result?.status,"open");assert.equal(result?.messageId,"om_sent_group");assert.equal(sent.length,1);assert.equal(proposals.length,0);
+ }finally{await router.stop();}
+}));

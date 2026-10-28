@@ -17,6 +17,7 @@ export class AgentMessaging {
   private readonly sending = new Set<string>();
   constructor(readonly store: SqliteAgentStore, private readonly options: {
     ownerId: () => string; bridge?: AgentReplyBridge; cli?: typeof inboxCli;
+    groupReviewRequired?: () => boolean;
     queueGroup?: (input: {outreachId:string;chatId:string;identity:"bot"|"user";text:string})=>number;
   }) {
     store.db.exec(`CREATE TABLE IF NOT EXISTS agent_outreach (
@@ -70,12 +71,12 @@ export class AgentMessaging {
         const {data}=await this.cli(["im","chats","get","--as",identity,"--chat-id",chatId]);
         if(!["group","p2p"].includes(data?.chat_mode))throw new Error("无法确认目标会话类型，未发送。");
         group=data.chat_mode==="group";
-        if(group&&!this.options.queueGroup)throw new Error("群消息必须进入隐私审批，未发送。");
+        if(group&&(this.options.groupReviewRequired?.()??true)&&!this.options.queueGroup)throw new Error("群消息必须进入隐私审批，未发送。");
       }
       const id = randomUUID(), at = new Date().toISOString();
       this.store.db.prepare("INSERT INTO agent_outreach (id,requestKey,sourceThreadId,sourceLabel,sourceCwd,identity,recipientId,chatId,text,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?,'sending',?)")
         .run(id,requestKey,sourceThreadId,sourceLabel,path.resolve(sourceCwd),identity,recipientId,chatId,text,at);
-      if(group){
+      if(group&&(this.options.groupReviewRequired?.()??true)){
         this.store.db.prepare("UPDATE agent_outreach SET status='awaiting_approval' WHERE id=?").run(id);
         this.options.queueGroup!({outreachId:id,chatId,identity:identity as "bot"|"user",text});
         return this.outreach(id);
