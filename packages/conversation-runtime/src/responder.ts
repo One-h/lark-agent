@@ -13,6 +13,7 @@ import { sanitizeLarkReply } from "./replySanitization.js";
 import { hasLarkManualTurnApproval, notifyLarkTurnEnded } from "./approvalLifecycle.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { postHostJson } from "./hostHttp.js";
+import { finishLarkProgressCard, queueLarkProgressUpdate, rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -186,8 +187,7 @@ type ActiveLarkCodexRun = {
   startedMs: number;
   lastInputMs: number;
   lastHeartbeatMs: number;
-  sentInterimCount: number;
-  lastInterimSentMs: number;
+  progressId: string;
   sentInterimEventIds: Set<string>;
   sentReplies: Map<number, string>;
   sentReplyKeys: Map<number, string>;
@@ -2061,6 +2061,8 @@ function finishRun(
     reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
   }
   updateRunMembers(run, finalStatus, finalError);
+  finishLarkProgressCard(run.progressId, !sendReply ? "interrupted" : finalStatus === "failed"
+    ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed");
   if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
   if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0) {
     queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
@@ -2240,14 +2242,14 @@ export function shouldSendLarkInterimReply(input: {
   enabled: boolean;
   elapsedMs: number;
   hasStartedSubstantiveWork: boolean;
-  sentCount: number;
+  sentCount?: number;
   maxReplies?: number;
   delayMs?: number;
 }): boolean {
+  // Legacy count fields are ignored; the progress transport rate-limits edits.
   return input.enabled
     && input.hasStartedSubstantiveWork
-    && input.elapsedMs >= (input.delayMs ?? config.larkCodexInterimReplyDelayMs)
-    && input.sentCount < (input.maxReplies ?? config.larkCodexMaxInterimReplies);
+    && input.elapsedMs >= (input.delayMs ?? config.larkCodexInterimReplyDelayMs);
 }
 
 export function larkFinalTextDeliveryDecision(input: {
@@ -2265,8 +2267,9 @@ export function larkFinalTextDeliveryDecision(input: {
 }
 
 function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
-  const candidate = run.pendingInterim;
-  if (!candidate) return;
+  if (run.settled || !shouldSendLarkInterimReply({ enabled: getAppSettings().larkCodexInterimRepliesEnabled,
+    elapsedMs: Date.now() - run.startedMs, hasStartedSubstantiveWork: run.hasStartedSubstantiveWork })) return;
+  const candidate = run.pendingInterim ?? { id: "work-started", text: "已开始执行，等待结果。" };
   if (
     run.sentInterimEventIds.has(candidate.id)
     || candidate.text.length > 700
@@ -2274,19 +2277,9 @@ function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
     run.pendingInterim = null;
     return;
   }
-  const nowMs = Date.now();
   const interimRepliesEnabled = getAppSettings().larkCodexInterimRepliesEnabled;
   if (!interimRepliesEnabled) {
     run.pendingInterim = null;
-    return;
-  }
-  if (!shouldSendLarkInterimReply({
-    enabled: interimRepliesEnabled,
-    elapsedMs: nowMs - run.lastInputMs,
-    hasStartedSubstantiveWork: run.hasStartedSubstantiveWork,
-    sentCount: run.sentInterimCount
-  })) return;
-  if (run.lastInterimSentMs > 0 && nowMs - run.lastInterimSentMs < config.larkCodexStreamReplyMinIntervalMs) {
     return;
   }
   run.sentInterimEventIds.add(candidate.id);
@@ -2302,14 +2295,8 @@ function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
     run.pendingInterim = null;
     return;
   }
-  const outboundReply = formatLarkFinalReply(target.row, reply);
-  const deliveryKey = larkReplyIdempotencyKey(`codexs${run.sentInterimCount + 1}`, `${run.turnId}:${candidate.id}`);
-  queueLarkTextReply(target.row, outboundReply, deliveryKey);
-  run.sentReplies.set(target.row.id, reply);
-  run.sentReplyKeys.set(target.row.id, deliveryKey);
-  run.memberReplies.set(target.row.id, reply);
-  run.sentInterimCount += 1;
-  run.lastInterimSentMs = nowMs;
+  queueLarkProgressUpdate({ progressId: run.progressId, turnId: run.turnId, threadId: run.threadId,
+    source: target.row, eventId: candidate.id, text: reply });
   run.pendingInterim = null;
   updateCodexState(target.row.id, { status: "running", reply, sessionId: run.threadId });
 }
@@ -2424,7 +2411,6 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
         run.lastAgentMessage = null;
         run.finalAgentMessage = null;
         run.pendingInterim = null;
-        run.hasStartedSubstantiveWork = false;
       }
       return;
     }
@@ -2525,6 +2511,7 @@ async function retryLarkTurnAfterCapacityFailure(run: ActiveLarkCodexRun, initia
         return;
       }
       run.turnId = turn.turn.id;
+      rebindLarkProgressCard(run.progressId, run.turnId, run.threadId);
       registerCodexAppServerTurn(run.turnId);
       run.startedMs = Date.now();
       run.lastInputMs = Date.now();
@@ -2603,6 +2590,7 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
     unregisterCodexAppServerTurn(previousTurnId);
     run.threadId = threadId;
     run.turnId = turn.turn.id;
+    rebindLarkProgressCard(run.progressId, run.turnId, run.threadId);
     registerCodexAppServerTurn(run.turnId);
     run.startedMs = Date.now();
     run.lastInputMs = Date.now();
@@ -3654,8 +3642,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     startedMs: Date.now(),
     lastInputMs: Date.now(),
     lastHeartbeatMs: Date.now(),
-    sentInterimCount: 0,
-    lastInterimSentMs: 0,
+    progressId: turn.turn.id,
     sentInterimEventIds: new Set<string>(),
     sentReplies: new Map<number, string>(),
     sentReplyKeys: new Map<number, string>(),
@@ -3946,6 +3933,7 @@ export function reconcileLarkCodexResponder(): void {
     WHERE codex_status = 'failed'
       AND codex_reply = ?
   `).run(legacyLongRunningProgressText);
+  reconcileLarkProgressCards();
 }
 
 export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false): number {
@@ -3985,6 +3973,7 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
     }
   });
   transaction();
+  reconcileLarkProgressCards();
   return ids.length;
 }
 

@@ -158,6 +158,15 @@ export class SqliteAgentStore {
       CREATE TABLE IF NOT EXISTS lark_delivery_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, last_error TEXT, sent_at TEXT, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_lark_capability_approvals_pending ON lark_capability_approvals(status, expires_at);
       CREATE INDEX IF NOT EXISTS idx_lark_delivery_outbox_pending ON lark_delivery_outbox(status, next_attempt_at);
+      CREATE TABLE IF NOT EXISTS lark_progress_cards (
+        progress_id TEXT PRIMARY KEY, native_turn_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+        lark_message_id INTEGER NOT NULL, message_id TEXT NOT NULL, card_message_id TEXT,
+        entries_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'running', version INTEGER NOT NULL DEFAULT 1,
+        delivered_version INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 1,
+        create_attempted INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_lark_progress_pending ON lark_progress_cards(next_attempt_at) WHERE pending=1;
     `);
 
     this.ensureColumn("stickers", "content_hash", "TEXT");

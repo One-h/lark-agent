@@ -215,6 +215,7 @@ test("conversation runtime responder preserves stream extraction and idempotency
   assert.equal(shouldSendLarkInterimReply({ enabled: false, elapsedMs: 60_000, hasStartedSubstantiveWork: true, sentCount: 0 }), false);
   assert.equal(shouldSendLarkInterimReply({ enabled: true, elapsedMs: 60_000, hasStartedSubstantiveWork: false, sentCount: 0 }), false);
   assert.equal(shouldSendLarkInterimReply({ enabled: true, elapsedMs: 30_000, hasStartedSubstantiveWork: true, sentCount: 0 }), true);
+  assert.equal(shouldSendLarkInterimReply({ enabled: true, elapsedMs: 60_000, hasStartedSubstantiveWork: true, sentCount: 999 }), true);
   assert.equal(larkCodexStartedSubstantiveWorkItem({ method: "item/started", params: { item: { type: "mcpToolCall", server: "lark_stickers" } } }), false);
   assert.equal(larkCodexStartedSubstantiveWorkItem({ method: "item/started", params: { item: { type: "commandExecution" } } }), true);
   assert.deepEqual(larkFinalTextDeliveryDecision({ reply: "相同答复", previousReply: "相同答复", previousKey: "interim-key", hasSticker: true, newKey: "final-key" }), { shouldQueue: false, dependencyKey: "interim-key" });

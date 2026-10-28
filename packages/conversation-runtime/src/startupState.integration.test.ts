@@ -5,7 +5,9 @@ import path from "node:path";
 import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
-import { configureConversationRuntime, setAppSettingValue } from "./context.js";
+import { config, configureConversationRuntime, setAppSettingValue } from "./context.js";
+import { drainLarkProgressCards } from "./progressCards.js";
+import type { LarkProgressContent } from "@lark-agent/adapter-lark-cli";
 import { codexAppServer } from "./codexRuntime.js";
 import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, reconcilePendingLarkThreadArchives, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
 import { ingestLarkEvent } from "./worker.js";
@@ -56,8 +58,12 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   process.env.PATH = `${root}:${previousPath ?? ""}`;
   const store = new SqliteAgentStore(path.join(root, "test.sqlite"));
   const delivered: string[] = [], attempts: Array<{text: string; key: string}> = [], reactions: Array<{messageId: string; emoji: string}> = [];
+  const progress: LarkProgressContent[] = [], progressUpdates: LarkProgressContent[] = [];
+  let failProgress = false;
   let failDelivery = false;
   configureConversationRuntime({database: store.db, mode: "active", repoRoot: root, workspaceRoot: root, larkStickerDirectory: path.join(root, "stickers"),
+    progressSender: async (_id, content) => { progress.push(structuredClone(content)); if (failProgress) throw new Error("fixture progress failed"); return {ok:true,messageId:"om_progress",chatId:"oc_fixture",messageAt:null,messageType:"interactive"}; },
+    progressUpdater: async (_id, content) => { progressUpdates.push(structuredClone(content)); return {ok:true}; },
     reactionSender: (messageId, emoji) => { reactions.push({messageId, emoji}); return {ok: true}; }, textReplySender: (_id, text, key) => {
       attempts.push({text, key});
       if (failDelivery) return {ok: false, error: "fixture transport failure"};
@@ -69,7 +75,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   const state = (value: unknown) => fs.writeFileSync(statePath, JSON.stringify(value));
   const emit = (notifications: unknown[]) => codexAppServer.request("fixture/emit", {notifications});
   const message = {event_id: "event-fixture", message_id: "om_1", chat_id: "oc_fixture", chat_type: "p2p", sender_id: "ou_sender", sender_type: "user", message_type: "text", content: "fixture request"};
-  return {root, store, delivered, attempts, reactions, row, records, state, emit, message, turnId,
+  return {root, store, delivered, attempts, reactions, progress, progressUpdates, row, records, state, emit, message, turnId,
+    failProgress(value: boolean) { failProgress = value; },
     failDelivery(value: boolean) { failDelivery = value; },
     async ready(startError = false) {
       if (startError) state({startError: true});
@@ -84,7 +91,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
         {method: "turn/completed", params: {threadId: "thread-fixture", turn: {id: turnId, status: "completed"}}}]);
       await until(() => row().codex_status === "answered");
     },
-    async close() { stopLarkCodexResponder(); await immediate(); store.close(); if (previous === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previous; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; fs.rmSync(root, {recursive: true, force: true}); }
+    async close() { stopLarkCodexResponder(); await drainLarkProgressCards(); await immediate(); store.close(); if (previous === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previous; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; fs.rmSync(root, {recursive: true, force: true}); }
   };
 }
 
@@ -346,6 +353,70 @@ test("unloaded bot thread owned by another writer starts a new full-context conv
   await f.emit([{method:"item/completed",params:{threadId:"thread-fixture-new",turnId:row().codex_turn_id,item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture recovered"}}},{method:"turn/completed",params:{threadId:"thread-fixture-new",turn:{id:row().codex_turn_id,status:"completed"}}}]);
   await until(()=>row().codex_status==="answered");assert.equal(f.delivered.at(-1),"fixture recovered");
  }finally{await f.close();}
+});
+
+test("short tasks send only final text even when commentary matches the final answer", async () => {
+  const f = fixture();
+  try {
+    setAppSettingValue("interimRepliesEnabled", "true"); await f.ready();
+    const turnId = f.row().codex_turn_id;
+    await f.emit([
+      {method:"item/started",params:{threadId:"thread-fixture",turnId,item:{id:"work",type:"commandExecution"}}},
+      {method:"item/completed",params:{threadId:"thread-fixture",turnId,item:{id:"progress",type:"agentMessage",phase:"commentary",text:"fixture done"}}}
+    ]);
+    await f.complete(); await drainLarkProgressCards();
+    assert.deepEqual(f.delivered, ["fixture done"]); assert.equal(f.progress.length, 0);
+  } finally { await f.close(); }
+});
+
+test("long tasks and steer keep one progress card, then send the final answer once even with identical text", async () => {
+  const f = fixture(), delay = config.larkCodexInterimReplyDelayMs;
+  try {
+    config.larkCodexInterimReplyDelayMs = 0;
+    setAppSettingValue("interimRepliesEnabled", "true"); await f.ready();
+    const turnId = f.row().codex_turn_id;
+    const progress = (id: string, text: string) => f.emit([{method:"item/completed",params:{threadId:"thread-fixture",turnId,item:{id,type:"agentMessage",phase:"commentary",text}}}]);
+    await f.emit([{method:"item/started",params:{threadId:"thread-fixture",turnId,item:{id:"work",type:"commandExecution"}}}]);
+    await progress("step-one", "first step"); await drainLarkProgressCards();
+    assert.equal(f.progress.length, 1); assert.equal(f.delivered.length, 0); assert.equal(f.row().reply_status, "pending");
+    ingestLarkEvent({...f.message,event_id:"event-steer",message_id:"om_steer",content:"how is it going"});
+    const steered = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_steer'").get() as any;
+    await until(() => steered()?.codex_turn_id === turnId);
+    await f.emit([{method:"item/completed",params:{threadId:"thread-fixture",turnId,item:{type:"userMessage",clientId:"om_steer"}}}]);
+    await progress("step-two", "second step"); await progress("step-three", "fixture done");
+    f.store.db.prepare("UPDATE lark_progress_cards SET next_attempt_at='2000-01-01T00:00:00Z'").run(); await drainLarkProgressCards();
+    await f.complete(); await drainLarkProgressCards();
+    assert.equal(f.progress.length, 1); assert.equal(f.progressUpdates.at(-1)!.state, "completed");
+    assert.ok(f.progressUpdates.at(-1)!.entries.some(e => e.text === "second step"));
+    assert.deepEqual(f.delivered, ["fixture done"]); assert.equal(steered().reply_status, "sent");
+    assert.equal(f.records().filter(r => r.method === "turn/start").length, 1);
+    assert.equal(f.records().filter(r => r.method === "turn/steer").length, 1);
+  } finally { config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
+});
+
+test("progress delivery failure never blocks or duplicates final text", async () => {
+  const f = fixture(), delay = config.larkCodexInterimReplyDelayMs;
+  try {
+    config.larkCodexInterimReplyDelayMs = 0; f.failProgress(true);
+    setAppSettingValue("interimRepliesEnabled", "true"); await f.ready();
+    await f.emit([{method:"item/started",params:{threadId:"thread-fixture",turnId:f.row().codex_turn_id,item:{id:"work",type:"commandExecution"}}}]);
+    await drainLarkProgressCards(); await f.complete(); await drainLarkProgressCards();
+    assert.deepEqual(f.delivered, ["fixture done"]); assert.equal(f.row().reply_status, "sent");
+    const card = f.store.db.prepare("SELECT state,last_error FROM lark_progress_cards").get() as any;
+    assert.equal(card.state, "completed"); assert.match(card.last_error, /fixture progress failed/);
+  } finally { config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
+});
+
+test("an isolated progress storage failure cannot prevent the native task from completing and replying", async () => {
+  const f = fixture(), delay = config.larkCodexInterimReplyDelayMs;
+  try {
+    config.larkCodexInterimReplyDelayMs = 0;
+    f.store.db.exec("CREATE TRIGGER reject_progress BEFORE INSERT ON lark_progress_cards BEGIN SELECT RAISE(ABORT,'fixture progress storage failure'); END");
+    setAppSettingValue("interimRepliesEnabled", "true"); await f.ready();
+    await f.emit([{method:"item/started",params:{threadId:"thread-fixture",turnId:f.row().codex_turn_id,item:{id:"work",type:"commandExecution"}}}]);
+    await f.complete(); await drainLarkProgressCards();
+    assert.deepEqual(f.delivered, ["fixture done"]); assert.equal(f.row().codex_status, "answered");
+  } finally { config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
 });
 
 test("native inputs reuse stable instructions but refresh settings, compaction and per-message tool bindings", async () => {

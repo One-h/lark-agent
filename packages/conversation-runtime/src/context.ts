@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { sendLarkProgressCard, updateLarkProgressCard } from "@lark-agent/adapter-lark-cli";
 import { sendLarkTextReply, sendLarkMediaReply, sendLarkReaction, type LarkSentMessage } from "@lark-agent/adapter-lark-cli";
 
 export type LarkStickerRow = {
@@ -45,8 +46,12 @@ export type LarkReactionSender = (messageId: string, emojiType: string) => { ok:
 export let larkTextReplySender: LarkTextReplySender = sendLarkTextReply;
 export let larkMediaReplySender: typeof sendLarkMediaReply = sendLarkMediaReply;
 export let larkReactionSender: LarkReactionSender = sendLarkReaction;
+export type LarkProgressSender = typeof sendLarkProgressCard;
+export type LarkProgressUpdater = typeof updateLarkProgressCard;
+export let larkProgressSender: LarkProgressSender = sendLarkProgressCard;
+export let larkProgressUpdater: LarkProgressUpdater = updateLarkProgressCard;
 
-export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender; groupPrivacyEnforced?: boolean }): void {
+export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender; groupPrivacyEnforced?: boolean; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater }): void {
   db = input.database;
   config.groupPrivacyEnforced = input.groupPrivacyEnforced ?? false;
   config.runtimeMode = input.mode ?? "shadow";
@@ -62,6 +67,8 @@ export function configureConversationRuntime(input: { database: Database.Databas
   larkTextReplySender = input.textReplySender ?? sendLarkTextReply;
   larkMediaReplySender = input.mediaReplySender ?? sendLarkMediaReply;
   larkReactionSender = input.reactionSender ?? sendLarkReaction;
+  larkProgressSender = input.progressSender ?? sendLarkProgressCard;
+  larkProgressUpdater = input.progressUpdater ?? updateLarkProgressCard;
 }
 
 export function recordOutboundLarkMessage(input: { messageId: string; chatId: string | null; chatType: string | null; recipientId: string | null; content: string; replyToMessageId: string | null; messageAt?: string | null; messageType?: string | null; source: "reply" | "proactive" }): number | null {

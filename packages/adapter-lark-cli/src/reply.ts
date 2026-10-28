@@ -21,7 +21,7 @@ export type LarkSentMessage = {
 
 type LarkSendResult = LarkSentMessage | { ok: false; error: string };
 
-function jsonFromCliOutput(stdout: string): unknown {
+export function jsonFromCliOutput(stdout: string): unknown {
   const trimmed = stdout.trim();
   if (!trimmed) return null;
   try { return JSON.parse(trimmed) as unknown; } catch { /* Some CLI versions print notices before JSON. */ }
