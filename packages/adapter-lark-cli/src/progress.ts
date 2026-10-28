@@ -5,18 +5,17 @@ import { jsonFromCliOutput, parseLarkSentMessage, type LarkSentMessage } from ".
 export type LarkProgressState = "running" | "completed" | "failed" | "cancelled" | "interrupted";
 export type LarkProgressEntry = { id: string; at: string; text: string };
 export type LarkProgressContent = { state: LarkProgressState; entries: LarkProgressEntry[] };
-const labels: Record<LarkProgressState, string> = { running: "处理中", completed: "本轮已结束", failed: "执行失败", cancelled: "已取消", interrupted: "执行已中断" };
+const labels: Record<LarkProgressState, string> = { running: "处理中", completed: "已结束", failed: "失败", cancelled: "已取消", interrupted: "已中断" };
 const escape = (text: string) => text.replace(/[&<>*_\[\]`~]/g, c => `&#${c.charCodeAt(0)};`);
 
 export function buildLarkProgressCard(input: LarkProgressContent) {
   const entries = input.entries.slice(-5).map(entry => {
     const time = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(entry.at));
     return `${time}  ${escape(entry.text.replace(/\s+/g, " ").slice(0, 180))}`;
-  }).join("\n\n");
+  }).join("\n");
   return { schema: "2.0", config: { update_multi: true, width_mode: "compact", summary: { content: `任务进度 · ${labels[input.state]}` } },
-    body: { direction: "vertical", padding: "8px", vertical_spacing: "8px", elements: [
-      { tag: "column_set", flex_mode: "none", background_style: input.state === "running" ? "blue-50" : input.state === "completed" ? "green-50" : "grey-50",
-        columns: [{ tag: "column", width: "weighted", weight: 1, padding: "4px", elements: [{ tag: "markdown", content: `**${labels[input.state]}**` }] }] },
+    body: { direction: "vertical", padding: "8px", vertical_spacing: "4px", elements: [
+      { tag: "markdown", content: `<font color='grey'>${labels[input.state]}</font>`, text_size: "notation" },
       { tag: "markdown", content: entries || "已开始处理。", text_size: "notation" }
     ] } };
 }
