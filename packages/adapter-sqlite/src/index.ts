@@ -139,6 +139,16 @@ export class SqliteAgentStore {
       CREATE TABLE IF NOT EXISTS lark_codex_sessions (session_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, codex_session_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS lark_codex_archive_queue (thread_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, activity_version INTEGER NOT NULL, token TEXT NOT NULL, due_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_lark_codex_archive_queue_due ON lark_codex_archive_queue(due_at);
+      CREATE TABLE IF NOT EXISTS lark_owner_mention_assists (
+        lark_message_id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'pending',
+        status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '', draft TEXT NOT NULL DEFAULT '',
+        question TEXT NOT NULL DEFAULT '', owner_context_cursor INTEGER NOT NULL, decision_turn_id TEXT, ready_turn_id TEXT,
+        membership_checked_at INTEGER NOT NULL DEFAULT 0, manual_approved INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 1, notified INTEGER NOT NULL DEFAULT 0, notice_generation INTEGER NOT NULL DEFAULT 1, notify_attempts INTEGER NOT NULL DEFAULT 0,
+        notify_after TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_lark_owner_assist_notify ON lark_owner_mention_assists(notify_after)
+        WHERE status='needs_owner' AND notified=0 AND notify_attempts<5;
       CREATE TABLE IF NOT EXISTS lark_codex_session_resets (id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, codex_session_id TEXT NOT NULL, reset_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_lark_codex_session_resets_chat ON lark_codex_session_resets(chat_id, id DESC);
       CREATE TABLE IF NOT EXISTS lark_group_context_cursors (chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, last_message_id INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(chat_id, trust_scope));

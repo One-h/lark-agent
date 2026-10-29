@@ -23,6 +23,7 @@ export class PersonalInbox {
     ownerId: () => string; model: () => string; transport?: PersonalInboxTransport;
     review?: (message: PersonalMessage, model: string) => Promise<InboxDecision>;
     now?: () => Date; routeMessage?: (message: PersonalMessage) => boolean;
+    botAssistClaimed?: (message: PersonalMessage) => boolean;
   }) {
     store.db.exec(`CREATE TABLE IF NOT EXISTS personal_inbox (
       id INTEGER PRIMARY KEY AUTOINCREMENT, messageId TEXT NOT NULL UNIQUE, chatId TEXT NOT NULL,
@@ -51,6 +52,11 @@ export class PersonalInbox {
     const entries = Object.entries({ ...patch, updatedAt: this.now() });
     this.store.db.prepare(`UPDATE personal_inbox SET ${entries.map(([key]) => `${key}=?`).join(",")}, version=version+1 WHERE id=?`)
       .run(...entries.map(([, value]) => value), id);
+  }
+  private transferredToBot(row: InboxRow): boolean {
+    if (row.chatType !== "group" || !this.options.botAssistClaimed?.(row)) return false;
+    this.update(row.id,{status:"dismissed",summary:"此消息已交由机器人群聊协同处理，不以本人身份重复发送。",question:""});
+    return true;
   }
   async configure(body: Record<string, unknown>) {
     if (Object.keys(body).some(key => !["enabled", "autoReply"].includes(key))
@@ -109,6 +115,7 @@ export class PersonalInbox {
           if (await this.transport.ownerReplied(row, identity.ownerId)) { this.update(row.id, { status: "owner_replied", summary: "你已亲自回复，助手不再重复发送。" }); continue; }
           this.update(row.id, { status: "reviewing" });
           const decision = await (this.options.review ?? reviewPersonalMessage)(row, this.options.model());
+          if (this.transferredToBot(row)) continue;
           const routine = decision.action === "routine" && automaticReplyAllowed(row) && this.setting("autoReply", "true") === "true";
           this.update(row.id, { status: decision.action === "ignore" ? "dismissed" : routine ? "ready" : "needs_owner",
             draft: decision.reply, summary: decision.summary, question: decision.question || (routine ? "" : "你希望怎么回复这条消息？") });
@@ -117,6 +124,7 @@ export class PersonalInbox {
       }
       const notify = this.store.db.prepare("SELECT * FROM personal_inbox WHERE status IN ('needs_owner','awaiting_auth','send_unknown') AND notified=0 ORDER BY id LIMIT 5").all() as InboxRow[];
       for (const row of notify) {
+        if (this.transferredToBot(row)) continue;
         try {
           await this.transport.notify(identity.ownerId,
             `个人收件箱 #${row.id} · ${row.chatType === "group" ? "群里@你" : "私聊"}\n来自：${row.senderName}${row.chatName ? ` · ${row.chatName}` : ""}\n消息：${row.content.slice(0, 600)}\n${row.question || row.error || "以本人身份回复尚待授权。"}\n${row.draft ? `建议回复：${row.draft.slice(0, 500)}\n` : ""}请在 Forge 个人收件箱确认或修改后发送：http://127.0.0.1:4732/personal-inbox`,
@@ -145,12 +153,14 @@ export class PersonalInbox {
     try {
       const row = this.row(id);
       if (!row || !["ready", "awaiting_auth"].includes(row.status)) return;
+      if (this.transferredToBot(row)) return;
       if (!row.approved && (!automaticReplyAllowed(row) || this.setting("autoReply", "true") !== "true")) return;
       const identity = await this.transport.identity();
       if (identity.ownerId !== this.setting("ownerId")) throw new Error("当前登录账号不一致，未发送。");
       this.canSend = identity.canSend;
       if (!identity.canSend) { this.update(id, { status: "awaiting_auth", error: "需补上 im:message.send_as_user 用户授权。" }); return; }
       if (await this.transport.ownerReplied(row, identity.ownerId)) { this.update(id, { status: "owner_replied", error: null }); return; }
+      if (this.transferredToBot(row)) return;
       this.update(id, { status: "sending", error: null });
       const key = `inbox-${createHash("sha256").update(row.messageId).digest("hex").slice(0, 32)}`;
       try {

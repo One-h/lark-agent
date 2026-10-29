@@ -1,7 +1,8 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { defaultLarkAcknowledgeReactionEmoji, isLarkReactionEmojiType, larkReactionEmojiTypes } from "@lark-agent/adapter-lark-cli";
-import { config, db, getAppSettings, larkReactionSender, nowIso } from "./context.js";
-import { decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply } from "./responder.js";
+import { config, db, getAppSettings, larkReactionSender, nowIso, type LarkMessageRow } from "./context.js";
+import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings } from "./ownerMentionAssist.js";
+import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply } from "./responder.js";
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { imageKeysFromContent } from "./mediaImages.js";
@@ -172,6 +173,12 @@ export function shouldStartSpontaneousLarkReply(
     && randomValue < normalizedRate;
 }
 
+export function isOwnerMentionAssistMessage(event: LarkEvent): boolean {
+  if (event.chat_type !== "group" || event.sender_type !== "user" || typeof event.chat_id !== "string") return false;
+  const policy = ownerMentionAssistSettings(event.chat_id);
+  return policy.effectiveEnabled && event.sender_id !== policy.ownerId && isAtMeMessage(event, policy.ownerId);
+}
+
 export function hasRecentHandledLarkMessage(chatId: string | null, nowMs = Date.now()): boolean {
   if (!chatId) return false;
   const cooldownMs = conversationSpontaneousSettings(chatId).effectiveCooldownMs;
@@ -268,13 +275,14 @@ function persistLarkEvent(event: LarkEvent): void {
   const chatId = stringValue(event.chat_id);
   const rootMessageId = stringValue(event.root_id);
   const threadId = stringValue(event.thread_id);
-  const spontaneous = shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
+  const ownerMentioned = isOwnerMentionAssistMessage(event);
+  const spontaneous = !ownerMentioned && shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
   const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
     ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
     : resolveReplyContext(messageId, stringValue(event.reply_to));
-  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous }) ?? false;
-  const shouldRespond = !externallyRouted && config.runtimeMode === "active" && (directlyMentioned || spontaneous);
-  const replyTrigger = spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
+  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned }) ?? false;
+  const shouldRespond = !externallyRouted && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned);
+  const replyTrigger = ownerMentioned ? "owner_mention" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));
   let replyStatus = shouldRespond ? "pending" : "skipped";
   let replyError: string | null = null;
@@ -323,7 +331,8 @@ function persistLarkEvent(event: LarkEvent): void {
     if (!keyValue) {
       return;
     }
-    const existing = db.prepare(`SELECT reply_status, reply_error FROM lark_messages WHERE ${keyColumn} = ?`).get(keyValue) as { reply_status: string; reply_error: string | null } | undefined;
+    const existing = db.prepare(`SELECT reply_status, reply_error,reply_trigger FROM lark_messages WHERE ${keyColumn} = ?`).get(keyValue) as { reply_status: string; reply_error: string | null; reply_trigger: string } | undefined;
+    if (existing?.reply_trigger === "owner_mention") return;
     replyStatus = existing?.reply_status ?? replyStatus;
     replyError = existing?.reply_error ?? replyError;
     db.prepare(`
@@ -377,6 +386,10 @@ function persistLarkEvent(event: LarkEvent): void {
     );
   }
   if (insert.changes > 0 && messageId) {
+    const persisted = db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(messageId) as LarkMessageRow;
+    if (shouldRespond && ownerMentioned) ensureOwnerMentionAssist(persisted);
+    observeOwnerAssistContext(persisted);
+    appendOwnerAssistContext(persisted);
     const groupEmoji = groupMessageReactionEmoji(event);
     const reactionEmoji = groupEmoji ?? (directlyMentioned ? validReactionEmoji(getAppSettings().larkAcknowledgeReactionEmoji) : null);
     if (reactionEmoji) {

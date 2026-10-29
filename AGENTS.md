@@ -21,3 +21,4 @@ These rules apply to the entire repository.
 
 - Use one managed tmux session for this checkout on loopback port `4780`; reuse an existing checkout session, or use `lark-agent-runtime` / `LARK_AGENT_TMUX_SESSION` for a new install.
 - Do not start additional runtime instances against the same database. Before restarting, wait for active turns to finish and verify the session, port, and `/v1/health` afterward.
+- Also wait for `/v1/health` `activeOwnerAssists` to reach zero before a restart; private notifications and draft confirmation may still be in flight after a native turn ends.

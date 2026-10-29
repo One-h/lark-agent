@@ -65,6 +65,11 @@ const validators = {
   groupMessageReactionChatIds: (value: unknown) => groupIds(value, "groupMessageReactionChatIds"),
   acknowledgeReactionEmoji: (value: unknown) => emojiValue(value, "acknowledgeReactionEmoji"),
   groupSpontaneousRepliesEnabled: (value: unknown) => booleanValue(value, "groupSpontaneousRepliesEnabled"),
+  ownerMentionAssistEnabled: (value: unknown) => booleanValue(value, "ownerMentionAssistEnabled"),
+  ownerMentionAssistOwnerId: (value: unknown): string => {
+    if (typeof value !== "string" || value.length > 200 || value.trim() !== "" && !/^ou_[A-Za-z0-9]+$/.test(value.trim())) throw new Error("ownerMentionAssistOwnerId must be an open_id or empty");
+    return value.trim();
+  },
   groupSpontaneousChatIds: (value: unknown) => groupIds(value, "groupSpontaneousChatIds"),
   groupSpontaneousReplyRate: (value: unknown) => numberValue(value, "groupSpontaneousReplyRate", 0, 1, false),
   groupSpontaneousReplyCooldownMs: (value: unknown) => numberValue(value, "groupSpontaneousReplyCooldownMs", 0, 604_800_000),

@@ -11,7 +11,7 @@ import { normalizePersonalMessage, type PersonalInboxTransport, type PersonalMes
 
 const message: PersonalMessage = { messageId: "om_test", chatId: "oc_personal", chatType: "p2p", chatName: "同事",
   senderId: "ou_colleague", senderName: "同事", content: "你好", sourceTime: "2026-10-26 20:00", messageType: "text" };
-async function fixture(run: (context: { inbox: PersonalInbox; store: SqliteAgentStore; transport: PersonalInboxTransport; sent: string[]; advance: () => void }) => Promise<void>) {
+async function fixture(run: (context: { inbox: PersonalInbox; store: SqliteAgentStore; transport: PersonalInboxTransport; sent: string[]; advance: () => void }) => Promise<void>, options: { botAssistClaimed?: (message: PersonalMessage) => boolean } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-personal-inbox-"));
   const store = new SqliteAgentStore(path.join(root, "test.sqlite"));
   let at = new Date("2026-10-27T03:00:00Z");
@@ -21,7 +21,7 @@ async function fixture(run: (context: { inbox: PersonalInbox; store: SqliteAgent
     collect: async () => [], ownerReplied: async () => false,
     send: async (_message, text, key) => { sent.push(text + key); return "om_sent"; }, notify: async () => {}
   };
-  const inbox = new PersonalInbox(store, { ownerId: () => "ou_owner", model: () => "fixture", transport, now: () => at });
+  const inbox = new PersonalInbox(store, { ownerId: () => "ou_owner", model: () => "fixture", transport, now: () => at, ...options });
   try { await run({ inbox, store, transport, sent, advance: () => { at = new Date(at.getTime() + 60_000); } }); }
   finally { await inbox.stop(); store.close(); fs.rmSync(root, { recursive: true, force: true }); }
 }
@@ -69,6 +69,26 @@ test("owner replies suppress automated and manually approved replies", async () 
   transport.ownerReplied = async () => true; await inbox.tick();
   assert.equal(inbox.rows()[0].status, "owner_replied"); assert.equal(sent.length, 0);
 }));
+
+test("a bot-owned group request never falls back to speaking as the human owner",async()=>{
+  let claimed=false;
+  await fixture(async({inbox,sent})=>{
+    await inbox.configure({enabled:true});inbox.ingest([{...message,chatType:"group"}]);claimed=true;await inbox.tick();
+    assert.equal(sent.length,0);assert.equal(inbox.rows()[0].status,"dismissed");
+  },{botAssistClaimed:()=>claimed});
+});
+
+test("bot ownership is rechecked after asynchronous user-identity and owner-reply checks",async()=>{
+  let claimed=false;
+  await fixture(async({inbox,transport,sent})=>{
+    transport.identity=async()=>({ownerId:"ou_owner",botId:"ou_bot",canSend:false});
+    await inbox.configure({enabled:true});inbox.ingest([{...message,chatType:"group"}]);await inbox.tick();
+    assert.equal(inbox.rows()[0].status,"awaiting_auth");
+    transport.identity=async()=>({ownerId:"ou_owner",botId:"ou_bot",canSend:true});
+    transport.ownerReplied=async()=>{claimed=true;return false;};
+    await inbox.tick();assert.equal(sent.length,0);assert.equal(inbox.rows()[0].status,"dismissed");
+  },{botAssistClaimed:()=>claimed});
+});
 
 test("sensitive messages ask owner and stale decisions cannot send", async () => fixture(async ({ inbox, sent }) => {
   await inbox.configure({ enabled: true }); await inbox.tick(); inbox.ingest([{ ...message, content: "合同和付款请审批" }]); await inbox.tick();

@@ -15,7 +15,7 @@ export function larkStickerMcpCodexConfig(): string[] {
     `mcp_servers.lark_stickers.args=${JSON.stringify([tsx, server])}`,
     'mcp_servers.lark_stickers.env_vars=["LARK_AGENT_RUNTIME_URL","LARK_AGENT_RUNTIME_TOKEN"]',
     "mcp_servers.lark_stickers.startup_timeout_sec=10",
-    "mcp_servers.lark_stickers.tool_timeout_sec=30"
+    "mcp_servers.lark_stickers.tool_timeout_sec=45"
   ];
 }
 

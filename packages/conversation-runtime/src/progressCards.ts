@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { larkReplyIdempotencyKey, type LarkProgressContent, type LarkProgressEntry, type LarkProgressState } from "@lark-agent/adapter-lark-cli";
 import { config, db, getAppSettings, larkProgressSender, larkProgressUpdater, nowIso, recordOutboundLarkMessage, type LarkMessageRow } from "./context.js";
+import { ownerAssistMayExecute } from "./ownerMentionAssist.js";
 
 type ProgressRow = { progress_id: string; native_turn_id: string; thread_id: string; lark_message_id: number; message_id: string;
   card_message_id: string | null; entries_json: string; state: LarkProgressState; version: number; delivered_version: number;
@@ -18,7 +19,7 @@ function textOf(entries: LarkProgressEntry[], state: LarkProgressState) { return
 
 export function queueLarkProgressUpdate(input: { progressId: string; turnId: string; threadId: string; source: LarkMessageRow; eventId: string; text: string }): boolean {
   try {
-  if (config.runtimeMode !== "active" || !getAppSettings().larkCodexInterimRepliesEnabled || input.source.sender_type === "bot"
+  if (config.runtimeMode !== "active" || !getAppSettings().larkCodexInterimRepliesEnabled || input.source.sender_type === "bot" || !ownerAssistMayExecute(input.source.id)
     || config.groupPrivacyEnforced && input.source.chat_type !== "p2p" || !input.source.message_id) return false;
   const text = input.text.trim().replace(/\s+/g, " ").slice(0, 180);
   if (!text) return false;

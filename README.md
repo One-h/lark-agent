@@ -103,6 +103,13 @@ The hash tracks the captured default prompt, even when custom mode omits its tex
 Existing saved prompt overrides are preserved and used only in default mode;
 do not store authorization requirements in the editable persona field.
 
+Optional [owner-mention assistance](docs/owner-mention-assist.md) lets the bot help
+when another group member mentions a configured person. It is off by default,
+with global and per-group inherit/on/off settings. The same turn decides whether
+to help, prepare a private draft or stay quiet. New replies from that person are
+fed back for supplementation, not treated as an unconditional cancellation.
+Draft review publishes as the bot and never grants execution authority.
+
 The authenticated host API also exposes `POST /v1/internal/outbound` for delayed workflow notifications. A host may send to a configured contact or reply to a stored source-message ID; group replies automatically mention the original sender. The runtime token and loopback binding protect this endpoint, and callers must provide a stable idempotency key.
 
 Write-risk capabilities and observed mutating App Server commands produce a

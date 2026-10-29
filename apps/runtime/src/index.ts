@@ -24,12 +24,15 @@ import { configuredLarkStickerUsageMode, groupMessageReactionChatIds, groupSpont
 import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-runtime";
 import { drainLarkProgressCards, retryPendingLarkProgressCards, type LarkProgressSender, type LarkProgressUpdater } from "@lark-agent/conversation-runtime";
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
+import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
+  onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
+import { registerOwnerMentionAssistRoutes } from "./ownerMentionAssistRoutes.js";
 import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
 import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
-export type RuntimeConfig = { databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater };
+export type RuntimeConfig = { databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
 type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void };
 type MessageCursor = { messageAt: string; id: number };
@@ -156,11 +159,18 @@ export function createRuntime(config: RuntimeConfig) {
   if (!storedApprover && approverId) store.setSetting("approverId", approverId);
   configureConversationRuntime({ database: store.db, groupPrivacyEnforced: store.setting("groupPrivacy.enabled", "false") === "true", mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender, progressSender: config.progressSender, progressUpdater: config.progressUpdater });
   configureTurnApprovalReviewer(config.turnApprovalReviewer);
+  configureOwnerMentionAssist({ membershipProbe: config.ownerMentionAssistMembershipProbe, privateSender: config.proactiveMessageSender, delayMs: config.ownerMentionAssistDelayMs, reviewAvailable: Boolean(config.runtimeToken) });
   configureAutoApprovalNotificationSender(config.autoApprovalNotificationSender);
   store.registerCapabilities([{ id: "lark.message.send", title: "发送飞书消息", description: "Send a bot text message to a known Lark contact. Input requires recipient (name, alias, or open_id) and text.", inputSchema: { type: "object", properties: { recipient: { type: "string" }, text: { type: "string" } }, required: ["recipient", "text"] }, risk: "external-write" }]);
   reconcileLarkCodexResponder();
+  reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
-  const authorizations = new Set<{ turnId: string; controller: AbortController; started: boolean }>();
+  const authorizations = new Set<{ turnId: string; messageId: number; controller: AbortController; started: boolean }>();
+  const removeOwnerContextListener = onOwnerAssistContextChanged(messageId => {
+    cancelOwnerAssistPendingApprovals(messageId);
+    for (const call of authorizations) if (call.messageId === messageId && !call.started) call.controller.abort();
+  });
+  app.addHook("onClose", async () => { removeOwnerContextListener(); });
   let activeCapabilityCalls = 0;
   let listener: { stop(): void; running(): boolean } | null = null;
 
@@ -188,6 +198,7 @@ export function createRuntime(config: RuntimeConfig) {
   };
   const settleApproval = (id: number, status: "approved" | "rejected" | "expired" | "failed", scope: "once" | "turn" = "once", reason: string | null = null) => {
     const row = store.approval(id);
+    if (row && status === "approved" && !ownerAssistMayExecute(row.lark_message_id)) { status = "failed"; reason = "协同上下文或配置已变化，未放行操作。"; }
     if (!row || !store.db.prepare("UPDATE lark_capability_approvals SET status=?,approval_scope=?,error=?,decided_at=? WHERE id=? AND status='pending'")
       .run(status, scope, reason, new Date().toISOString(), id).changes) return false;
     const pending = pendingApprovals.get(id);
@@ -252,6 +263,7 @@ export function createRuntime(config: RuntimeConfig) {
     while (activeCapabilityCalls > 0) await new Promise(resolve => setTimeout(resolve, 20));
     stopLarkCodexResponder();
     await drainLarkProgressCards();
+    await drainOwnerAssistNotifications();
     removeTurnListener();
   });
   const decideApprovalFromCard = (event: Record<string, unknown>) => {
@@ -300,6 +312,7 @@ export function createRuntime(config: RuntimeConfig) {
       ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_session_id, codex_turn_id, codex_status, message_type, sender_type, direction FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_session_id?: string | null; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string } | undefined
       : undefined;
     if (!message || message.chat_id !== context.chatId) throw new Error("Invalid capability context");
+    if (!ownerAssistMayExecute(larkMessageId)) throw new Error("Owner assistance has not accepted this request; publishing a draft does not authorize execution");
     if (message.chat_type === "group" && conversationConfig.groupPrivacyEnforced) throw new Error("群消息不能调用旧宿主能力；请使用群聊隐私单次审批。");
     const expectedScope = isTrustedLarkSender(message.sender_id) ? "trusted" : "untrusted";
     if (context.trustScope !== expectedScope) throw new Error("Capability trust scope does not match the current sender");
@@ -314,7 +327,7 @@ export function createRuntime(config: RuntimeConfig) {
       throw new Error("The same capability invocation is already running in this turn");
     }
     const approvalRequired = capability.risk === "external-write" || (capability.risk === "local-write" && expectedScope !== "trusted");
-    const call = { turnId, controller: new AbortController(), started: false };
+    const call = { turnId, messageId: larkMessageId, controller: new AbortController(), started: false };
     authorizations.add(call);
     const signal = requestSignal ? AbortSignal.any([requestSignal, call.controller.signal]) : call.controller.signal;
     const cancelled = () => {
@@ -323,6 +336,7 @@ export function createRuntime(config: RuntimeConfig) {
     };
     signal.addEventListener("abort", cancelled, { once: true });
     const assertActive = () => {
+      if (!ownerAssistMayExecute(larkMessageId)) throw new Error("协同上下文或开关已变化，未放行新的操作。");
       if (signal.aborted || !liveTurn(larkMessageId, turnId)) throw new Error("会话已结束、turn 已变化或调用已断开，未开始新的操作。");
       const current = store.db.prepare("SELECT sender_id,chat_id,codex_session_id FROM lark_messages WHERE id=?").get(larkMessageId) as { sender_id: string; chat_id: string; codex_session_id: string | null };
       if (current.sender_id !== message.sender_id || current.chat_id !== context.chatId || current.codex_session_id !== message.codex_session_id || (isTrustedLarkSender(current.sender_id) ? "trusted" : "untrusted") !== expectedScope)
@@ -407,10 +421,15 @@ export function createRuntime(config: RuntimeConfig) {
   if (config.mode === "active" && process.env.LARK_AGENT_TEST_DATABASE !== "1") groupPrivacy.start();
   app.addHook("onClose", async () => { setExternalMessageHandler(null); });
   if (config.mode === "active") agentMessaging.start();
-  const personalInbox = new PersonalInbox(store, { ownerId: () => approverId ?? "", model: configuredLarkCodexModel, routeMessage: message => groupPrivacy.ingest(message, "user") || agentMessaging.ingest(message, "user") });
+  const personalInbox = new PersonalInbox(store, { ownerId: () => approverId ?? "", model: configuredLarkCodexModel,
+    routeMessage: message => groupPrivacy.ingest(message, "user") || agentMessaging.ingest(message, "user"),
+    botAssistClaimed: message => message.chatType === "group" && ownerMentionAssistSettings(message.chatId).effectiveEnabled
+      && Boolean(store.db.prepare(`SELECT 1 FROM lark_owner_mention_assists a JOIN lark_messages m ON m.id=a.lark_message_id WHERE m.message_id=? AND a.owner_id=?`)
+        .get(message.messageId,store.setting("personalInbox.ownerId",approverId ?? ""))) });
   registerPersonalInboxRoutes(app, personalInbox, request => Boolean(config.runtimeToken) && authenticated(request));
+  registerOwnerMentionAssistRoutes(app, request => Boolean(config.runtimeToken) && authenticated(request));
   if (config.mode === "active") personalInbox.start();
-  registerPersonaRoutes(app, authenticated);
+  registerPersonaRoutes(app, authenticated, Boolean(config.runtimeToken));
   registerHostOutboundRoutes(app, store, authenticated, {
     sendDirect: config.proactiveMessageSender ?? sendLarkTextMessage,
     sendReply: config.textReplySender ?? sendLarkTextReply,
@@ -427,6 +446,7 @@ export function createRuntime(config: RuntimeConfig) {
     return { ok, mode: config.mode, pid: process.pid, node: process.execPath,
       listenerRunning, approvalListenerRunning, dependencies: { larkCli },
       activeTurns: larkCodexAppServerStatus().activeTurns,
+      activeOwnerAssists: activeOwnerAssistRequests(),
       delivery: {
         pendingText: (store.db.prepare("SELECT count(*) AS count FROM lark_messages WHERE reply_status='pending' AND reply_delivery_text IS NOT NULL").get() as { count: number }).count,
         failedText: (store.db.prepare("SELECT count(*) AS count FROM lark_messages WHERE reply_status='failed' AND reply_delivery_text IS NOT NULL").get() as { count: number }).count
@@ -709,6 +729,14 @@ export function createRuntime(config: RuntimeConfig) {
   };
   app.post("/v1/capabilities/:id/invoke", capabilityRoute);
   app.post("/v1/internal/capabilities/:id/execute", capabilityRoute);
+  app.post("/v1/internal/owner-assist/decision", async (request, reply) => {
+    if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
+    const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
+    if (!payload || Object.keys(payload).some(key => !["contextToken", "input"].includes(key)) || typeof payload.contextToken !== "string"
+      || !/^[A-Za-z0-9_-]{32}$/.test(payload.contextToken) || !payload.input || typeof payload.input !== "object" || Array.isArray(payload.input)) return reply.code(400).send({ error: "invalid owner assistance MCP request" });
+    const result = await runLarkOwnerAssistMcpTool(payload.contextToken, payload.input as Record<string, unknown>);
+    return reply.code(result.success ? 200 : 409).send(result);
+  });
   app.post("/v1/internal/attachments/register", async (request, reply) => {
     if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
     const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
@@ -748,16 +776,21 @@ export function createRuntime(config: RuntimeConfig) {
   const runtimeSettings = () => ({ groupSpontaneousReplyCooldownMs: groupSpontaneousReplyCooldownMs(), executionReceiptsEnabled: store.setting("executionReceiptsEnabled", "true") !== "false", codexModel: configuredLarkCodexModel(), reasoningEffort: configuredLarkCodexReasoningEffort(), stickerUsageMode: configuredLarkStickerUsageMode(), groupSpontaneousReplyRate: groupSpontaneousReplyRate(), listenerEnabled: store.setting("listenerEnabled", "true") === "true", repliesEnabled: store.setting("repliesEnabled", "true") === "true", interimRepliesEnabled: store.setting("interimRepliesEnabled", "true") === "true", groupMessageReactionEnabled: store.setting("groupMessageReactionEnabled", "false") === "true", groupMessageReactionEmoji: store.setting("groupMessageReactionEmoji", "THUMBSUP"), groupMessageReactionChatIds: groupMessageReactionChatIds(), groupSpontaneousRepliesEnabled: store.setting("groupSpontaneousRepliesEnabled", "false") === "true", groupSpontaneousChatIds: groupSpontaneousChatIds(), groupContextMessageLimit: Number(store.setting("groupContextMessageLimit", "50")), groupContextMaxChars: Number(store.setting("groupContextMaxChars", "6000")), acknowledgeReactionEmoji: store.setting("acknowledgeReactionEmoji", "EYESCLOSED"), trustedSenderIds: [...trustedSenderIds], approverId: approverId ?? "", listenerRunning: listener?.running() ?? false, approvalListenerRunning: larkMessageWorkerStatus().approvalRunning });
   const autoApprovalSettings = () => ({ turnAutoApprovalEnabled: store.setting("turnAutoApprovalEnabled", "false") === "true", turnAutoApprovalModel: configuredTurnAutoApprovalModel(store.db), turnAutoApprovalModelConfigurable: true, turnAutoApprovalDataSources: configuredTurnAutoApprovalDataSources(store.db) });
   const ownerMessageSettings = () => ({ ownerMessageFastPathEnabled: store.setting("ownerMessageFastPathEnabled", "false") === "true", ownerMessageFastPathOwnerId: store.setting("ownerMessageFastPathOwnerId", "") });
+  const ownerAssistSettings = () => ({ ownerMentionAssistEnabled: store.setting("ownerMentionAssistEnabled", "false") === "true", ownerMentionAssistOwnerId: store.setting("ownerMentionAssistOwnerId", "") });
   const executionSettings = () => ({ workspaceRoot, trustedExecutionEnabled: configuredTrustedExecutionEnabled() });
-  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...executionSettings() });
+  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...ownerAssistSettings(), ...executionSettings() });
   app.get("/v1/settings", async () => allSettings());
   app.patch("/v1/settings", async (request, reply) => {
     let payload: RuntimeSettingsPatch;
     try { payload = parseRuntimeSettingsPatch(request.body); }
     catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+    if ((payload.ownerMentionAssistEnabled !== undefined || payload.ownerMentionAssistOwnerId !== undefined) && (!config.runtimeToken || !authenticated(request))) return reply.code(401).send({ error: "Runtime token required for owner assistance settings" });
     const nextApproverId = payload.approverId ?? approverId ?? "";
     const nextTrustedSenderIds = payload.trustedSenderIds ?? [...trustedSenderIds];
     const nextWorkspaceRoot = payload.workspaceRoot ?? workspaceRoot;
+    if (payload.ownerMentionAssistEnabled === true && !/^ou_[A-Za-z0-9]+$/.test((payload.ownerMentionAssistOwnerId ?? ownerAssistSettings().ownerMentionAssistOwnerId) || nextApproverId)) return reply.code(400).send({ error: "Configure an owner open_id before enabling group assistance" });
+    if (payload.ownerMentionAssistOwnerId !== undefined && payload.ownerMentionAssistOwnerId !== ownerAssistSettings().ownerMentionAssistOwnerId
+      && store.db.prepare("SELECT 1 FROM lark_messages WHERE reply_trigger='owner_mention' AND codex_status IN ('queued','running') LIMIT 1").get()) return reply.code(409).send({ error: "Wait for active owner assistance turns before changing the owner" });
     if (payload.ownerMessageFastPathEnabled === true && !nextApproverId) return reply.code(400).send({ error: "An owner approver must be configured before enabling the message exemption" });
     const executionChanged = nextWorkspaceRoot !== workspaceRoot
       || (payload.trustedExecutionEnabled !== undefined && payload.trustedExecutionEnabled !== configuredTrustedExecutionEnabled())
@@ -786,6 +819,7 @@ export function createRuntime(config: RuntimeConfig) {
     nextTrustedSenderIds.forEach(id => trustedSenderIds.add(id));
     conversationConfig.larkExecutionApproverId = nextApproverId;
     conversationConfig.trustedLarkCodexSenderIds = [...trustedSenderIds];
+    refreshOwnerAssistPolicies();
     if (payload.trustedSenderIds !== undefined) config.trustedSenderIds.splice(0, config.trustedSenderIds.length, ...trustedSenderIds);
     if (payload.listenerEnabled !== undefined) {
       try { if (payload.listenerEnabled) startListener(); else stopListener(); }
@@ -805,6 +839,7 @@ if (process.argv[1]?.endsWith("index.ts")) {
   await runtime.app.listen({ host: "127.0.0.1", port });
   setInterval(() => { runtime.expireApprovals(); runtime.recoverOrphanedRuns(); retryPendingLarkTextReplies(); retryPendingLarkMediaReplies(); retryPendingLarkCompletionReactions(); retryPendingLarkExecutionReceipts();
     void retryPendingLarkProgressCards();
+    retryOwnerAssistNotifications();
     void retryPendingAutoApprovalNotifications().catch((error) => console.warn(`Auto-approval notification retry failed: ${error instanceof Error ? error.message : String(error)}`));
     void reconcilePendingLarkThreadArchives().catch((error) => console.warn(`Lark thread archive reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)); }, 2_000).unref();
   if (process.env.LARK_AGENT_LISTEN !== "false") runtime.startListener();

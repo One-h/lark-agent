@@ -41,6 +41,14 @@ async function callRuntime(route: string, contextToken: string, input: Record<st
 }
 
 const server = new McpServer({ name: "lark-stickers", version: "0.1.0" });
+server.registerTool("owner_assist_decision", {
+  title: "判断群内协同回复及核对本人新增发言",
+  description: "仅用于真正 @ 指定对象的当前群消息。先提交 handle/owner_required/ignore；最终草稿准备好后再次提交 handle 和 reply。若返回 owner_context_updated，保留草稿并结合本人发言重新判断，不能直接取消。ready 才能公开；owner_required 仅私下草稿，不批准执行。",
+  inputSchema: z.object({ context_token: z.string().regex(/^[A-Za-z0-9_-]{32}$/),
+    action: z.enum(["handle", "owner_required", "ignore"]), reason: z.string().trim().min(1).max(500),
+    reply: z.string().max(6000).optional(), question: z.string().max(500).optional(), owner_context_cursor: z.number().int().positive().optional() }).strict(),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+}, async ({ context_token, ...input }) => callRuntime("/v1/internal/owner-assist/decision", context_token, input, 40_000));
 server.registerTool("attach_files", {
   title: "为本轮回复添加图片或文件",
   description: "登记当前消息 output 目录中已生成的图片和文档，不立即发送。追加最多八个附件；重复路径更新登记，files=[] 清空。正常结束本轮后由队列投递，最终文字无需媒体标签。",
