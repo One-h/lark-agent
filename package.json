@@ -10,6 +10,8 @@
   "engines": { "node": ">=24 <25" },
   "scripts": {
     "build": "tsc --noEmit",
+    "publication:check": "node scripts/check-publication.mjs main --require-policy",
+    "sync:main": "node scripts/sync-main.mjs",
     "test": "LARK_AGENT_TEST_DATABASE=1 tsx --test --test-concurrency=4 \"**/*.test.ts\"",
     "test:app-server": "tsx scripts/verify-app-server-dynamic-tools.ts",
     "test:sticker-tools": "tsx scripts/verify-sticker-tools.ts",

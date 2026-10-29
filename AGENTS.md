@@ -2,6 +2,12 @@
 
 These rules apply to the entire repository.
 
+## Shared Public Main
+
+- Internal and public repositories share one sanitized main. Publish with `npm run sync:main`; both remote main refs must read back the same commit before reporting success.
+- Run `npm run publication:check` before publishing. The private denylist is stored in the local Git common directory as `publication-policy.json`, never in tracked source. See `docs/repository-sync.md`.
+- Do not merge pre-sanitization history or publish internal archive refs, all refs, or tags. Keep private endpoints, identities, data sources and credentials in local configuration. Preserve historical contributor attribution only in the internal archive when anonymization is required.
+
 ## Database Safety
 
 - Treat `data/lark-agent.sqlite`, any configured `LARK_AGENT_DATABASE`, and their `-wal` / `-shm` files as persistent user data. Never delete, replace, truncate, reset, or use them as test fixtures.
