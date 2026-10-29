@@ -71,7 +71,8 @@ An already-loaded, non-archived thread is reused without unarchive/resume. A loa
 thread can still be archived during the unsubscribe grace period, so reuse checks
 native active membership first, then archived membership before restoring it.
 Normal reuse never enumerates old archives. These metadata-only lookups are
-bounded to ten pages of 100 app-server threads. Invalid, failed or incomplete
+bounded to ten pages of 100 native threads. Do not filter by the `appServer` source:
+existing integration threads can be recorded as `vscode` or `cli`. Invalid, failed or incomplete
 lookups cannot be treated as proof that a thread is unarchived.
 
 Before an archive write, both local dispatch/run state and the native thread's

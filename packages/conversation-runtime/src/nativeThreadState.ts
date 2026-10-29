@@ -47,7 +47,7 @@ async function nativeThreadListed(request: Request, threadId: string, archived: 
   // A bounded metadata-only read can confirm success, but an incomplete search cannot justify cleanup.
   for (let pageIndex = 0; pageIndex < 10; pageIndex++) {
     const page = await request("thread/list", {
-      archived, sourceKinds: ["appServer"], useStateDbOnly: true, sortKey: "updated_at", limit: 100,
+      archived, useStateDbOnly: true, sortKey: "updated_at", limit: 100,
       ...(cursor ? { cursor } : {})
     }) as { data?: Array<{ id?: unknown }>; nextCursor?: unknown } | null;
     if (!Array.isArray(page?.data) || page.data.some(row => typeof row?.id !== "string")

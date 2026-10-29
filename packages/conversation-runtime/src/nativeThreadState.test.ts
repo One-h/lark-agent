@@ -58,7 +58,7 @@ test("native archive reconciliation matches exact IDs across bounded metadata-on
     assert.equal(method, "thread/list"); calls.push(params);
     return params.cursor ? { data: [{ id: "wanted" }], nextCursor: null } : { data: [{ id: "other" }], nextCursor: "page-2" };
   }, "wanted"), true);
-  assert.deepEqual(calls[0], { archived: true, sourceKinds: ["appServer"], useStateDbOnly: true, sortKey: "updated_at", limit: 100 });
+  assert.deepEqual(calls[0], { archived: true, useStateDbOnly: true, sortKey: "updated_at", limit: 100 });
   let count = 0;
   await assert.rejects(isNativeThreadArchived(async () => ({ data: [], nextCursor: `page-${++count}` }), "wanted"), /bounded page limit/);
   assert.equal(count, 10);
@@ -71,7 +71,8 @@ test("native archive reconciliation matches exact IDs across bounded metadata-on
 test("loaded active reuse never scans the archive list, while restore requires exact archived membership", async () => {
   assert.equal(await nativeThreadNeedsUnarchive(async (_method, params) => {
     assert.equal(params.archived, false);
-    return { data: [{ id: "wanted" }], nextCursor: null };
+    assert.equal("sourceKinds" in params, false);
+    return { data: [{ id: "wanted", source: "vscode" }], nextCursor: null };
   }, "wanted"), false);
   assert.equal(await nativeThreadNeedsUnarchive(async (_method, params) => ({ data: params.archived ? [{ id: "wanted" }] : [], nextCursor: null }), "wanted"), true);
   await assert.rejects(nativeThreadNeedsUnarchive(async () => ({ data: [], nextCursor: null }), "wanted"), /missing from native thread metadata/);
