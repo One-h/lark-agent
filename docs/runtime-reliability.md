@@ -59,3 +59,28 @@ Regression tests use freshly created OS-temporary databases and fake commands.
 The listener environment test only resolves an executable and must never
 subscribe to real Feishu events. Run `npm test` and `npm run build` with the
 deployment's pinned Node version before activation.
+
+## Native conversation reuse and archive cleanup
+
+Completed turns schedule a durable, thread-specific archive intent after 30 seconds.
+New input keeps that intent while dispatch/native work is active; it does not delete
+cleanup for an old thread when recovery needs a replacement conversation. Each
+thread finishes independently even when its chat now uses another thread.
+
+An already-loaded, non-archived thread is reused without unarchive/resume. A loaded
+thread can still be archived during the unsubscribe grace period, so reuse checks
+native active membership first, then archived membership before restoring it.
+Normal reuse never enumerates old archives. These metadata-only lookups are
+bounded to ten pages of 100 app-server threads. Invalid, failed or incomplete
+lookups cannot be treated as proof that a thread is unarchived.
+
+Before an archive write, both local dispatch/run state and the native thread's
+latest turn must confirm it is safe. Active, inconsistent or unknown native state
+retains the intent for a later check; it never triggers an interrupt. Tokens guard
+against stale asynchronous cleanup overwriting newer scheduling.
+
+Archive writes stop after five failures. Exhausted rows are reconciled read-only
+every ten minutes, and exact native archived membership clears stale failures.
+Missing rollouts alone do not prove success. All operations use native RPCs, not
+direct changes to the Codex database. This change does not scan or automatically
+archive historical threads that no longer have an archive intent.

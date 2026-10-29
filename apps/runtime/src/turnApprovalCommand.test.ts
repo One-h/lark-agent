@@ -18,6 +18,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line);
  if(m.method==="thread/start" || m.method==="thread/resume") send({id:m.id,result:{thread:{id:"thread-test"},model:m.params.model}});
  else if(m.method==="thread/loaded/list") send({id:m.id,result:{data:["thread-test"]}});
+ else if(m.method==="thread/list") send({id:m.id,result:{data:m.params.archived?[]:[{id:"thread-test"}],nextCursor:null}});
  else if(m.method==="turn/start") { turn="turn-"+(++number);send({id:m.id,result:{turn:{id:turn,status:"inProgress"}}});send({method:"turn/started",params:{threadId:"thread-test",turn:{id:turn,status:"inProgress"}}});setTimeout(()=>{if(number>1)send({id:"stale-"+number,method:"item/commandExecution/requestApproval",params:{threadId:"thread-test",turnId:"turn-"+(number-1),itemId:"stale",command:"node old-task.mjs",cwd:${JSON.stringify(root)}}});approve(1);},20); }
  else if(m.method) send({id:m.id,result:{}});
  else if(String(m.id).startsWith("stale-") && m.result?.decision==="accept") send({method:"turn/completed",params:{threadId:"thread-test",turn:{id:turn,status:"failed",error:{message:"stale approval was accepted"},items:[]}}});
@@ -100,6 +101,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line);
  if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"deployment-thread"},model:m.params.model}});
  else if(m.method==="thread/loaded/list")send({id:m.id,result:{data:["deployment-thread"]}});
+ else if(m.method==="thread/list")send({id:m.id,result:{data:m.params.archived?[]:[{id:"deployment-thread"}],nextCursor:null}});
  else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"deployment-turn",status:"inProgress"}}});send({method:"turn/started",params:{threadId:"deployment-thread",turn:{id:"deployment-turn",status:"inProgress"}}});setTimeout(()=>ask(1),20);}
  else if(m.method)send({id:m.id,result:{}});
  else if(String(m.id).startsWith("approval-")){

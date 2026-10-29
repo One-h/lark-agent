@@ -31,6 +31,7 @@ readline.createInterface({input: process.stdin}).on("line", line => {
   if (m.method === "thread/start") { currentThread = "settings-thread-" + (++thread); send({id:m.id,result:{thread:{id:currentThread}}}); }
   else if (m.method === "thread/resume") { currentThread=m.params.threadId; send({id:m.id,result:{thread:{id:currentThread}}}); }
   else if (m.method === "thread/loaded/list") send({id:m.id,result:{data:currentThread?[currentThread]:[],nextCursor:null}});
+  else if (m.method === "thread/list") send({id:m.id,result:{data:!m.params.archived&&currentThread?[{id:currentThread}]:[],nextCursor:null}});
   else if (m.method === "turn/start") send({id:m.id,result:{turn:{id:"settings-turn-" + (++turn),status:"inProgress"}}});
   else if (m.method === "fixture/complete") {
     send({id:m.id,result:{}});

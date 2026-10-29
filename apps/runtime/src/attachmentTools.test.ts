@@ -28,6 +28,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line);
  if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"attachment-thread"}}});
  else if(m.method==="thread/loaded/list")send({id:m.id,result:{data:["attachment-thread"],nextCursor:null}});
+ else if(m.method==="thread/list")send({id:m.id,result:{data:m.params.archived?[]:[{id:"attachment-thread"}],nextCursor:null}});
  else if(m.method==="turn/start"||m.method==="turn/steer"){
   if(m.method==="turn/start")turn++;
   send({id:m.id,result:{turn:{id:"attachment-turn-"+turn,status:"inProgress"}}});

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isNativeThreadLoaded, isNativeThreadMissingError } from "./nativeThreadState.js";
+import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 
 test("loaded-thread checks follow native pages and do not retain presence between calls", async () => {
   const calls: unknown[] = [];
@@ -29,4 +29,50 @@ test("only an explicit missing-thread rejection for the requested thread allows 
   for (const error of [new Error("thread not found: other"), new Error("thread not found: WANTED"), new Error("request timed out: turn/start"), new Error("Connection reset by peer"), new Error("thread wanted already has an active writer"), "thread not found: wanted"]) {
     assert.equal(isNativeThreadMissingError(error, "wanted"), false);
   }
+});
+
+test("archive safety requires an idle native thread and a confirmed latest terminal turn", async () => {
+  for (const threadStatus of ["idle", "notLoaded", "active", "systemError", undefined]) {
+    for (const status of ["completed", "failed", "interrupted", "inProgress", "unknown"]) {
+      const result = await nativeThreadArchiveSafety(async (method, params) => {
+        if (method === "thread/read") return { thread: { id: "wanted", status: { type: threadStatus } } };
+        assert.deepEqual(params, { threadId: "wanted", limit: 1, sortDirection: "desc", itemsView: "summary" });
+        return { data: [{ id: "newest", status }] };
+      }, "wanted");
+      assert.equal(result, threadStatus === "active" ? "active"
+        : threadStatus !== "idle" && threadStatus !== "notLoaded" ? "unknown"
+        : status === "inProgress" ? "active" : status === "unknown" ? "unknown" : "idle");
+    }
+  }
+  for (const page of [null, {}, { data: [] }, { data: [null] }, { data: [{ status: "completed" }] }]) {
+    assert.equal(await nativeThreadArchiveSafety(async method => method === "thread/read"
+      ? { thread: { id: "wanted", status: { type: "idle" } } } : page, "wanted"), "unknown");
+  }
+  assert.equal(await nativeThreadArchiveSafety(async () => ({ thread: { id: "foreign", status: { type: "idle" } } }), "wanted"), "unknown");
+  await assert.rejects(nativeThreadArchiveSafety(async () => { throw new Error("offline"); }, "wanted"), /offline/);
+});
+
+test("native archive reconciliation matches exact IDs across bounded metadata-only pages", async () => {
+  const calls: Record<string, unknown>[] = [];
+  assert.equal(await isNativeThreadArchived(async (method, params) => {
+    assert.equal(method, "thread/list"); calls.push(params);
+    return params.cursor ? { data: [{ id: "wanted" }], nextCursor: null } : { data: [{ id: "other" }], nextCursor: "page-2" };
+  }, "wanted"), true);
+  assert.deepEqual(calls[0], { archived: true, sourceKinds: ["appServer"], useStateDbOnly: true, sortKey: "updated_at", limit: 100 });
+  let count = 0;
+  await assert.rejects(isNativeThreadArchived(async () => ({ data: [], nextCursor: `page-${++count}` }), "wanted"), /bounded page limit/);
+  assert.equal(count, 10);
+  for (const page of [null, {}, { data: [null] }, { data: [{ id: "foreign" }], nextCursor: 1 }, { data: [], nextCursor: "loop" }]) {
+    await assert.rejects(isNativeThreadArchived(async () => page, "wanted"), /Invalid Codex archived-thread list/);
+  }
+  assert.equal(await isNativeThreadArchived(async () => ({ data: [{ id: "foreign" }], nextCursor: null }), "wanted"), false);
+});
+
+test("loaded active reuse never scans the archive list, while restore requires exact archived membership", async () => {
+  assert.equal(await nativeThreadNeedsUnarchive(async (_method, params) => {
+    assert.equal(params.archived, false);
+    return { data: [{ id: "wanted" }], nextCursor: null };
+  }, "wanted"), false);
+  assert.equal(await nativeThreadNeedsUnarchive(async (_method, params) => ({ data: params.archived ? [{ id: "wanted" }] : [], nextCursor: null }), "wanted"), true);
+  await assert.rejects(nativeThreadNeedsUnarchive(async () => ({ data: [], nextCursor: null }), "wanted"), /missing from native thread metadata/);
 });

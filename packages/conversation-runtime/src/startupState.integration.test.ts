@@ -31,19 +31,24 @@ const send = x => process.stdout.write(JSON.stringify(x)+"\\n");
 const counter=${JSON.stringify(path.join(root, "counter"))};
 let turn=fs.existsSync(counter)?Number(fs.readFileSync(counter,"utf8")):0;
 let held=null;
+let heldArchive=null;
+const archived=new Set();
 let missingRejections=0;
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line), s=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},"utf8"));
  fs.appendFileSync(${JSON.stringify(log)},line+"\\n");
  if(m.method==="thread/loaded/list") {if(s.listError)send({id:m.id,error:{code:-1,message:"fixture list timed out"}});else send({id:m.id,result:{data:s.loaded===false||s.resumeWriterConflict?[]:["thread-fixture"],nextCursor:null}});}
+ else if(m.method==="thread/unarchive") {if(s.unarchiveWriterConflict)send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});else{archived.delete(m.params.threadId);send({id:m.id,result:{}});}}
+ else if(m.method==="thread/archive") {if(s.archiveError)send({id:m.id,error:{code:-1,message:s.archiveError}});else if(s.deferArchive)heldArchive={id:m.id,threadId:m.params.threadId};else{archived.add(m.params.threadId);send({id:m.id,result:{}});}}
+ else if(m.method==="thread/list") {const ids=s.archivedIds??[...archived];if(s.archiveListError)send({id:m.id,error:{code:-1,message:"fixture archive list failure"}});else send({id:m.id,result:s.archiveListMalformed?{}:{data:(m.params.archived?ids:["thread-fixture","thread-fixture-new"].filter(id=>!ids.includes(id))).map(id=>({id})),nextCursor:null}});}
  else if(m.method==="thread/resume" && s.resumeWriterConflict) send({id:m.id,error:{code:-1,message:"thread thread-fixture already has an active writer"}});
  else if(m.method==="thread/start"||m.method==="thread/resume") send({id:m.id,result:{thread:{id:s.resumeWriterConflict?"thread-fixture-new":"thread-fixture"}}});
  else if(m.method==="turn/start" && s.resumeWriterConflict && m.params.threadId!=="thread-fixture-new")send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
  else if(m.method==="turn/start" && s.missingThread && (s.missingAlways||missingRejections++===0))send({id:m.id,error:{code:-1,message:"thread not found: thread-fixture"}});
  else if(m.method==="turn/start") {if(s.startError)send({id:m.id,error:{code:-1,message:typeof s.startError==="string"?s.startError:"fixture startup error /private/path token=fixture-secret"}});else{fs.writeFileSync(counter,String(++turn));send({id:m.id,result:{turn:{id:${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:"inProgress"}}});}}
- else if(m.method==="thread/read") {const result={thread:{id:"thread-fixture",status:{type:s.threadStatus}}};if(s.readError)send({id:m.id,error:{code:-1,message:"fixture read failure"}});else if(s.defer)held={id:m.id,result};else send({id:m.id,result});}
+ else if(m.method==="thread/read") {const result={thread:{id:m.params.threadId,status:{type:s.threadStatus}}};if(s.readError)send({id:m.id,error:{code:-1,message:"fixture read failure"}});else if(s.defer)held={id:m.id,result};else send({id:m.id,result});}
  else if(m.method==="thread/turns/list") send({id:m.id,result:{data:s.missing?[]:[{id:s.turnId??${JSON.stringify(path.basename(root) + "-turn-")}+turn,status:s.status,error:s.error,items:s.items??[]}]}});
- else if(m.method==="fixture/release") {if(held)send(held);held=null;send({id:m.id,result:{}});}
+ else if(m.method==="fixture/release") {if(held)send(held);held=null;if(heldArchive){archived.add(heldArchive.threadId);send({id:heldArchive.id,result:{}});}heldArchive=null;send({id:m.id,result:{}});}
  else if(m.method==="fixture/emit") {send({id:m.id,result:{}});for(const n of m.params.notifications)send(n);}
  else if(m.method==="fixture/crash") {send({id:m.id,result:{}});setImmediate(()=>process.exit(23));}
  else if(m.method) send({id:m.id,result:{}});
@@ -270,7 +275,7 @@ test("native capacity error readback retains recovery without replaying recovere
 test("idle archive unload checks native state without retaining a loaded flag", async () => {
   for (const loaded of [false, true]) {
     const f = fixture(); try {
-      await f.ready(); await f.complete(); f.state({ loaded });
+      await f.ready(); await f.complete(); f.state({ loaded, threadStatus: "idle", status: "completed" });
       await immediate();
       await until(() => (f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as { n: number }).n === 1);
       assert.equal(await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString()), 1);
@@ -286,7 +291,7 @@ test("idle archive unload checks native state without retaining a loaded flag", 
 test("bot reuse consults native loaded state even without a close notification", async () => {
   for (const loaded of [false, true]) {
     const f = fixture(); try {
-      await f.ready(); await f.complete(); f.state({ loaded });
+      await f.ready(); await f.complete(); f.state({ loaded, unarchiveWriterConflict: loaded });
       ingestLarkEvent({ ...f.message, event_id: "event-second", message_id: "om_second", content: "second request" });
       const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_second'").get() as any;
       await until(() => Boolean(row()?.codex_turn_id) || row()?.codex_status === "failed");
@@ -294,6 +299,7 @@ test("bot reuse consults native loaded state even without a close notification",
       const calls = f.records();
       assert.equal(calls.filter(r => r.method === "thread/loaded/list").length, 1);
       assert.equal(calls.filter(r => r.method === "thread/resume").length, loaded ? 0 : 1);
+      assert.equal(calls.filter(r => r.method === "thread/unarchive").length, loaded ? 0 : 1);
       assert.equal(calls.filter(r => r.method === "thread/start").length, 1);
       assert.equal(row().codex_session_id, "thread-fixture");
       await f.complete(row().codex_turn_id);
@@ -353,6 +359,177 @@ test("unloaded bot thread owned by another writer starts a new full-context conv
   await f.emit([{method:"item/completed",params:{threadId:"thread-fixture-new",turnId:row().codex_turn_id,item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture recovered"}}},{method:"turn/completed",params:{threadId:"thread-fixture-new",turn:{id:row().codex_turn_id,status:"completed"}}}]);
   await until(()=>row().codex_status==="answered");assert.equal(f.delivered.at(-1),"fixture recovered");
  }finally{await f.close();}
+});
+
+test("archive intent survives successful reuse and waits for the new native turn to end", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete();
+    await until(() => (f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n === 1);
+    f.state({ loaded: true, unarchiveWriterConflict: true });
+    ingestLarkEvent({ ...f.message, event_id: "event-next", message_id: "om_next", content: "next request" });
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_next'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id));
+    await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 1);
+    assert.equal(f.records().filter(r => r.method === "thread/archive").length, 0);
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered"); await immediate();
+    f.state({ threadStatus: "idle", status: "completed" });
+    await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    assert.equal(f.records().filter(r => r.method === "thread/archive").length, 1);
+    assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 0);
+  } finally { await f.close(); }
+});
+
+test("fallback keeps the old thread archive independent from the replacement active thread", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ resumeWriterConflict: true, threadStatus: "active", status: "inProgress" });
+    ingestLarkEvent({ ...f.message, event_id: "event-new", message_id: "om_new", content: "replacement request" });
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_new'").get() as any;
+    await until(() => row()?.codex_session_id === "thread-fixture-new" && Boolean(row()?.codex_turn_id)); await immediate();
+    const reconcile = () => reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    await reconcile();
+    assert.equal(f.records().filter(r => r.method === "thread/archive").length, 0);
+    assert.equal((f.store.db.prepare("SELECT attempts FROM lark_codex_archive_queue WHERE thread_id='thread-fixture'").get() as any).attempts, 0);
+    f.state({ resumeWriterConflict: true, threadStatus: "idle", status: "completed" });
+    await reconcile();
+    assert.deepEqual(f.records().filter(r => r.method === "thread/archive").map(r => r.params.threadId), ["thread-fixture"]);
+    assert.equal(row().codex_status, "running");
+    await f.emit([{ method: "turn/completed", params: { threadId: "thread-fixture-new", turn: { id: row().codex_turn_id, status: "completed" } } }]);
+    await until(() => row().codex_status === "no_reply"); await immediate();
+    assert.ok(f.store.db.prepare("SELECT 1 FROM lark_codex_archive_queue WHERE thread_id='thread-fixture-new'").get());
+    await reconcile();
+    assert.deepEqual(f.records().filter(r => r.method === "thread/archive").map(r => r.params.threadId), ["thread-fixture", "thread-fixture-new"]);
+    assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 0);
+    assert.equal(f.records().some(r => r.method === "turn/interrupt"), false);
+  } finally { await f.close(); }
+});
+
+test("archive probes retain intent on active, inconsistent, missing and unavailable native state", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    for (const state of [
+      { threadStatus: "active", status: "completed" }, { threadStatus: "idle", status: "inProgress" },
+      { threadStatus: "idle", missing: true }, { threadStatus: "systemError" }, { readError: true }
+    ]) {
+      f.state(state);
+      await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+      const row = f.store.db.prepare("SELECT attempts FROM lark_codex_archive_queue").get() as any;
+      assert.equal(row.attempts, 0);
+      assert.equal(f.records().filter(r => r.method === "thread/archive" || r.method === "thread/unsubscribe" || r.method === "turn/interrupt").length, 0);
+    }
+    f.state({ threadStatus: "notLoaded", status: "completed" });
+    await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 0);
+  } finally { await f.close(); }
+});
+
+test("already archived native threads reconcile errors and exhausted rows without more archive writes", async () => {
+  for (const exhausted of [false, true]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); await immediate();
+      if (exhausted) f.store.db.prepare("UPDATE lark_codex_archive_queue SET attempts=5").run();
+      f.state({ threadStatus: "idle", status: "completed", archiveError: "no rollout found for thread id thread-fixture", archivedIds: ["thread-fixture"] });
+      await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+      assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 0);
+      assert.equal(f.records().filter(r => r.method === "thread/archive").length, exhausted ? 0 : 1);
+      assert.equal(f.records().filter(r => r.method === "thread/unsubscribe").length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test("archive write failures are bounded and exhausted intent is only rechecked at low frequency", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ threadStatus: "idle", status: "completed", archiveError: "writer unavailable", archivedIds: [] });
+    const future = new Date(Date.now() + 700_000).toISOString();
+    for (let n = 0; n < 6; n++) await reconcilePendingLarkThreadArchives(future);
+    assert.equal(f.records().filter(r => r.method === "thread/archive").length, 5);
+    const row = f.store.db.prepare("SELECT * FROM lark_codex_archive_queue").get() as any;
+    assert.equal(row.attempts, 5); assert.ok(Date.parse(row.due_at) >= Date.now() + 590_000);
+    assert.equal(await reconcilePendingLarkThreadArchives(), 0);
+    f.state({ archivedIds: ["thread-fixture"] });
+    await reconcilePendingLarkThreadArchives(future);
+    assert.equal((f.store.db.prepare("SELECT count(*) n FROM lark_codex_archive_queue").get() as any).n, 0);
+  } finally { await f.close(); }
+});
+
+test("incoming reuse waits for an in-flight archive before it can start a new turn", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ threadStatus: "idle", status: "completed", deferArchive: true });
+    const checking = reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    await until(() => f.records().some(r => r.method === "thread/archive"));
+    ingestLarkEvent({ ...f.message, event_id: "event-after", message_id: "om_after", content: "after archive" });
+    await immediate(); await immediate();
+    assert.equal(f.records().filter(r => r.method === "turn/start").length, 1);
+    await codexAppServer.request("fixture/release", {}); await checking;
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_after'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id));
+    assert.equal(f.records().filter(r => r.method === "turn/start").length, 2);
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+  } finally { await f.close(); }
+});
+
+test("an incoming dispatch during the native idle probe prevents archiving its reused thread", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ threadStatus: "idle", status: "completed", defer: true });
+    const checking = reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    await until(() => f.records().some(r => r.method === "thread/read"));
+    ingestLarkEvent({ ...f.message, event_id: "event-probe", message_id: "om_probe", content: "new request during probe" });
+    await immediate();
+    await codexAppServer.request("fixture/release", {}); await checking;
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_probe'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id));
+    assert.equal(f.records().filter(r => r.method === "thread/archive").length, 0);
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+    assert.ok(f.store.db.prepare("SELECT 1 FROM lark_codex_archive_queue").get());
+  } finally { await f.close(); }
+});
+
+test("an archived thread still loaded during unsubscribe grace is restored before reuse", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ threadStatus: "idle", status: "completed", loaded: true });
+    await reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    ingestLarkEvent({ ...f.message, event_id: "event-restored", message_id: "om_restored", content: "restore archived conversation" });
+    const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_restored'").get() as any;
+    await until(() => Boolean(row()?.codex_turn_id));
+    assert.equal(row().codex_session_id, "thread-fixture");
+    assert.equal(f.records().filter(r => r.method === "thread/unarchive").length, 1);
+    assert.equal(f.records().filter(r => r.method === "thread/resume").length, 0);
+    await f.complete(row().codex_turn_id); await until(() => row().codex_status === "answered");
+  } finally { await f.close(); }
+});
+
+test("unknown archive membership cannot trigger restore, fallback or replay of a loaded thread", async () => {
+  for (const state of [{ archiveListError: true }, { archiveListMalformed: true }]) {
+    const f = fixture(); try {
+      await f.ready(); await f.complete(); await immediate(); f.state(state);
+      ingestLarkEvent({ ...f.message, event_id: "event-unknown", message_id: "om_unknown", content: "unknown membership" });
+      const row = () => f.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_unknown'").get() as any;
+      await until(() => row()?.codex_status === "failed");
+      assert.equal(f.records().filter(r => r.method === "thread/start").length, 1);
+      assert.equal(f.records().filter(r => r.method === "turn/start").length, 1);
+      assert.equal(f.records().filter(r => r.method === "thread/unarchive" || r.method === "turn/interrupt").length, 0);
+      assert.ok(f.store.db.prepare("SELECT 1 FROM lark_codex_archive_queue").get());
+    } finally { await f.close(); }
+  }
+});
+
+test("stale archive completion cannot delete or overwrite a newer thread cleanup token", async () => {
+  const f = fixture(); try {
+    await f.ready(); await f.complete(); await immediate();
+    f.state({ threadStatus: "idle", status: "completed", deferArchive: true });
+    const checking = reconcilePendingLarkThreadArchives(new Date(Date.now() + 31_000).toISOString());
+    await until(() => f.records().some(r => r.method === "thread/archive"));
+    f.store.db.prepare("UPDATE lark_codex_archive_queue SET token='newer-token', attempts=2").run();
+    await codexAppServer.request("fixture/release", {}); await checking;
+    const row = f.store.db.prepare("SELECT token,attempts FROM lark_codex_archive_queue").get() as any;
+    assert.deepEqual(row, { token: "newer-token", attempts: 2 });
+    assert.equal(f.records().some(r => r.method === "thread/unsubscribe"), false);
+  } finally { await f.close(); }
 });
 
 test("short tasks send only final text even when commentary matches the final answer", async () => {

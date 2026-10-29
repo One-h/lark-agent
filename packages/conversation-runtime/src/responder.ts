@@ -22,7 +22,7 @@ import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
-import { isNativeThreadLoaded, isNativeThreadMissingError } from "./nativeThreadState.js";
+import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions } from "./completionReactions.js";
@@ -2148,11 +2148,6 @@ export function formatLarkFinalReply(
   return reply.includes(`user_id="${message.sender_id}"`) ? reply : `${mention} ${reply}`;
 }
 
-function cancelLarkThreadArchive(threadId: string | null | undefined): void {
-  if (!threadId) return;
-  db.prepare("DELETE FROM lark_codex_archive_queue WHERE thread_id=?").run(threadId);
-}
-
 function scheduleLarkThreadArchive(threadId: string, sessionKey: string, activityVersion: number): void {
   if (larkSessionActivityVersions.get(sessionKey) !== activityVersion) return;
   const now = nowIso();
@@ -2171,39 +2166,55 @@ function currentArchiveToken(row: PendingLarkThreadArchive): boolean {
 
 async function archiveLarkThreadIfIdle(row: PendingLarkThreadArchive): Promise<void> {
   const { thread_id: threadId, session_key: sessionKey, activity_version: activityVersion } = row;
-  const currentVersion = larkSessionActivityVersions.get(sessionKey);
-  if (!currentArchiveToken(row) || (currentVersion !== undefined && currentVersion !== activityVersion)) {
-    db.prepare("DELETE FROM lark_codex_archive_queue WHERE thread_id=? AND token=?").run(threadId, row.token);
-    return;
-  }
-  if (activeLarkCodexRuns.has(sessionKey) || dispatchChains.has(sessionKey)) return;
+  const locallyBusy = () => [...activeLarkCodexRuns.values()].some(run => run.threadId === threadId)
+    || dispatchChains.has(sessionKey);
+  if (!currentArchiveToken(row) || locallyBusy()) return;
+  const request = (method: string, params: Record<string, unknown>) => codexAppServer.request(method, params, 10_000);
+  let archiveAttempted = false;
+  let archiveSucceeded = false;
+  const defer = (error: string, failedAttempt = false) => {
+    db.prepare("UPDATE lark_codex_archive_queue SET attempts=?,last_error=?,due_at=?,updated_at=? WHERE thread_id=? AND token=?")
+      .run(row.attempts + (failedAttempt ? 1 : 0), error.slice(0, 1000),
+        new Date(Date.now() + (row.attempts >= 5 ? 600_000 : Math.min(600_000, 15_000 * 2 ** row.attempts))).toISOString(), nowIso(), threadId, row.token);
+  };
   try {
-    await codexAppServer.request("thread/archive", { threadId }, 10_000);
+    if (row.attempts >= 5) {
+      if (!await isNativeThreadArchived(request, threadId)) { defer("Archive retries exhausted; native archive not confirmed"); return; }
+    } else {
+      const safety = await nativeThreadArchiveSafety(request, threadId);
+      if (!currentArchiveToken(row) || locallyBusy()) return;
+      if (safety !== "idle") { defer(`Native thread state is ${safety}; waiting to archive`); return; }
+      archiveAttempted = true;
+      await request("thread/archive", { threadId });
+      archiveSucceeded = true;
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (!/already archived|is archived/i.test(message)) {
+    const archived = await isNativeThreadArchived(request, threadId).catch(() => false);
+    if (!archived) {
       console.warn(`Unable to archive completed Lark Codex thread ${threadId}: ${message}`);
-      const attempts = row.attempts + 1;
-      db.prepare("UPDATE lark_codex_archive_queue SET attempts=?,last_error=?,due_at=?,updated_at=? WHERE thread_id=? AND token=?")
-        .run(attempts, message.slice(0, 1000), new Date(Date.now() + Math.min(600_000, 15_000 * 2 ** row.attempts)).toISOString(), nowIso(), threadId, row.token);
+      defer(message, archiveAttempted);
       return;
     }
   }
-  if (!currentArchiveToken(row) || (larkSessionActivityVersions.get(sessionKey) !== undefined && larkSessionActivityVersions.get(sessionKey) !== activityVersion)) return;
-  try {
-    if (await larkResponderOwnsThread(threadId)) {
-      await codexAppServer.requestIfRunning("thread/unsubscribe", { threadId }, 10_000);
+  if (!currentArchiveToken(row)) return;
+  if (archiveSucceeded) {
+    try {
+      // Reuse waits on this archive promise before it can start another native turn.
+      if (await larkResponderOwnsThread(threadId)) await codexAppServer.requestIfRunning("thread/unsubscribe", { threadId }, 10_000);
+    } catch (error) {
+      console.warn(`Unable to unload completed Lark Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    loadedLarkThreadParameters.delete(threadId);
-  } catch (error) {
-    console.warn(`Unable to unload completed Lark Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
   }
+  loadedLarkThreadParameters.delete(threadId);
   db.prepare("DELETE FROM lark_codex_archive_queue WHERE thread_id=? AND token=?").run(threadId, row.token);
-  if (larkSessionActivityVersions.get(sessionKey) === activityVersion) larkSessionActivityVersions.delete(sessionKey);
+  const session = db.prepare("SELECT codex_session_id FROM lark_codex_sessions WHERE session_key=?").get(sessionKey) as { codex_session_id: string } | undefined;
+  if (session?.codex_session_id === threadId && !activeLarkCodexRuns.has(sessionKey) && !dispatchChains.has(sessionKey)
+    && larkSessionActivityVersions.get(sessionKey) === activityVersion) larkSessionActivityVersions.delete(sessionKey);
 }
 
 export async function reconcilePendingLarkThreadArchives(now = nowIso()): Promise<number> {
-  const rows = db.prepare("SELECT thread_id,session_key,activity_version,token,attempts FROM lark_codex_archive_queue WHERE due_at<=? AND attempts<5 ORDER BY due_at LIMIT 10")
+  const rows = db.prepare("SELECT thread_id,session_key,activity_version,token,attempts FROM lark_codex_archive_queue WHERE due_at<=? ORDER BY due_at LIMIT 10")
     .all(now) as PendingLarkThreadArchive[];
   for (const row of rows) {
     if (archivingLarkThreads.has(row.thread_id)) continue;
@@ -3537,11 +3548,13 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   if (threadId) {
     const previousWorkspace = appSettingValue(`codex.threadWorkspace:${threadId}`);
     const workspaceChanged = previousWorkspace !== undefined && previousWorkspace !== config.workspaceRoot;
-    cancelLarkThreadArchive(threadId);
     const appServerHasThread = await isNativeThreadLoaded((method, params) => codexAppServer.request(method, params), threadId);
-    appendPreparedLog(prepared, { method: "thread/reuse-check", params: { threadId, appServerHasThread, source: "thread/loaded/list" } });
+    // Unsubscribe can leave an archived thread loaded during the native inactivity grace period.
+    const loadedThreadArchived = appServerHasThread
+      && await nativeThreadNeedsUnarchive((method, params) => codexAppServer.request(method, params), threadId);
+    appendPreparedLog(prepared, { method: "thread/reuse-check", params: { threadId, appServerHasThread, loadedThreadArchived, source: "thread/loaded/list" } });
     try {
-      await unarchiveLarkThread(threadId);
+      if (!appServerHasThread || loadedThreadArchived) await unarchiveLarkThread(threadId);
       if (!appServerHasThread || workspaceChanged) {
         const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", {
           threadId,
@@ -3554,6 +3567,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendPreparedError(prepared, `Unable to resume Codex thread ${threadId}: ${message}`);
+      scheduleLarkThreadArchive(threadId, prepared.sessionKey, prepared.activityVersion);
       if (workspaceChanged) throw new Error(`Unable to bind Codex thread to the configured workspace: ${message}`);
       // Another writer does not mean this app-server has the thread loaded.
       // Keep that writer's conversation intact and start a separate full-context
@@ -3786,7 +3800,6 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
     const previousSession = larkCodexSessionForMessage(message, trustedSender);
     const pendingArchive = previousSession ? archivingLarkThreads.get(previousSession.codex_session_id) : undefined;
     if (pendingArchive) await pendingArchive;
-    cancelLarkThreadArchive(previousSession?.codex_session_id);
     prepared = await prepareLarkCodexMessage(larkMessageId, previousSession ? "delta" : "full", undefined, activityVersion);
     await startPreparedTurn(prepared);
   } catch (error) {
