@@ -128,7 +128,7 @@ export class SqliteAgentStore {
         reply_to_message_id TEXT, root_message_id TEXT, thread_id TEXT, reply_to_message_type TEXT,
         reply_to_content TEXT, reply_to_raw_json TEXT, mentioned INTEGER NOT NULL DEFAULT 0,
         reply_trigger TEXT NOT NULL DEFAULT 'none', reply_status TEXT NOT NULL DEFAULT 'skipped', reply_error TEXT,
-        reply_delivery_key TEXT, reply_delivery_text TEXT, reply_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        reply_delivery_key TEXT, reply_delivery_text TEXT, reply_delivery_payload TEXT, reply_delivery_attempts INTEGER NOT NULL DEFAULT 0,
         reply_next_attempt_at TEXT, reply_sent_at TEXT, codex_status TEXT NOT NULL DEFAULT 'skipped', codex_reply TEXT,
         codex_error TEXT, codex_session_id TEXT, codex_turn_id TEXT, codex_last_heartbeat_at TEXT,
         codex_runner_generation TEXT, codex_task_dir TEXT, codex_started_at TEXT, codex_finished_at TEXT,
@@ -198,6 +198,7 @@ export class SqliteAgentStore {
     this.ensureColumn("lark_messages", "outbound_source", "TEXT");
     this.ensureColumn("lark_messages", "root_message_id", "TEXT");
     this.ensureColumn("lark_messages", "thread_id", "TEXT");
+    this.ensureColumn("lark_messages", "reply_delivery_payload", "TEXT");
     this.ensureColumn("lark_capability_approvals", "approval_scope", "TEXT NOT NULL DEFAULT 'once'");
     this.ensureColumn("lark_capability_approvals", "error", "TEXT");
     this.ensureColumn("lark_capability_approvals", "requester_id", "TEXT");

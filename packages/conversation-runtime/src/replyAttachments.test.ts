@@ -5,8 +5,29 @@ import path from "node:path";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime } from "./context.js";
-import { attachmentToolPrompt, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment } from "./replyAttachments.js";
+import { attachmentToolPrompt, createReplyMarkdownAttachment, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment } from "./replyAttachments.js";
 import { extractLarkReplyMedia, deliverLarkOutboxRow, retryPendingLarkTextReplies } from "./responder.js";
+
+test("generated full Markdown attachments are idempotent and reject symlink or changed-file targets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-generated-reply-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "lark-generated-outside-"));
+  try {
+    const first = createReplyMarkdownAttachment(root, "# 完整结果\n\n| A | B |\n| --- | --- |\n| 1 | 2 |");
+    assert.deepEqual(createReplyMarkdownAttachment(root, fs.readFileSync(first.absolutePath, "utf8")), first);
+    const original = fs.readFileSync(first.absolutePath, "utf8");
+    const alternate = path.join(root, "output", "same-content.md");
+    fs.writeFileSync(alternate, original); fs.unlinkSync(first.absolutePath); fs.symlinkSync(alternate, first.absolutePath);
+    assert.throws(() => createReplyMarkdownAttachment(root, original), /校验失败/);
+    assert.equal(fs.readFileSync(alternate, "utf8"), original);
+    fs.unlinkSync(first.absolutePath); createReplyMarkdownAttachment(root, original);
+    fs.writeFileSync(first.absolutePath, "tampered");
+    assert.throws(() => createReplyMarkdownAttachment(root, "# 完整结果\n\n| A | B |\n| --- | --- |\n| 1 | 2 |"), /校验失败/);
+    fs.rmSync(path.join(root, "output", ".rendered"), { recursive: true });
+    fs.symlinkSync(outside, path.join(root, "output", ".rendered"));
+    assert.throws(() => createReplyMarkdownAttachment(root, "must stay inside"), /不安全/);
+    assert.deepEqual(fs.readdirSync(outside), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); }
+});
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-attachment-files-"));

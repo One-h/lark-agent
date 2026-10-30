@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@lark-agent/core": "0.1.0"
+    "@lark-agent/core": "0.1.0",
+    "marked": "17.0.1"
   }
 }

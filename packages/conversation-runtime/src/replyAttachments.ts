@@ -74,6 +74,44 @@ function assertSnapshotDirectory(directory: string, output: string): void {
     || !fs.lstatSync(directory).isDirectory()) throw new Error("附件快照目录不安全");
 }
 
+export function createReplyMarkdownAttachment(taskDir: string, markdown: string): ReplyMedia {
+  const contents = Buffer.from(markdown, "utf8");
+  if (!contents.length || contents.length > 50 * 1024 * 1024) throw new Error("完整回复附件大小不符合限制");
+  const outputPath = path.join(taskDir, "output");
+  fs.mkdirSync(outputPath, { recursive: true });
+  const realTask = fs.realpathSync(taskDir), output = fs.realpathSync(outputPath);
+  if (!within(output, realTask)) throw new Error("完整回复附件目录不安全");
+  const directory = path.join(output, ".rendered");
+  if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+  assertSnapshotDirectory(directory, output);
+  const digest = crypto.createHash("sha256").update(contents).digest("hex");
+  const file = path.join(directory, `reply-details-${digest.slice(0, 24)}.md`);
+  let fd: number | undefined;
+  let created: fs.Stats | undefined;
+  let complete = false;
+  try {
+    try {
+      fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+      created = fs.fstatSync(fd);
+      assertSnapshotDirectory(directory, output);
+      if (!created.isFile() || created.nlink !== 1 || !sameFile(fs.lstatSync(file), created)) throw new Error("完整回复附件路径发生变化");
+      fs.writeFileSync(fd, contents); fs.fsyncSync(fd);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || fd !== undefined) throw error;
+    }
+    assertSnapshotDirectory(directory, output);
+    const source = resolveReplyAttachment(taskDir, path.relative(output, file));
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.nlink !== 1 || created && !sameFile(stat, created)
+      || attachmentDigest(source.absolutePath) !== digest) throw new Error("完整回复附件校验失败");
+    complete = true;
+    return { ...source, sha256: digest };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (!complete && created) removeCreatedSnapshot(file, created, output);
+  }
+}
+
 function removeCreatedSnapshot(file: string, identity: fs.Stats, output: string): void {
   try {
     assertSnapshotDirectory(path.dirname(file), output);

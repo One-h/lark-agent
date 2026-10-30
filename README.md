@@ -99,6 +99,10 @@ receipt, or as an attachment-only reply. Failed/cancelled turns do not send stag
 files. Valid legacy media tags remain compatible; malformed tags are reported
 rather than forwarded as reply text. See [the attachment tool contract](docs/attachment-tools.md)
 for scope, limits, retries and completion signals.
+
+Final replies use [Markdown posts and data cards](docs/rich-replies.md).
+Large results retain their complete Markdown as a reliably delivered attachment;
+history keeps readable original text rather than card JSON.
 The hash tracks the captured default prompt, even when custom mode omits its text.
 Existing saved prompt overrides are preserved and used only in default mode;
 do not store authorization requirements in the editable persona field.

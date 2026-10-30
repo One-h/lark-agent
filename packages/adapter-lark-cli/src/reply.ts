@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
+import type { LarkReplyPresentation } from "./richReply.js";
 
 export function larkReplyIdempotencyKey(kind: string, seed: string): string {
   const hash = crypto.createHash("sha1").update(seed).digest("hex").slice(0, 16);
@@ -77,12 +78,15 @@ export function parseLarkSentMessage(stdout: string): LarkSentMessage {
 export function sendLarkTextReply(
   messageId: string,
   text: string,
-  idempotencyKey: string
+  idempotencyKey: string,
+  presentation?: LarkReplyPresentation
 ): LarkSendResult {
   const result = spawnSync(
     "lark-cli",
-    ["im", "+messages-reply", "--as", "bot", "--message-id", messageId, "--text", text, "--idempotency-key", idempotencyKey, "--format", "json"],
-    { cwd: process.cwd(), encoding: "utf8" }
+    ["im", "+messages-reply", "--as", "bot", "--message-id", messageId,
+      ...(presentation ? ["--msg-type", presentation.msgType, "--content", JSON.stringify(presentation.content)] : ["--text", text]),
+      "--idempotency-key", idempotencyKey, "--format", "json"],
+    { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 }
   );
   if (result.status === 0) {
     return parseLarkSentMessage(result.stdout);
