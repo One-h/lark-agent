@@ -6,6 +6,71 @@ import test from "node:test";
 import { decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply, setAppSettingValue } from "@lark-agent/conversation-runtime";
 import { createRuntime } from "./index.js";
 
+test("read-only query command approvals use the same automatic and manual routing in private and group chats", async () => {
+  for (const scenario of [{ chatType: "p2p", manual: false }, { chatType: "group", manual: false }, { chatType: "group", manual: true }]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-query-approval-"));
+    const executable = path.join(root, "codex.mjs"), log = path.join(root, "rpc.jsonl"), result = path.join(root, "decision.json");
+    fs.writeFileSync(executable, `#!${process.execPath}
+import readline from "node:readline";import fs from "node:fs";
+const send=x=>process.stdout.write(JSON.stringify(x)+"\\n");
+readline.createInterface({input:process.stdin}).on("line",line=>{
+ const m=JSON.parse(line);fs.appendFileSync(${JSON.stringify(log)},line+"\\n");
+ if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"query-thread"}}});
+ else if(m.method==="turn/start"){
+  send({id:m.id,result:{turn:{id:"query-turn",status:"inProgress"}}});
+  setTimeout(()=>send({id:"query-approval",method:"item/commandExecution/requestApproval",params:{threadId:"query-thread",turnId:"query-turn",itemId:"query",command:"python3 query-readonly.py check",cwd:${JSON.stringify(root)},reason:"Read-only query requires network and system credentials"}}),20);
+ }else if(m.method)send({id:m.id,result:{}});
+ else if(m.id==="query-approval"){
+  fs.writeFileSync(${JSON.stringify(result)},JSON.stringify({decision:m.result?.decision}));
+  const item={type:"agentMessage",id:"answer",phase:"final_answer",text:m.result?.decision==="accept"?"模拟查询完成":"未获授权，未执行查询"};
+  send({method:"item/completed",params:{threadId:"query-thread",turnId:"query-turn",item}});
+  send({method:"turn/completed",params:{threadId:"query-thread",turn:{id:"query-turn",status:"completed",items:[item]}}});
+ }
+});`);
+    fs.chmodSync(executable, 0o755);
+    fs.writeFileSync(path.join(root, "lark-cli"), '#!/bin/sh\nprintf \'%s\\n\' \'{"data":{"message_id":"om_fixture_card"}}\'\n', { mode: 0o755 });
+    const previousExecutable = process.env.CODEX_EXECUTABLE, previousPath = process.env.PATH;
+    process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${root}:${previousPath ?? ""}`;
+    let reviews = 0;
+    const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
+      turnApprovalReviewer: async () => { reviews++; return { decision: scenario.manual ? "manual" : "approve_turn", reason: "fixture query review" }; },
+      textReplySender: () => ({ ok: true, messageId: "om_fixture_reply", chatId: "oc_query", messageAt: new Date().toISOString(), messageType: "text" }) });
+    try {
+      await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true, executionReceiptsEnabled: false, interimRepliesEnabled: false } });
+      const now = new Date().toISOString();
+      runtime.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
+        VALUES(1,'om_query','oc_query',?,'ou_sender','text','查询每日分布',1,?,'skipped','failed','{}',?,?)`)
+        .run(scenario.chatType, scenario.chatType === "p2p" ? "p2p" : "mention", now, now);
+      assert.equal(enqueueLarkCodexReply(1), true);
+      let status = "";
+      for (let i = 0; i < 160; i++) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        const pending = runtime.store.db.prepare("SELECT token,card_message_id FROM lark_execution_approvals WHERE status='pending' AND card_message_id IS NOT NULL LIMIT 1").get() as { token: string; card_message_id: string } | undefined;
+        if (pending) {
+          assert.equal(scenario.manual, true);
+          assert.equal(decideLarkExecutionApprovalFromCard({ token: pending.token, decision: "reject", operatorId: "ou_owner", messageId: pending.card_message_id }).ok, true);
+        }
+        status = (runtime.store.db.prepare("SELECT codex_status FROM lark_messages WHERE id=1").get() as { codex_status: string }).codex_status;
+        if (["answered", "no_reply", "failed"].includes(status)) break;
+      }
+      assert.notEqual(status, "failed"); assert.notEqual(status, "running"); assert.equal(reviews, 1);
+      assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).decision, scenario.manual ? "decline" : "accept");
+      const audit = runtime.store.db.prepare("SELECT source,decision,applied_at FROM lark_turn_auto_reviews").get() as { source: string; decision: string; applied_at: string | null };
+      assert.equal(audit.source, "model");
+      assert.equal(audit.decision, scenario.manual ? "manual" : "approved");
+      assert.equal(Boolean(audit.applied_at), !scenario.manual);
+      const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const thread = calls.find(call => call.method === "thread/start").params;
+      assert.equal(thread.sandbox, "read-only"); assert.equal(thread.approvalPolicy, "on-request");
+      assert.match(JSON.stringify(calls.find(call => call.method === "turn/start").params.input), /只读查询执行授权/);
+    } finally {
+      await runtime.app.close(); runtime.stop();
+      if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable;
+      process.env.PATH = previousPath; fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("App Server approval requests grant the current turn and do not leak to the next turn", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-command-auto-"));
   const executable = path.join(root, "codex.mjs");

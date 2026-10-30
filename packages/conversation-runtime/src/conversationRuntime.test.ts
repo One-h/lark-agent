@@ -140,6 +140,55 @@ test("conversation runtime responder preserves prompts, trust profiles and group
   } finally { store.close(); }
 });
 
+test("restricted read-only queries request execution approval in group and private full or incremental prompts", () => {
+  const { root, store } = fixture();
+  try {
+    const sections: string[] = [];
+    for (const chat_type of ["group", "p2p"]) {
+      const message = { id: 1, message_id: "om_query", chat_id: "oc_query", chat_type, sender_id: "ou_sender",
+        content: "查询最近的每日分布", reply_to_message_id: null, reply_to_message_type: null, reply_to_content: null };
+      for (const prompt of [buildLarkCodexPrompt(message, { trustedSender: false }),
+        buildLarkCodexDeltaPrompt(message, { trustedSender: false }),
+        buildLarkCodexDeltaPrompt(message, { trustedSender: false, includeStableInstructions: false })]) {
+        const section = prompt.split("\n").find(line => line.startsWith("只读查询执行授权："));
+        assert.ok(section);
+        assert.match(section, /本地检索可直接进行/);
+        assert.match(section, /联网、隧道或系统凭据/);
+        assert.match(section, /sandbox_permissions=require_escalated/);
+        assert.match(section, /申请对应命令的授权，再执行或重试/);
+        assert.match(section, /现有自动\/人工审批/);
+        assert.match(section, /审批拒绝或过期即停止对应操作/);
+        assert.match(section, /账号认证失败、业务权限拒绝或来源白名单拦截/);
+        assert.match(section, /不能通过提权、换账号或导出凭据绕过/);
+        assert.equal(prompt.split("只读查询执行授权：").length - 1, 1);
+        sections.push(section);
+      }
+    }
+    assert.equal(new Set(sections).size, 1);
+    const params = buildLarkCodexThreadParams(false);
+    assert.equal(params.sandbox, "read-only");
+    assert.equal(params.approvalPolicy, "on-request");
+    const turn = buildLarkCodexTurnParams({ input: [], messageId: "om_query", trustedSender: false }, "thread_query");
+    assert.equal(turn.approvalPolicy, "on-request");
+    assert.equal(turn.sandboxPolicy, undefined);
+  } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("trusted execution retains its existing permission policy without adding restricted-query approvals", () => {
+  const { root, store } = fixture();
+  try {
+    const message = { content: "查本地记录", chat_type: "group", sender_id: "ou_owner",
+      reply_to_message_id: null, reply_to_message_type: null, reply_to_content: null };
+    for (const build of [buildLarkCodexPrompt, buildLarkCodexDeltaPrompt]) {
+      assert.doesNotMatch(build(message, { trustedSender: true }), /只读查询执行授权：/);
+      assert.match(build({ ...message, reply_trigger: "owner_mention" }, { trustedSender: true }), /只读查询执行授权：/);
+    }
+    const params = buildLarkCodexThreadParams(true);
+    assert.equal(params.sandbox, "danger-full-access");
+    assert.equal(params.approvalPolicy, "never");
+  } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("conversation runtime responder preserves no-reply, sanitization and recovery decisions", () => {
   assert.equal(isLarkNoReplyDecision("<forge-no-reply/>"), true);
   assert.equal(isLarkNoReplyDecision("正常回复"), false);
