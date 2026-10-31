@@ -17,3 +17,4 @@ export * from "./approvalTaskContext.js";
 export * from "./hostHttp.js";
 export * from "./progressCards.js";
 export * from "./ownerMentionAssist.js";
+export * from "./topicNativeMode.js";

@@ -101,6 +101,9 @@ rather than forwarded as reply text. See [the attachment tool contract](docs/att
 for scope, limits, retries and completion signals.
 
 Final replies use [Markdown posts and data cards](docs/rich-replies.md).
+Optional [native topic conversations](docs/native-topics.md) continue an explicitly
+joined topic without repeated mentions, using compact incremental input. This
+mode is off by default; disabling it retains the existing group behavior.
 Large results retain their complete Markdown as a reliably delivered attachment;
 history keeps readable original text rather than card JSON.
 The hash tracks the captured default prompt, even when custom mode omits its text.

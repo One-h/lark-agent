@@ -10,7 +10,7 @@ import { PassThrough } from "node:stream";
 import { captureConversationStyle, config, isTrustedLarkSender } from "@lark-agent/conversation-runtime";
 import { createRuntime } from "./index.js";
 
-const booleanFields = ["trustedExecutionEnabled", "listenerEnabled", "repliesEnabled", "interimRepliesEnabled", "executionReceiptsEnabled", "groupMessageReactionEnabled", "groupSpontaneousRepliesEnabled", "turnAutoApprovalEnabled", "ownerMessageFastPathEnabled"];
+const booleanFields = ["trustedExecutionEnabled", "listenerEnabled", "repliesEnabled", "interimRepliesEnabled", "executionReceiptsEnabled", "groupMessageReactionEnabled", "groupSpontaneousRepliesEnabled", "turnAutoApprovalEnabled", "ownerMessageFastPathEnabled", "topicNativeModeEnabled"];
 const savedRows = (runtime: ReturnType<typeof createRuntime>) => runtime.store.db.prepare("SELECT * FROM settings ORDER BY key").all();
 const settings = async (runtime: ReturnType<typeof createRuntime>) => (await runtime.app.inject({ method: "GET", url: "/v1/settings" })).json();
 const patch = (runtime: ReturnType<typeof createRuntime>, payload: unknown) => runtime.app.inject({ method: "PATCH", url: "/v1/settings", headers: { "content-type": "application/json" }, payload: JSON.stringify(payload) });
@@ -40,7 +40,7 @@ test("settings reject every invalid writable field and mixed unknown fields befo
       groupContextMessageLimit: [null, "1", 0, 1.5, 201],
       groupContextMaxChars: [null, "500", 499, 500.5, 30_001]
     };
-    assert.equal(Object.keys(invalid).length, 25);
+    assert.equal(Object.keys(invalid).length, 26);
     for (const [key, values] of Object.entries(invalid)) {
       for (const value of values) {
         const result = await patch(runtime, { workspaceRoot: next, repliesEnabled: false, [key]: value });
@@ -104,13 +104,13 @@ test("settings persist all 24 fields, normalized sets, false and zero with ident
     runtime.store.setSetting("codex.threadWorkspace:known", "/previous-workspace");
     const payload = {
       workspaceRoot: next + "/../next", trustedExecutionEnabled: true, trustedSenderIds: [" ou_new ", "ou_new"], approverId: " ou_new ",
-      listenerEnabled: false, repliesEnabled: true, interimRepliesEnabled: true, executionReceiptsEnabled: true,
+      listenerEnabled: false, repliesEnabled: true, interimRepliesEnabled: true, executionReceiptsEnabled: true, topicNativeModeEnabled: true,
       groupMessageReactionEnabled: true, groupMessageReactionEmoji: "GeneralDoNotDisturb", groupMessageReactionChatIds: [" oc_one ", "oc_one", "oc_two"],
       acknowledgeReactionEmoji: "Status_PrivateMessage", groupSpontaneousRepliesEnabled: true, groupSpontaneousChatIds: [" oc_two ", "oc_two"],
       groupSpontaneousReplyRate: 1, groupSpontaneousReplyCooldownMs: 604_800_000, groupContextMessageLimit: 200, groupContextMaxChars: 30_000,
       codexModel: " gpt-6-sol ", reasoningEffort: "ultra", stickerUsageMode: "always", turnAutoApprovalEnabled: true, turnAutoApprovalModel: " gpt-6-sol ", turnAutoApprovalDataSources: [" Analytics_Demo ", "analytics_demo", "orders_demo"], ownerMessageFastPathEnabled: true
     };
-    assert.equal(Object.keys(payload).length, 25);
+    assert.equal(Object.keys(payload).length, 26);
     const result = await patch(runtime, payload);
     assert.equal(result.statusCode, 200, result.body);
     const expected = { ...payload, workspaceRoot: next, trustedSenderIds: ["ou_new"], approverId: "ou_new", groupMessageReactionChatIds: ["oc_one", "oc_two"], groupSpontaneousChatIds: ["oc_two"], codexModel: "gpt-6-sol", turnAutoApprovalModel: "gpt-6-sol", turnAutoApprovalDataSources: ["analytics_demo", "orders_demo"] };

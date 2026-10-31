@@ -22,6 +22,7 @@ import { createHistoryImageBudget, createHistoryImageState, historyImagesAllowed
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
+import { isNativeTopicConversation } from "./topicNativeMode.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
@@ -49,6 +50,7 @@ type LarkGroupContextMessage = {
   reply_to_message_id: string | null;
   reply_to_content: string | null;
   reply_to_local_id: number | null;
+  native_reply_thread_id?: string | null;
 };
 
 type LarkPromptAttachments = {
@@ -65,6 +67,7 @@ type LarkPromptAttachments = {
   recentMessagesHasMore?: boolean;
   contextKind?: "main" | "topic";
   stickerContextToken?: string;
+  nativeTopicMode?: boolean;
 };
 
 type LarkPromptMode = "full" | "delta";
@@ -875,6 +878,25 @@ export function buildLarkCodexDeltaPrompt(
   const contactDirectory = knownLarkContactsPrompt(message, [...(attachments.backgroundMessages ?? []), ...(attachments.recentMessages ?? [])]);
   const groupReplyDecisionInstruction = larkGroupReplyDecisionPrompt(message);
   const style = attachments.conversationStyle ?? captureConversationStyle(message.chat_id);
+  if (attachments.nativeTopicMode) {
+    const refreshedInstructions = attachments.includeStableInstructions !== false
+      ? [style.effectiveInstructions, groupMentionInstruction,
+        larkQueryExecutionApprovalPrompt(Boolean(attachments.trustedSender)), larkGroupReplyDecisionPrompt(message),
+        mediaOutputInstruction, historyImageInstruction].filter(Boolean).join("\n\n") : "";
+    return [
+      refreshedInstructions,
+      "话题续聊：结合本 thread 的既有目标处理新增消息；进度追问先简短回应，再继续可执行任务。",
+      recentMessages,
+      contactDirectory,
+      larkPromptTime(message),
+      `最新消息（message_id=${message.message_id ?? "unknown"}，sender_id=${message.sender_id ?? "unknown"}）：\n${latestMessage}`,
+      stickerInstruction,
+      attachments.stickerContextToken ? `本轮工具 context_token=${attachments.stickerContextToken}；附件输出目录=${attachments.mediaOutputDirectory ?? "未配置"}。用 attach_files 登记要交付的附件，暂存不代表送达。` : "",
+      referencedImagePaths.length ? `本轮图片已作为 image attachment 传入：${referencedImagePaths.join(", ")}` : "",
+      missingImageCount > 0 ? `${missingImageCount} 张当前或直接引用的图片获取失败；可见性以实际读取结果为准。` : "",
+      referencedFilePrompt
+    ].filter(Boolean).join("\n\n");
+  }
   return [
     "这是同一飞书 Codex 会话中的新增消息。此前角色说明、权限范围、技能和历史上下文已经在当前 thread 中，不要重新陈述它们。优先处理以下新增内容。",
     attachments.includeStableInstructions === false ? "" : style.effectiveInstructions,
@@ -1343,7 +1365,10 @@ function larkGroupMessageSelect(): string {
       COALESCE(messages.message_at, messages.received_at, messages.created_at) AS message_at,
       messages.reply_to_message_id,
       messages.reply_to_content,
-      parent.id AS reply_to_local_id
+      parent.id AS reply_to_local_id,
+      CASE WHEN messages.direction = 'outbound' AND messages.outbound_source = 'reply'
+        AND parent.codex_status = 'answered' AND parent.codex_error IS NULL
+        AND messages.content = parent.reply_delivery_text THEN parent.codex_session_id END AS native_reply_thread_id
     FROM lark_messages AS messages
     LEFT JOIN lark_contacts AS contacts ON contacts.open_id = messages.sender_id
     LEFT JOIN lark_messages AS parent ON parent.message_id = messages.reply_to_message_id
@@ -1762,6 +1787,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
   const ownerPolicy = target?.reply_trigger === "owner_mention" && chatId ? ownerMentionAssistSettings(chatId) : null;
   const canAssist = Boolean(ownerPolicy?.effectiveEnabled && target?.sender_type === "user" && target.sender_id !== ownerPolicy.ownerId
     && ownerAssistRow(larkMessageId)?.owner_id === ownerPolicy.ownerId);
+  const canContinueTopic = Boolean(target && target.reply_trigger === "topic" && isNativeTopicConversation(target));
 
   const claimed = db.prepare(`
     UPDATE lark_messages
@@ -1772,7 +1798,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
         codex_started_at = NULL,
         codex_finished_at = NULL
     WHERE id = ?
-      AND ((mentioned = 1 AND reply_trigger!='owner_mention') OR (reply_trigger='owner_mention' AND chat_type='group' AND ?=1) OR (
+      AND ((mentioned = 1 AND reply_trigger NOT IN ('owner_mention','topic')) OR (reply_trigger='topic' AND ?=1) OR (reply_trigger='owner_mention' AND chat_type='group' AND ?=1) OR (
         reply_trigger = 'spontaneous'
         AND chat_type = 'group' AND sender_type = 'user' AND message_type = 'text'
         AND length(trim(content)) > 0
@@ -1780,7 +1806,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
       ))
       AND message_id IS NOT NULL
       AND codex_status IN ('skipped', 'failed', 'timeout')
-  `).run(larkMessageId, canAssist ? 1 : 0, JSON.stringify(spontaneousChatIds));
+  `).run(larkMessageId, canContinueTopic ? 1 : 0, canAssist ? 1 : 0, JSON.stringify(spontaneousChatIds));
   return claimed.changes > 0;
 }
 
@@ -3599,7 +3625,8 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
     instructions: prepared.conversationStyle.effectiveInstructions,
     globalPromptHash: prepared.conversationStyle.globalPromptHash,
     group: prepared.row.chat_type !== "p2p", trusted: prepared.trustedSender,
-    chatId: prepared.row.chat_id, workspace: config.workspaceRoot, repoRoot: config.repoRoot
+    chatId: prepared.row.chat_id, workspace: config.workspaceRoot, repoRoot: config.repoRoot,
+    nativeTopicMode: isNativeTopicConversation(prepared.row)
   })).digest("hex");
   const snapshot = threadId ? promptInstructionCache.prepare(threadId, fingerprint, promptMode === "full") : undefined;
   const sameInstructions = prepared.promptInstructions?.fingerprint === snapshot?.fingerprint
@@ -3611,6 +3638,10 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
   const groupContext = prepared.row.chat_type && prepared.row.chat_type !== "p2p"
     ? loadLarkGroupContext(prepared.row, prepared.trustedSender, getAppSettings().larkGroupContextMessageLimit, promptMode === "full")
     : { backgroundMessages: [], messages: [], hasMore: false, cursorId: null, contextKind: "main" as const };
+  const nativeTopicMode = isNativeTopicConversation(prepared.row);
+  if (nativeTopicMode && promptMode === "delta" && threadId) {
+    groupContext.messages = groupContext.messages.filter(message => message.native_reply_thread_id !== threadId);
+  }
   const attachments: LarkPromptAttachments = {
     conversationStyle: prepared.conversationStyle,
     includeStableInstructions: snapshot?.included ?? true,
@@ -3623,11 +3654,13 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
     recentMessages: groupContext.messages,
     recentMessagesHasMore: groupContext.hasMore,
     contextKind: groupContext.contextKind,
-    stickerContextToken: prepared.stickerContextToken
+    stickerContextToken: prepared.stickerContextToken,
+    nativeTopicMode
   };
   prepared.prompt = promptMode === "full"
     ? buildLarkCodexPrompt(prepared.row, attachments)
     : buildLarkCodexDeltaPrompt(prepared.row, attachments);
+  if (nativeTopicMode && promptMode === "full") prepared.prompt += "\n\n话题原生会话模式：本话题后续真人消息会继续追加到同一信任范围的 thread；按新增消息延续或调整既有任务。";
   const assistPrompt = ownerAssistPrompt(prepared.row, prepared.stickerContextToken);
   if (assistPrompt) prepared.prompt += `\n\n${assistPrompt}`;
   prepared.input = buildLarkCodexUserInput(prepared.prompt, prepared.referencedImagePaths);
@@ -3742,6 +3775,10 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
 
   updatePreparedPrompt(prepared, prepared.promptMode ?? "full", threadId);
 
+  if (skipDisabledTopicContinuation(prepared.row)) {
+    scheduleLarkThreadArchive(threadId, prepared.sessionKey, prepared.activityVersion);
+    return;
+  }
     upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
   updateCodexState(prepared.row.id, { status: "running", sessionId: threadId, heartbeatAt: nowIso(), taskDir: prepared.taskDir });
   setLarkThreadDisplayName(threadId, prepared);
@@ -3879,6 +3916,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
 }
 
 async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedLarkCodexMessage): Promise<void> {
+  if (skipDisabledTopicContinuation(prepared.row)) return;
   updatePreparedPrompt(prepared, "delta", run.threadId);
   run.members.set(prepared.row.id, prepared);
   run.pendingSteers += 1;
@@ -3925,6 +3963,12 @@ async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedL
   }
 }
 
+function skipDisabledTopicContinuation(message: LarkMessageRow): boolean {
+  if (message.reply_trigger !== "topic" || isNativeTopicConversation(message) && getAppSettings().larkCodexRepliesEnabled) return false;
+  db.prepare("UPDATE lark_messages SET codex_status='skipped',reply_status='skipped',codex_finished_at=?,codex_last_heartbeat_at=NULL WHERE id=? AND codex_status IN ('queued','running')").run(nowIso(), message.id);
+  return true;
+}
+
 async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
   const dispatchId = crypto.randomUUID();
   let prepared: PreparedLarkCodexMessage | null = null;
@@ -3934,6 +3978,7 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
     if (!message?.message_id) {
       throw new Error("Missing Lark message_id");
     }
+    if (skipDisabledTopicContinuation(message)) return;
     if (groupPrivacyBlocks(larkMessageId)) {
       updateCodexState(larkMessageId, {status:"skipped"});
       return;

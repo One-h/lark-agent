@@ -6,6 +6,7 @@ import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueL
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { imageKeysFromContent } from "./mediaImages.js";
+import { enrollNativeTopic, isNativeTopicConversation, isTopicLeaveCommand, topicNativeModeEnabled } from "./topicNativeMode.js";
 
 const messageConsumeCommand = "tail -f /dev/null | lark-cli event consume im.message.receive_v1 --as bot";
 const approvalConsumeCommand = "tail -f /dev/null | lark-cli event consume card.action.trigger --as bot";
@@ -271,18 +272,24 @@ function resolveReplyContext(messageId: string | null, eventReplyToId: string | 
 function persistLarkEvent(event: LarkEvent): void {
   const eventId = stringValue(event.event_id);
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
+  if (messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger === "topic") return;
   const directlyMentioned = isAtMeMessage(event);
   const chatId = stringValue(event.chat_id);
   const rootMessageId = stringValue(event.root_id);
   const threadId = stringValue(event.thread_id);
   const ownerMentioned = isOwnerMentionAssistMessage(event);
-  const spontaneous = !ownerMentioned && shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
+  const topicMessage = { chat_id: chatId, chat_type: stringValue(event.chat_type), message_id: messageId,
+    root_message_id: rootMessageId, thread_id: threadId, sender_type: stringValue(event.sender_type) };
+  const leaveTopic = topicNativeModeEnabled() && !config.groupPrivacyEnforced && directlyMentioned && !ownerMentioned && event.sender_type === "user"
+    && event.chat_type === "group" && Boolean(threadId) && isTopicLeaveCommand(event.content);
+  const topicContinuation = !ownerMentioned && !directlyMentioned && isNativeTopicConversation(topicMessage);
+  const spontaneous = !ownerMentioned && !topicContinuation && shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
   const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
     ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
     : resolveReplyContext(messageId, stringValue(event.reply_to));
-  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned }) ?? false;
-  const shouldRespond = !externallyRouted && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned);
-  const replyTrigger = ownerMentioned ? "owner_mention" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
+  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation }) ?? false;
+  const shouldRespond = !externallyRouted && !leaveTopic && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
+  const replyTrigger = leaveTopic ? "none" : ownerMentioned ? "owner_mention" : topicContinuation ? "topic" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));
   let replyStatus = shouldRespond ? "pending" : "skipped";
   let replyError: string | null = null;
@@ -387,11 +394,13 @@ function persistLarkEvent(event: LarkEvent): void {
   }
   if (insert.changes > 0 && messageId) {
     const persisted = db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(messageId) as LarkMessageRow;
+    if (!externallyRouted && config.runtimeMode === "active" && event.sender_type === "user" && getAppSettings().larkCodexRepliesEnabled && !ownerMentioned
+      && (directlyMentioned || topicContinuation)) enrollNativeTopic(persisted, leaveTopic);
     if (shouldRespond && ownerMentioned) ensureOwnerMentionAssist(persisted);
     observeOwnerAssistContext(persisted);
     appendOwnerAssistContext(persisted);
     const groupEmoji = groupMessageReactionEmoji(event);
-    const reactionEmoji = groupEmoji ?? (directlyMentioned ? validReactionEmoji(getAppSettings().larkAcknowledgeReactionEmoji) : null);
+    const reactionEmoji = groupEmoji ?? (directlyMentioned || topicContinuation ? validReactionEmoji(getAppSettings().larkAcknowledgeReactionEmoji) : null);
     if (reactionEmoji) {
       const reaction = reactToMessage(messageId, reactionEmoji);
       if (!reaction.ok) {

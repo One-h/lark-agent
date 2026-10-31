@@ -59,6 +59,7 @@ const validators = {
   listenerEnabled: (value: unknown) => booleanValue(value, "listenerEnabled"),
   repliesEnabled: (value: unknown) => booleanValue(value, "repliesEnabled"),
   interimRepliesEnabled: (value: unknown) => booleanValue(value, "interimRepliesEnabled"),
+  topicNativeModeEnabled: (value: unknown) => booleanValue(value, "topicNativeModeEnabled"),
   executionReceiptsEnabled: (value: unknown) => booleanValue(value, "executionReceiptsEnabled"),
   groupMessageReactionEnabled: (value: unknown) => booleanValue(value, "groupMessageReactionEnabled"),
   groupMessageReactionEmoji: (value: unknown) => emojiValue(value, "groupMessageReactionEmoji"),

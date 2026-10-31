@@ -28,6 +28,7 @@ import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAs
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
 import { registerOwnerMentionAssistRoutes } from "./ownerMentionAssistRoutes.js";
 import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
+import { topicNativeModeEnabled, resetTopicNativeEnrollmentEpoch } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
 import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization } from "@lark-agent/conversation-runtime";
 
@@ -778,7 +779,7 @@ export function createRuntime(config: RuntimeConfig) {
   const ownerMessageSettings = () => ({ ownerMessageFastPathEnabled: store.setting("ownerMessageFastPathEnabled", "false") === "true", ownerMessageFastPathOwnerId: store.setting("ownerMessageFastPathOwnerId", "") });
   const ownerAssistSettings = () => ({ ownerMentionAssistEnabled: store.setting("ownerMentionAssistEnabled", "false") === "true", ownerMentionAssistOwnerId: store.setting("ownerMentionAssistOwnerId", "") });
   const executionSettings = () => ({ workspaceRoot, trustedExecutionEnabled: configuredTrustedExecutionEnabled() });
-  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...ownerAssistSettings(), ...executionSettings() });
+  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...ownerAssistSettings(), ...executionSettings(), topicNativeModeEnabled: topicNativeModeEnabled() });
   app.get("/v1/settings", async () => allSettings());
   app.patch("/v1/settings", async (request, reply) => {
     let payload: RuntimeSettingsPatch;
@@ -808,6 +809,7 @@ export function createRuntime(config: RuntimeConfig) {
           if (!store.db.prepare("SELECT 1 FROM settings WHERE key=?").get(key)) store.setSetting(key, workspaceRoot);
         }
       }
+      if (payload.topicNativeModeEnabled !== undefined && payload.topicNativeModeEnabled !== topicNativeModeEnabled()) resetTopicNativeEnrollmentEpoch();
       for (const [key, value] of runtimeSettingEntries(payload)) store.setSetting(key, value);
       if (payload.ownerMessageFastPathEnabled === true) store.setSetting("ownerMessageFastPathOwnerId", nextApproverId);
       if (payload.executionReceiptsEnabled === false) suppressPendingLarkExecutionReceipts();
