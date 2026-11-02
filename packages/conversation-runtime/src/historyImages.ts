@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
+import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 import type { LarkMessageRow } from "./context.js";
 import { downloadLarkImageToTask, imageKeysFromContent } from "./mediaImages.js";
 import { detectStickerImage } from "./stickers.js";
@@ -62,7 +63,7 @@ export function searchLarkHistoryImages(
   const items = rows.flatMap((row) => {
     const imageKeys = imageKeysFromContent(row.content);
     return imageKeys.length > 0 ? [{ localId: row.id, sentAt: row.message_at, senderId: row.sender_id,
-      imageCount: imageKeys.length, preview: (row.content ?? "").replace(/\[Image:[^\]]+\]|!\[[^\]]*\]\([^)]*\)/g, "[图片]").slice(0, 120) }] : [];
+      imageCount: imageKeys.length, preview: unicodeSafePrefix((row.content ?? "").replace(/\[Image:[^\]]+\]|!\[[^\]]*\]\([^)]*\)/g, "[图片]"), 120) }] : [];
   }).slice(0, limit);
   state.candidates = new Set(items.flatMap((item) => Array.from({ length: item.imageCount }, (_, index) => `${item.localId}:${index + 1}`)));
   const nextBeforeLocalId = items.length === limit ? items.at(-1)!.localId : rows.length === 160 ? rows.at(-1)!.id : null;

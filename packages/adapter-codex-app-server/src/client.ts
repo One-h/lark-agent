@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolveCodexExecutable } from "./executable.js";
+import { serializeCodexAppServerMessage } from "./unicode.js";
 
 export type CodexAppServerNotification = {
   method: string;
@@ -208,7 +209,9 @@ export class CodexAppServerClient {
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        const cause = error instanceof Error ? error : new Error(String(error));
+        this.lastError = cause.message;
+        reject(cause);
       }
     });
   }
@@ -218,7 +221,7 @@ export class CodexAppServerClient {
     if (!child || child.killed || !child.stdin.writable) {
       throw new Error("Codex app-server is not running");
     }
-    child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.stdin.write(`${serializeCodexAppServerMessage(message)}\n`);
   }
 
   private handleStdout(chunk: string): void {

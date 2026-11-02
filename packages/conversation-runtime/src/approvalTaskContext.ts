@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 
 export type ApprovalTaskContext = Array<{ messageId: number; request: string; result: string }>;
 
@@ -18,9 +19,9 @@ export function loadApprovalTaskContext(database: Database.Database, messageId: 
   const selected: ApprovalTaskContext = [];
   for (const row of rows) {
     if (remaining <= 0) break;
-    const request = (row.content ?? "").slice(0, Math.min(300, remaining));
+    const request = unicodeSafePrefix(row.content ?? "", Math.min(300, remaining));
     remaining -= request.length;
-    const result = (row.codex_reply ?? "").slice(0, Math.min(100, remaining));
+    const result = unicodeSafePrefix(row.codex_reply ?? "", Math.min(100, remaining));
     remaining -= result.length;
     selected.unshift({ messageId: row.id, request, result });
   }

@@ -8,6 +8,7 @@ import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { configureTurnApprovalReviewer, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews } from "./turnAutoApproval.js";
 import { turnApprovalModelPrompt } from "./turnApprovalReviewer.js";
+import { serializeCodexAppServerMessage } from "@lark-agent/adapter-codex-app-server";
 
 test("approval background is bounded, chronological and isolated by person, chat, thread, topic and time", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-approval-background-"));
@@ -43,9 +44,10 @@ test("approval background is bounded, chronological and isolated by person, chat
     });
     const decision = await reviewLarkTurnAutoApproval({ messageId: 20, turnId: "new-turn", senderId: "ou_sender", originalMessage: "这是第一次上线，为什么需要处理旧数据？", operation: 'forge.deploy.production: {"repo":"demo-api","apps":["demo-api"]}', cwd: root });
     assert.equal(sawBackground, true); assert.equal(decision.source, "model"); assert.equal(decision.approved, false);
-    for (let id = 11; id < 17; id++) add(id, { content: "x".repeat(1000), result: "y".repeat(1000) });
+    for (let id = 11; id < 17; id++) add(id, { content: "x".repeat(299) + "\u{1f4dd}" + "x".repeat(1000), result: "y".repeat(99) + "\u{1f4dd}" + "y".repeat(1000) });
     const bounded = loadApprovalTaskContext(store.db, 20, "ou_sender");
     assert.equal(bounded.length, 6);
     assert.ok(bounded.reduce((n, row) => n + row.request.length + row.result.length, 0) <= 2400);
+    assert.doesNotThrow(() => serializeCodexAppServerMessage({ context: bounded }));
   } finally { stopLarkTurnAutoApprovalReviews(); configureTurnApprovalReviewer(); store.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });

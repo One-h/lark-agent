@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
+import { serializeCodexAppServerMessage } from "@lark-agent/adapter-codex-app-server";
 import { createHistoryImageBudget, createHistoryImageState, historyImagesAllowed, openLarkHistoryImage, searchLarkHistoryImages } from "./historyImages.js";
 
 test("history image search and open stay within the current chat, topic and turn candidates", async () => {
@@ -23,7 +24,7 @@ test("history image search and open stay within the current chat, topic and turn
     assert.equal(historyImagesAllowed(true, null), false);
     assert.equal(historyImagesAllowed(false, "unknown"), false);
     const single = add("om_single", "oc_group", "image", "[Image: img_single]");
-    const post = add("om_post", "oc_group", "post", "![Image](img_first) ![Image](img_second)");
+    const post = add("om_post", "oc_group", "post", "x".repeat(119) + "\u{1f4dd} ![Image](img_first) ![Image](img_second)");
     const rootId = add("om_root", "oc_group", "post", "![Image](img_topic_root)");
     const topic = add("om_topic", "oc_group", "image", "[Image: img_topic]", "thread_A", "om_root");
     const other = add("om_other", "oc_other", "image", "[Image: img_other]");
@@ -32,7 +33,10 @@ test("history image search and open stay within the current chat, topic and turn
     const state = createHistoryImageState();
     const search = searchLarkHistoryImages(store.db, main, state, { limit: 10 });
     assert.equal(search.success, true);
-    const listed = JSON.parse((search.contentItems[0] as { text: string }).text) as { images: Array<{ localId: number; imageCount: number }> };
+    assert.doesNotThrow(() => serializeCodexAppServerMessage(search));
+    const listed = JSON.parse((search.contentItems[0] as { text: string }).text) as { images: Array<{ localId: number; imageCount: number; preview: string }> };
+    assert.doesNotMatch(listed.images[0].preview, /[\uD800-\uDFFF]/u);
+    assert.ok(listed.images[0].preview.length <= 120);
     assert.deepEqual(listed.images.map((item) => [item.localId, item.imageCount]), [[post, 2], [single, 1]]);
     const firstPage = searchLarkHistoryImages(store.db, main, createHistoryImageState(), { limit: 1 });
     const firstPageBody = JSON.parse((firstPage.contentItems[0] as { text: string }).text) as { nextBeforeLocalId: number };
