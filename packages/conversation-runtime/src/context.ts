@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 import { sendLarkProgressCard, updateLarkProgressCard } from "@lark-agent/adapter-lark-cli";
 import { sendLarkTextReply, sendLarkMediaReply, sendLarkReaction, type LarkSentMessage, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
 
@@ -206,5 +207,5 @@ export function addLocalAuditEvent(_action: string, _summary: string, _details?:
 export function larkSenderReplyProfile(senderId: string | null): { replyTone: string } | null {
   if (!senderId) return null;
   const stored = appSettingValue("larkSenderReplyProfiles"); if (!stored) return null;
-  try { const profile = (JSON.parse(stored) as Record<string, { replyTone?: unknown }>)[senderId]; return typeof profile?.replyTone === "string" && profile.replyTone.trim() ? { replyTone: profile.replyTone.trim().slice(0, 300) } : null; } catch { return null; }
+  try { const profile = (JSON.parse(stored) as Record<string, { replyTone?: unknown }>)[senderId]; return typeof profile?.replyTone === "string" && profile.replyTone.trim() ? { replyTone: unicodeSafePrefix(profile.replyTone.trim(), 300) } : null; } catch { return null; }
 }

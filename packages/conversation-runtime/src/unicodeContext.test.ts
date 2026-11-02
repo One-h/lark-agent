@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { serializeCodexAppServerMessage } from "@lark-agent/adapter-codex-app-server";
-import { configureConversationRuntime } from "./context.js";
+import { configureConversationRuntime, larkSenderReplyProfile, setAppSettingValue } from "./context.js";
 import { buildLarkCodexDeltaPrompt, buildLarkCodexPrompt, buildLarkCodexUserInput, formatRecentLarkMessages } from "./responder.js";
 
 test("quoted emoji at the incident boundary produces valid full, delta and native-topic requests", () => {
@@ -13,6 +13,8 @@ test("quoted emoji at the incident boundary produces valid full, delta and nativ
   const store = new SqliteAgentStore(path.join(root, "test.sqlite"));
   try {
     configureConversationRuntime({ database: store.db, repoRoot: root, larkStickerDirectory: path.join(root, "stickers") });
+    setAppSettingValue("larkSenderReplyProfiles", JSON.stringify({ ou_fixture: { replyTone: "z".repeat(299) + "\u{1f4dd}" + " tail" } }));
+    assert.equal(larkSenderReplyProfile("ou_fixture")?.replyTone, "z".repeat(299));
     const quote = "x".repeat(118) + "\u{1f4dd}" + " reference tail";
     const broken = quote.slice(0, 119) + "...";
     assert.match(broken, /[\uD800-\uDFFF]/u);
