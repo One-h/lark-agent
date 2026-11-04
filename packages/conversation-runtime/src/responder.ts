@@ -201,6 +201,7 @@ type ActiveLarkCodexRun = {
   memberReplies: Map<number, string>;
   approvalOutcomeReplies: Map<number, string>;
   responseMemberId: number | null;
+  acceptedSteerMessageId: number | null;
   lastAgentMessage: string | null;
   finalAgentMessage: string | null;
   hasStartedWork: boolean;
@@ -1915,6 +1916,12 @@ function responseRunMember(run: ActiveLarkCodexRun): PreparedLarkCodexMessage {
   return (run.responseMemberId ? run.members.get(run.responseMemberId) : null) ?? latestRunMember(run);
 }
 
+function approvalRunMember(run: ActiveLarkCodexRun): PreparedLarkCodexMessage {
+  const response = responseRunMember(run);
+  const accepted = run.acceptedSteerMessageId === null ? undefined : run.members.get(run.acceptedSteerMessageId);
+  return accepted && accepted.row.id > response.row.id ? accepted : response;
+}
+
 function runMemberByMessageId(run: ActiveLarkCodexRun, messageId: string): PreparedLarkCodexMessage | null {
   return [...run.members.values()].find((prepared) => prepared.messageId === messageId) ?? null;
 }
@@ -3352,7 +3359,7 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     return true;
   }
   details.turnId = run.turnId;
-  const target = responseRunMember(run);
+  const target = approvalRunMember(run);
   if (target.row.reply_trigger === "owner_mention" && ["execCommandApproval","applyPatchApproval"].includes(request.method)) {
     codexAppServer.respondToRequest(request.id,details.rejectedResponse);
     appendPreparedError(target,"Owner assistance requires an approval protocol bound to an explicit native turn.");
@@ -3397,24 +3404,39 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
 
   if (turnAutoApprovalEnabled()) {
     const approvalTurnId = run.turnId;
-    void reviewLarkTurnAutoApproval({
-      messageId: target.row.id, turnId: run.turnId, senderId: target.row.sender_id,
-      originalMessage: target.row.content ?? "", operation: details.operation, cwd: details.cwd ?? config.workspaceRoot
+    const approvalThreadId = run.threadId;
+    const cwd = details.cwd ?? config.workspaceRoot;
+    const approvalInput = (member: PreparedLarkCodexMessage) => ({
+      messageId: member.row.id, turnId: approvalTurnId, senderId: member.row.sender_id,
+      originalMessage: member.row.content ?? "", operation: details.operation, cwd
+    });
+    void reviewLarkTurnAutoApproval(approvalInput(target), () => {
+      if (request.method !== "item/commandExecution/requestApproval"
+        || run.settled || run.authRecovering || run.turnId !== approvalTurnId || run.threadId !== approvalThreadId
+        || activeLarkCodexRuns.get(run.sessionKey) !== run || !turnAutoApprovalEnabled() || config.larkExecutionApproverId !== approverId) return;
+      const latest = approvalRunMember(run);
+      if (latest.row.id <= target.row.id || latest.row.sender_id !== target.row.sender_id
+        || latest.row.reply_trigger === "owner_mention" || target.row.reply_trigger === "owner_mention") return;
+      return { ...approvalInput(latest), requestId: request.id };
     }).then((decision) => {
-      if (run.authRecovering || run.turnId !== approvalTurnId) return;
+      if (run.authRecovering || run.turnId !== approvalTurnId || run.threadId !== approvalThreadId) return;
       if (run.settled || activeLarkCodexRuns.get(run.sessionKey) !== run) {
         codexAppServer.respondToRequest(request.id, details.rejectedResponse);
         return;
       }
-      const currentTarget = responseRunMember(run);
+      const currentTarget = approvalRunMember(run);
       const review = decision.reviewId ? db.prepare("SELECT model FROM lark_turn_auto_reviews WHERE id=?").get(decision.reviewId) as { model?: string | null } | undefined : undefined;
-      appendPreparedLog(target, { method: "approval/autoReview", params: { ...decision, turnId: run.turnId, model: review?.model ?? null } });
+      const { recheckedInput, ...audit } = decision;
+      appendPreparedLog(target, { method: "approval/autoReview", params: { ...audit, recheckedMessageId: recheckedInput?.messageId, turnId: run.turnId, model: review?.model ?? null } });
       if (decision.approved && turnAutoApprovalEnabled() && config.larkExecutionApproverId === approverId
-        && currentTarget.row.id === target.row.id) {
-        run.turnApprovalRequesterId = target.row.sender_id;
+        && run.pendingSteers === 0
+        && currentTarget.row.sender_id === target.row.sender_id
+        && currentTarget.row.id === (recheckedInput?.messageId ?? target.row.id)
+        && (!recheckedInput || recheckedInput.requestId === request.id)) {
+        run.turnApprovalRequesterId = currentTarget.row.sender_id;
         run.turnApprovalApproverId = approverId;
         run.turnApprovalAutoReviewId = decision.reviewId ?? null;
-        autoApproveTurnExecution(run, request, details, target);
+        autoApproveTurnExecution(run, request, details, currentTarget);
         if (decision.reviewId && run.turnApprovalRequesterId) markTurnAutoApprovalApplied(decision.reviewId);
       } else {
         const currentApprover = config.larkExecutionApproverId;
@@ -3422,10 +3444,10 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
         else codexAppServer.respondToRequest(request.id, details.rejectedResponse);
       }
     }).catch((error) => {
-      if (run.settled || run.authRecovering || run.turnId !== approvalTurnId) return;
+      if (run.settled || run.authRecovering || run.turnId !== approvalTurnId || run.threadId !== approvalThreadId) return;
       appendPreparedError(target, `Automatic approval failed: ${error instanceof Error ? error.message : String(error)}`);
       const currentApprover = config.larkExecutionApproverId;
-      if (currentApprover) requestManualExecutionApproval(run, request, details, responseRunMember(run), currentApprover);
+      if (currentApprover) requestManualExecutionApproval(run, request, details, approvalRunMember(run), currentApprover);
       else codexAppServer.respondToRequest(request.id, details.rejectedResponse);
     });
     return true;
@@ -3859,6 +3881,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     memberReplies: new Map<number, string>(),
     approvalOutcomeReplies: new Map<number, string>(),
     responseMemberId: prepared.row.id,
+    acceptedSteerMessageId: null,
     lastAgentMessage: null,
     finalAgentMessage: null,
     hasStartedWork: false,
@@ -3938,6 +3961,8 @@ async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedL
       input: prepared.input,
       clientUserMessageId: prepared.messageId
     });
+    // The steer acknowledgement can precede the native user-message notification.
+    run.acceptedSteerMessageId = Math.max(run.acceptedSteerMessageId ?? 0, prepared.row.id);
     acceptPreparedPrompt(prepared, run.threadId, run.turnId);
     recordAcceptedExecutionConfig(prepared, { ...run.executionConfig, action: "turn/steer", recordedAt: nowIso() });
     writeSessionArtifact(prepared, { action: "turn/steer", previousThreadId: run.threadId, threadId: run.threadId, turnId: run.turnId });

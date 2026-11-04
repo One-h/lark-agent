@@ -8,7 +8,7 @@ import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { codexAppServer } from "./codexRuntime.js";
 import { parseLarkExecutionConfigs } from "./executionConfig.js";
-import { configureTurnApprovalReviewer } from "./turnAutoApproval.js";
+import { configureTurnApprovalReviewer, type ModelApprovalDecision, type TurnApprovalInput } from "./turnAutoApproval.js";
 import { decideLarkExecutionApproval, enqueueLarkCodexReply, stopLarkCodexResponder } from "./responder.js";
 
 async function until(predicate: () => boolean): Promise<void> {
@@ -19,7 +19,7 @@ async function until(predicate: () => boolean): Promise<void> {
   }
 }
 
-function fixture() {
+function fixture(emitSteerNotification = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-capacity-recovery-"));
   const executable = path.join(root, "codex.mjs");
   const log = path.join(root, "rpc.jsonl");
@@ -39,7 +39,7 @@ readline.createInterface({input: process.stdin}).on("line", line => {
   else if (m.method === "turn/start") { fs.writeFileSync(counter, String(++turn)); send({id: m.id, result: {turn: {id: "turn-" + turn, status: "inProgress"}}}); }
   else if (m.method === "turn/steer") {
     send({id: m.id, result: {}});
-    send({method: "item/completed", params: {turnId: m.params.expectedTurnId, item: {type: "userMessage", clientId: m.params.clientUserMessageId}}});
+    if (${emitSteerNotification}) send({method: "item/completed", params: {turnId: m.params.expectedTurnId, item: {type: "userMessage", clientId: m.params.clientUserMessageId}}});
   } else if (m.method === "fixture/emit") {
     send({id: m.id, result: {}});
     for (const n of m.params.notifications) send(n);
@@ -60,10 +60,10 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     textReplySender: (_messageId, text) => { delivered.push(text); return {ok: true, messageId: `om_sent_${delivered.length}`, chatId: "oc_fixture", messageAt: null, messageType: "text"}; }
   });
   for (const [key, value] of Object.entries({stickerUsageMode: "off", executionReceiptsEnabled: "false", interimRepliesEnabled: "false"})) setAppSettingValue(key, value);
-  const add = (id: number, content = "唯一原始请求：核对发布版本") => {
+  const add = (id: number, content = "唯一原始请求：核对发布版本", sender = "ou_sender") => {
     const now = new Date().toISOString();
     store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,message_at,raw_json,received_at,created_at)
-      VALUES (?,?,'oc_fixture','p2p','ou_sender','user','text',?,1,'p2p','pending',?,'{}',?,?)`).run(id, `om_${id}`, content, now, now, now);
+      VALUES (?,?,'oc_fixture','p2p',?,'user','text',?,1,'p2p','pending',?,'{}',?,?)`).run(id, `om_${id}`, sender, content, now, now, now);
     assert.equal(enqueueLarkCodexReply(id), true);
   };
   const row = (id = 1) => store.db.prepare("SELECT codex_status,codex_turn_id,codex_task_dir FROM lark_messages WHERE id=?").get(id) as {codex_status: string; codex_turn_id: string; codex_task_dir: string};
@@ -204,6 +204,86 @@ test("an interrupted automatic approval cannot grant or create cards for a recov
     assert.equal(decideLarkExecutionApproval(next.token, "approve-turn").ok, true);
     await f.complete();
   } finally { release(); configureTurnApprovalReviewer(); await f.close(); }
+});
+
+test("an approved command is rechecked once after an accepted same-sender steer", async t => {
+  for (const outcome of ["approve_turn", "steer-ack-only", "manual", "superseded", "ended", "different-sender", "restricted", "parallel-command"] as const) {
+    await t.test(outcome, async () => {
+      const f = fixture(outcome !== "steer-ack-only");
+      const reviews: Array<{ input: TurnApprovalInput; resolve: (decision: ModelApprovalDecision) => void }> = [];
+      configureTurnApprovalReviewer(input => new Promise(resolve => reviews.push({input, resolve})));
+      const response = () => f.records().find(r => r.id === "review-steer" && r.result);
+      const cards = () => f.store.db.prepare("SELECT token,lark_message_id FROM lark_execution_approvals WHERE card_message_id IS NOT NULL").all() as Array<{token: string; lark_message_id: number}>;
+      const steer = async (id: number, content: string, sender?: string) => {
+        f.add(id, content, sender);
+        await until(() => {
+          const row = f.row(id);
+          if (row.codex_turn_id !== "turn-1") return false;
+          return JSON.parse(fs.readFileSync(path.join(row.codex_task_dir, "resume-session.json"), "utf8")).action === "turn/steer";
+        });
+      };
+      try {
+        await f.ready();
+        setAppSettingValue("turnAutoApprovalEnabled", "true");
+        await f.approval("review-steer", "kubectl get pods");
+        await until(() => reviews.length === 1);
+        await steer(2, outcome === "restricted" ? "回滚服务" : "只核对就绪状态", outcome === "different-sender" ? "ou_other" : undefined);
+        reviews[0].resolve({decision: "approve_turn", reason: "original scope"});
+        if (outcome === "different-sender" || outcome === "restricted") {
+          await until(() => cards().length === 1);
+          assert.equal(cards()[0].lark_message_id, 2);
+          assert.equal(reviews.length, 1);
+          assert.equal(response(), undefined);
+          assert.equal(decideLarkExecutionApproval(cards()[0].token, "reject").ok, true);
+          await until(() => response()?.result.decision === "decline");
+          return;
+        }
+        await until(() => reviews.length === 2);
+        assert.equal(response(), undefined);
+        assert.deepEqual(cards(), []);
+        assert.equal(reviews[1].input.messageId, 2);
+        assert.equal(reviews[1].input.operation, reviews[0].input.operation);
+        assert.equal(reviews[1].input.originalMessage, "只核对就绪状态");
+        assert.deepEqual(reviews[1].input.taskContext?.map(row => row.messageId), [1]);
+        if (outcome === "parallel-command") {
+          await f.approval("parallel-approval", "kubectl get pods");
+          // The fixture sends approval RPCs before the subsequent emit response.
+          await f.emit([]);
+        }
+        if (outcome === "superseded") await steer(3, "另一个目标");
+        if (outcome === "ended") await f.complete();
+        reviews[1].resolve({decision: outcome === "manual" ? "manual" : "approve_turn", reason: "rechecked scope"});
+        const audit = () => f.store.db.prepare("SELECT lark_message_id, decision, applied_at FROM lark_turn_auto_reviews").get() as {lark_message_id: number; decision: string; applied_at: string | null};
+        if (outcome === "approve_turn" || outcome === "steer-ack-only" || outcome === "parallel-command") {
+          await until(() => response()?.result.decision === "accept");
+          if (outcome === "parallel-command") {
+            await until(() => cards().length === 1);
+            assert.equal(f.records().some(r => r.id === "parallel-approval" && r.result?.decision === "accept"), false);
+            assert.equal(decideLarkExecutionApproval(cards()[0].token, "reject").ok, true);
+          } else assert.deepEqual(cards(), []);
+          assert.equal(audit().lark_message_id, 2);
+          assert.ok(audit().applied_at);
+        } else if (outcome === "ended") {
+          await until(() => audit().decision === "manual");
+          assert.notEqual(response()?.result.decision, "accept");
+          assert.deepEqual(cards(), []);
+          assert.equal(audit().applied_at, null);
+        } else {
+          await until(() => cards().length === 1);
+          assert.equal(cards()[0].lark_message_id, outcome === "superseded" ? 3 : 2);
+          assert.equal(audit().applied_at, null);
+          assert.equal(response(), undefined);
+          assert.equal(decideLarkExecutionApproval(cards()[0].token, "reject").ok, true);
+          await until(() => response()?.result.decision === "decline");
+        }
+        assert.equal(reviews.length, 2);
+      } finally {
+        for (const review of reviews) review.resolve({decision: "manual", reason: "fixture cleanup"});
+        configureTurnApprovalReviewer();
+        await f.close();
+      }
+    });
+  }
 });
 
 test("capacity recovery stops after three retries and leaves the failure visible", async t => {

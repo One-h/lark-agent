@@ -376,7 +376,9 @@ export function createRuntime(config: RuntimeConfig) {
         assertActive();
         if (!await confirmTurn(larkMessageId, turnId)) throw new Error("自动审核返回时原生会话已失效，操作未执行。");
         assertActive();
-        automaticallyApproved = decision.approved && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover;
+        // A recheck covers the pending native command, not another host operation sharing the turn.
+        automaticallyApproved = decision.approved && !decision.recheckedInput
+          && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover;
         if (automaticallyApproved && decision.reviewId) markTurnAutoApprovalApplied(decision.reviewId);
       }
       if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id, operation: `${capability.title}: ${textResult(input)}`, originalMessage: message.content }, signal)) throw new Error("Operation was not approved or its turn ended");
