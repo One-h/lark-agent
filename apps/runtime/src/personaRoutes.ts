@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { captureConversationStyle, composeConversationStyle, conversationStickerUsageSettings, larkStickerUsageModes, parsePersonaInput, saveConversationPersona, setConversationStickerUsageMode, validPersonaChatId } from "@lark-agent/conversation-runtime";
 import { conversationSpontaneousSettings, setConversationSpontaneousSettings, type ConversationSpontaneousMode } from "@lark-agent/conversation-runtime";
 import { strictSettingsObject } from "./settingsSchema.js";
+import { conversationCodexModelSettings, setConversationCodexModel, validLarkCodexModel } from "@lark-agent/conversation-runtime";
 import { ownerMentionAssistSettings, setOwnerMentionAssistMode, refreshOwnerAssistPolicies, type OwnerMentionAssistMode } from "@lark-agent/conversation-runtime";
 
 export function registerPersonaRoutes(app: FastifyInstance, authenticated: (request: FastifyRequest) => boolean, ownerAssistAvailable = true) {
@@ -36,11 +37,15 @@ export function registerPersonaRoutes(app: FastifyInstance, authenticated: (requ
       const { chatId } = request.params as { chatId: string };
       if (!validPersonaChatId(chatId)) return reply.code(400).send({ code: "INVALID_CHAT_ID", message: "无效的飞书会话 ID", traceId: request.id });
       if (request.method === "PATCH") {
-        try { strictSettingsObject(request.body, ["stickerUsageMode", "spontaneousMode", "spontaneousReplyRate", "spontaneousReplyCooldownMs", "ownerMentionAssistMode"], "conversation settings"); }
+        try { strictSettingsObject(request.body, ["stickerUsageMode", "spontaneousMode", "spontaneousReplyRate", "spontaneousReplyCooldownMs", "ownerMentionAssistMode", "codexModel"], "conversation settings"); }
         catch (error) { return reply.code(400).send({ code: "INVALID_CONVERSATION_SETTINGS", message: error instanceof Error ? error.message : String(error), traceId: request.id }); }
-        const body = request.body as { stickerUsageMode?: unknown; spontaneousMode?: unknown; spontaneousReplyRate?: unknown; spontaneousReplyCooldownMs?: unknown; ownerMentionAssistMode?: unknown } | null;
+        const body = request.body as { stickerUsageMode?: unknown; spontaneousMode?: unknown; spontaneousReplyRate?: unknown; spontaneousReplyCooldownMs?: unknown; ownerMentionAssistMode?: unknown; codexModel?: unknown } | null;
         const mode = body?.stickerUsageMode;
-        if (mode === undefined && body?.spontaneousMode === undefined && body?.spontaneousReplyRate === undefined && body?.spontaneousReplyCooldownMs === undefined && body?.ownerMentionAssistMode === undefined) {
+        const model = typeof body?.codexModel === "string" ? body.codexModel.trim() : body?.codexModel;
+        if (model !== undefined && model !== null && (typeof model !== "string" || !validLarkCodexModel(model))) {
+          return reply.code(400).send({ code: "INVALID_CODEX_MODEL", message: "请输入有效的模型 ID", traceId: request.id });
+        }
+        if (model === undefined && mode === undefined && body?.spontaneousMode === undefined && body?.spontaneousReplyRate === undefined && body?.spontaneousReplyCooldownMs === undefined && body?.ownerMentionAssistMode === undefined) {
           return reply.code(400).send({ code: "INVALID_CONVERSATION_SETTINGS", message: "没有可更新的会话设置", traceId: request.id });
         }
         if (mode !== undefined && mode !== "global" && !larkStickerUsageModes.includes(mode as typeof larkStickerUsageModes[number])) {
@@ -60,12 +65,13 @@ export function registerPersonaRoutes(app: FastifyInstance, authenticated: (requ
           return reply.code(400).send({ code: "INVALID_SPONTANEOUS_SETTINGS", message: "无效的群聊随机插话设置", traceId: request.id });
         }
         if (mode !== undefined) setConversationStickerUsageMode(chatId, mode as "global" | typeof larkStickerUsageModes[number]);
+        if (model !== undefined) setConversationCodexModel(chatId, model);
         if (body?.ownerMentionAssistMode !== undefined) { setOwnerMentionAssistMode(chatId, body.ownerMentionAssistMode as OwnerMentionAssistMode); refreshOwnerAssistPolicies(chatId); }
         if (spontaneousMode !== undefined || replyRate !== undefined || cooldownMs !== undefined) {
           setConversationSpontaneousSettings(chatId, { mode: spontaneousMode as ConversationSpontaneousMode | undefined, replyRate: replyRate as number | undefined, cooldownMs: cooldownMs as number | undefined });
         }
       }
-      return { stickerUsage: conversationStickerUsageSettings(chatId), spontaneousReply: conversationSpontaneousSettings(chatId), ownerMentionAssist: ownerMentionAssistSettings(chatId) };
+      return { codexModel: conversationCodexModelSettings(chatId), stickerUsage: conversationStickerUsageSettings(chatId), spontaneousReply: conversationSpontaneousSettings(chatId), ownerMentionAssist: ownerMentionAssistSettings(chatId) };
     }
   });
 }

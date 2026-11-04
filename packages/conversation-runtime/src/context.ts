@@ -160,6 +160,17 @@ export function configuredLarkCodexModel(): string {
   return stored && validLarkCodexModel(stored) ? stored : config.larkCodexModel;
 }
 
+export function conversationCodexModelSettings(chatId?: string | null): { override: string | null; effectiveModel: string; globalModel: string } {
+  const stored = chatId && db ? appSettingValue(`conversation.codexModel:${chatId}`) : undefined;
+  const override = stored && validLarkCodexModel(stored) ? stored : null;
+  const globalModel = configuredLarkCodexModel();
+  return { override, effectiveModel: override ?? globalModel, globalModel };
+}
+
+export function setConversationCodexModel(chatId: string, model: string | null): void {
+  setAppSettingValue(`conversation.codexModel:${chatId}`, model ?? "");
+}
+
 export const larkCodexReasoningEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type LarkCodexReasoningEffort = typeof larkCodexReasoningEfforts[number];
 

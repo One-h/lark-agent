@@ -26,6 +26,7 @@ import { isNativeTopicConversation } from "./topicNativeMode.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
+import { conversationCodexModelSettings } from "./context.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions } from "./completionReactions.js";
 import { decideOwnerMentionAssist, deferOwnerAssistDelivery, ensureOwnerMentionAssist, finishOwnerMentionAssist, markOwnerAssistSent,
@@ -796,10 +797,10 @@ ${recentMessages ? `${recentMessages}\n` : ""}
 ${latestMessage}`;
 }
 
-export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "new" | "resume" = "new"): Record<string, unknown> {
+export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "new" | "resume" = "new", model = configuredLarkCodexModel()): Record<string, unknown> {
   return {
     cwd: config.workspaceRoot,
-    model: configuredLarkCodexModel() || null,
+    model: model || null,
     approvalPolicy: trustedSender ? "never" : "on-request",
     approvalsReviewer: "user",
     sandbox: trustedSender ? "danger-full-access" : "read-only",
@@ -810,14 +811,14 @@ export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "n
   };
 }
 
-export function buildLarkCodexTurnParams(prepared: Pick<PreparedLarkCodexMessage, "input" | "messageId" | "trustedSender"> & Partial<Pick<PreparedLarkCodexMessage,"row">>, threadId: string): Record<string, unknown> {
+export function buildLarkCodexTurnParams(prepared: Pick<PreparedLarkCodexMessage, "input" | "messageId" | "trustedSender"> & Partial<Pick<PreparedLarkCodexMessage,"row">>, threadId: string, model = conversationCodexModelSettings(prepared.row?.chat_id).effectiveModel): Record<string, unknown> {
   const ownerAssist = prepared.row?.reply_trigger === "owner_mention";
   return {
     threadId,
     input: prepared.input,
     clientUserMessageId: prepared.messageId,
     cwd: config.workspaceRoot,
-    model: configuredLarkCodexModel() || null,
+    model: model || null,
     effort: configuredLarkCodexReasoningEffort(),
     approvalPolicy: prepared.trustedSender && !ownerAssist ? "never" : "on-request",
     ...(ownerAssist ? { sandboxPolicy: { type: "readOnly", networkAccess: false } } : {}),
@@ -1857,7 +1858,7 @@ function writeSessionArtifact(
     promptMode: prepared.promptMode,
     stableInstructions: prepared.promptInstructions ? (prepared.promptInstructions.included ? "included" : "reused") : "pending",
     stableInstructionFingerprint: prepared.promptInstructions?.fingerprint ?? null,
-    configuredModel: prepared.executionConfig?.model ?? configuredLarkCodexModel(),
+    configuredModel: prepared.executionConfig?.model ?? conversationCodexModelSettings(prepared.row.chat_id).effectiveModel,
     appliedModel: prepared.executionConfig?.model ?? null,
     reasoningEffort: prepared.executionConfig?.reasoningEffort ?? null,
     modelPolicy: prepared.executionConfig ? "accepted-turn-parameters" : "pending-thread-resolution"
@@ -2711,7 +2712,8 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
   promptInstructionCache.clear();
   codexAppServer.stop();
   try {
-    const threadParams = buildLarkCodexThreadParams(run.trustedSender && prepared.row.reply_trigger !== "owner_mention", "resume");
+    const model = conversationCodexModelSettings(prepared.row.chat_id).effectiveModel;
+    const threadParams = buildLarkCodexThreadParams(run.trustedSender && prepared.row.reply_trigger !== "owner_mention", "resume", model);
     const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", {
       threadId: previousThreadId,
       ...threadParams
@@ -2719,7 +2721,7 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
     const threadId = resumed.thread.id;
     loadedLarkThreadParameters.set(threadId, threadParams);
     updatePreparedPrompt(prepared, prepared.promptMode ?? "full", threadId);
-    const turnParams = buildLarkCodexTurnParams(prepared, threadId);
+    const turnParams = buildLarkCodexTurnParams(prepared, threadId, model);
     const turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
     acceptPreparedPrompt(prepared, threadId, turn.turn.id);
 
@@ -3730,7 +3732,8 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   prepared.conversationStyle = captureConversationStyle(prepared.row.chat_id);
   prepared.promptMode = null;
   const previousSession = larkCodexSessionForMessage(prepared.row, prepared.trustedSender);
-  const resumeParams = buildLarkCodexThreadParams(prepared.trustedSender && prepared.row.reply_trigger !== "owner_mention", "resume");
+  const model = conversationCodexModelSettings(prepared.row.chat_id).effectiveModel;
+  const resumeParams = buildLarkCodexThreadParams(prepared.trustedSender && prepared.row.reply_trigger !== "owner_mention", "resume", model);
   let createdThread = false;
   let threadId = previousSession?.codex_session_id ?? null;
 
@@ -3766,7 +3769,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   }
   if (!threadId) {
     updatePreparedPrompt(prepared, "full");
-    const startParams = buildLarkCodexThreadParams(prepared.trustedSender && prepared.row.reply_trigger !== "owner_mention", "new");
+    const startParams = buildLarkCodexThreadParams(prepared.trustedSender && prepared.row.reply_trigger !== "owner_mention", "new", model);
     const started = await codexAppServer.request<ThreadResponse>("thread/start", startParams);
     threadId = started.thread.id;
     loadedLarkThreadParameters.set(threadId, startParams);
@@ -3782,7 +3785,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
   updateCodexState(prepared.row.id, { status: "running", sessionId: threadId, heartbeatAt: nowIso(), taskDir: prepared.taskDir });
   setLarkThreadDisplayName(threadId, prepared);
-  let turnParams = buildLarkCodexTurnParams(prepared, threadId);
+  let turnParams = buildLarkCodexTurnParams(prepared, threadId, model);
   let turn: TurnStartResponse;
   try {
     turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
@@ -3796,7 +3799,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
       threadId = resumed.thread.id;
       loadedLarkThreadParameters.set(threadId, resumeParams);
       upsertLarkCodexSession(prepared.row, prepared.trustedSender, threadId);
-      turnParams = buildLarkCodexTurnParams(prepared, threadId);
+      turnParams = buildLarkCodexTurnParams(prepared, threadId, model);
       turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
     } else if (recovery === "restart-app-server") {
       if (activeLarkCodexRuns.size > 0) {

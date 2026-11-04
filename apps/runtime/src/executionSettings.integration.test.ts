@@ -46,10 +46,10 @@ readline.createInterface({input: process.stdin}).on("line", line => {
   const runtime = createRuntime({databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: workspaceA, trustedSenderIds: ["ou_sender"], reactionSender: () => ({ok: true})});
   const row = (id: number) => runtime.store.db.prepare("SELECT codex_status,codex_turn_id,codex_session_id,codex_task_dir FROM lark_messages WHERE id=?").get(id) as {codex_status: string; codex_turn_id: string; codex_session_id: string; codex_task_dir: string};
   const records = () => fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
-  const start = async (id: number, expectedTurn = id) => {
+  const start = async (id: number, expectedTurn = id, chatId = "oc_same", chatType = "p2p") => {
     const now = new Date().toISOString();
     runtime.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_status,codex_status,raw_json,received_at,created_at)
-      VALUES (?,?,'oc_same','p2p','ou_sender','user','text','fixture request',1,'pending','failed','{}',?,?)`).run(id, `om_${id}`, now, now);
+      VALUES (?,?,?,?,'ou_sender','user','text','fixture request',1,'pending','failed','{}',?,?)`).run(id, `om_${id}`, chatId, chatType, now, now);
     assert.equal(enqueueLarkCodexReply(id), true);
     await until(() => row(id).codex_turn_id === `settings-turn-${expectedTurn}`);
   };
@@ -58,6 +58,9 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     await codexAppServer.request("fixture/complete", {});
     await until(() => row(id).codex_status === "no_reply");
   };
+  const chatSettings = (chat: string, model: string | null) => runtime.app.inject({
+    method: "PATCH", url: `/v1/chats/${chat}/settings`, payload: { codexModel: model }
+  });
   try {
     await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {trustedExecutionEnabled: true, stickerUsageMode: "off", executionReceiptsEnabled: false, codexModel: "model-a", reasoningEffort: "high"}});
     await start(1);
@@ -70,6 +73,10 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     const busy = await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {workspaceRoot: workspaceB, trustedExecutionEnabled: false}});
     assert.equal(busy.statusCode, 409);
     await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {codexModel: "model-b", reasoningEffort: "low"}});
+    const p2pOverride = await chatSettings("oc_same", " provider/private-model ");
+    assert.equal(p2pOverride.statusCode, 200, p2pOverride.body);
+    assert.deepEqual(p2pOverride.json().codexModel, { override: "provider/private-model", effectiveModel: "provider/private-model", globalModel: "model-b" });
+    assert.equal((await chatSettings("oc_same", "../invalid")).statusCode, 400);
     await runtime.app.inject({method: "PUT", url: "/v1/chats/oc_same/persona", payload: {mode: "custom", name: "新版人设", instructions: "new persona"}});
     await start(2, 1);
     await until(() => fs.existsSync(path.join(row(2).codex_task_dir, "execution-configs.jsonl")));
@@ -88,8 +95,9 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     const resumed = calls.filter(r => r.method === "thread/resume").at(-1);
     assert.equal(resumed.params.threadId, row(1).codex_session_id);
     assert.equal(resumed.params.cwd, workspaceB);
+    assert.equal(resumed.params.model, "provider/private-model");
     assert.equal(row(1).codex_session_id, row(3).codex_session_id);
-    assert.equal(snapshots(3)[0].model, "model-b");
+    assert.equal(snapshots(3)[0].model, "provider/private-model");
     assert.equal(snapshots(3)[0].reasoningEffort, "low");
     assert.equal(snapshots(3)[0].persona.name, "新版人设");
     const secondTurn = calls.filter(r => r.method === "turn/start")[1];
@@ -99,6 +107,8 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     assert.equal(artifact.workspaceRoot, workspaceB);
     assert.equal(artifact.promptMode, "full");
     await complete(3);
+    const inherited = await chatSettings("oc_same", null);
+    assert.deepEqual(inherited.json().codexModel, { override: null, effectiveModel: "model-b", globalModel: "model-b" });
     assert.equal((await runtime.app.inject({method: "PATCH", url: "/v1/settings", payload: {trustedExecutionEnabled: false}})).statusCode, 200);
     await start(4, 3);
     calls = records();
@@ -106,10 +116,18 @@ readline.createInterface({input: process.stdin}).on("line", line => {
     const untrusted = calls.filter(r => r.method === "thread/start").at(-1);
     assert.equal(untrusted.params.sandbox, "read-only");
     assert.equal(untrusted.params.approvalPolicy, "on-request");
+    assert.equal(untrusted.params.model, "model-b");
     assert.equal(calls.filter(r => r.method === "turn/start").at(-1).params.cwd, workspaceB);
     assert.equal(snapshots(4)[0].sandbox, "read-only");
     await complete(4);
-    assert.equal((runtime.store.db.prepare("SELECT count(*) AS n FROM lark_messages").get() as {n: number}).n, 4);
+    assert.equal((await chatSettings("oc_group", "group-model")).statusCode, 200);
+    await start(5, 4, "oc_group", "group");
+    assert.equal(records().filter(r => r.method === "thread/start").at(-1).params.model, "group-model");
+    assert.equal(records().filter(r => r.method === "turn/start").at(-1).params.model, "group-model");
+    assert.equal(snapshots(5)[0].model, "group-model");
+    await complete(5);
+    assert.equal((await runtime.app.inject({ url: "/v1/chats/oc_same/settings" })).json().codexModel.effectiveModel, "model-b");
+    assert.equal((runtime.store.db.prepare("SELECT count(*) AS n FROM lark_messages").get() as {n: number}).n, 5);
   } finally {
     await runtime.app.close(); runtime.stop(); await immediate();
     if (oldExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = oldExecutable;
