@@ -88,6 +88,20 @@ export function setOwnerMentionAssistMode(chatId: string, mode: OwnerMentionAssi
   setAppSettingValue(`conversation.ownerMentionAssist:${chatId}`, mode);
 }
 
+export function configuredOwnerMentionAssistBotIds(): string[] {
+  try {
+    const value: unknown = JSON.parse(appSettingValue("ownerMentionAssistBotIds") ?? "[]");
+    return Array.isArray(value) && value.length <= 100
+      && value.every(id => typeof id === "string" && /^ou_[A-Za-z0-9]+$/.test(id) && id.length <= 200)
+      ? [...new Set(value)] : [];
+  } catch { return []; }
+}
+
+export function ownerAssistSourceAllowed(senderType: unknown, senderId: unknown): boolean {
+  return senderType === "user" || senderType === "bot" && typeof senderId === "string"
+    && configuredOwnerMentionAssistBotIds().includes(senderId);
+}
+
 export function ownerAssistRow(id: number): OwnerAssistRow | undefined {
   return db.prepare("SELECT * FROM lark_owner_mention_assists WHERE lark_message_id=?").get(id) as OwnerAssistRow | undefined;
 }
@@ -107,7 +121,9 @@ export function ensureOwnerMentionAssist(source: LarkMessageRow): void {
 
 function currentPolicy(source: LarkMessageRow, row: OwnerAssistRow): boolean {
   const policy = source.chat_id ? ownerMentionAssistSettings(source.chat_id) : null;
-  return Boolean(source.chat_type === "group" && config.runtimeMode === "active" && !config.groupPrivacyEnforced && policy?.effectiveEnabled && policy.ownerId === row.owner_id);
+  return Boolean(source.chat_type === "group" && source.direction === "inbound"
+    && source.sender_id !== row.owner_id && ownerAssistSourceAllowed(source.sender_type, source.sender_id)
+    && config.runtimeMode === "active" && !config.groupPrivacyEnforced && policy?.effectiveEnabled && policy.ownerId === row.owner_id);
 }
 
 function ownerMessages(source: LarkMessageRow, row: OwnerAssistRow) {
@@ -284,6 +300,10 @@ async function sendOwnerAssistNotifications(database: Database.Database): Promis
   for (const row of rows) {
     if (database !== db || !database.open) return;
     const source = sourceRow(row.lark_message_id);
+    if (source?.sender_type === "bot" && !ownerAssistSourceAllowed(source.sender_type, source.sender_id)) {
+      database.prepare("UPDATE lark_owner_mention_assists SET notify_attempts=5,question='来源机器人已不在白名单，自动通知已停止。' WHERE lark_message_id=?").run(row.lark_message_id);
+      continue;
+    }
     if (!source?.chat_id || ownerMentionAssistSettings(source.chat_id).ownerId !== row.owner_id || !ownerMentionAssistSettings(source.chat_id).effectiveEnabled) {
       db.prepare("UPDATE lark_owner_mention_assists SET notify_after=? WHERE lark_message_id=?").run(new Date(Date.now() + 600_000).toISOString(), row.lark_message_id);
       continue;
@@ -292,7 +312,7 @@ async function sendOwnerAssistNotifications(database: Database.Database): Promis
     if (database !== db || !database.open) return;
     const current = ownerAssistRow(row.lark_message_id);
     const policy = ownerMentionAssistSettings(source.chat_id);
-    if (!current || current.status !== "needs_owner" || current.notice_generation !== row.notice_generation || !policy.effectiveEnabled || policy.ownerId !== row.owner_id) continue;
+    if (!current || current.status !== "needs_owner" || current.notice_generation !== row.notice_generation || !currentPolicy(source, current) || !policy.effectiveEnabled || policy.ownerId !== row.owner_id) continue;
     if (membership === false) {
       db.prepare("UPDATE lark_owner_mention_assists SET notify_attempts=5,question='本人或机器人已不在群内，未转发群消息；草稿仍保留在控制台。' WHERE lark_message_id=? AND notice_generation=?")
         .run(row.lark_message_id,row.notice_generation);
@@ -320,7 +340,7 @@ export function reconcileOwnerMentionAssists(): void {
 }
 
 export function listOwnerMentionAssists() {
-  return (db.prepare(`SELECT a.*,m.id,m.content,m.chat_id,m.chat_type,m.sender_id,m.message_id,m.thread_id,m.codex_status FROM lark_owner_mention_assists a
+  return (db.prepare(`SELECT a.*,m.id,m.content,m.chat_id,m.chat_type,m.sender_id,m.sender_type,m.direction,m.message_id,m.thread_id,m.codex_status FROM lark_owner_mention_assists a
     JOIN lark_messages m ON m.id=a.lark_message_id ORDER BY a.lark_message_id DESC LIMIT 200`).all() as Array<OwnerAssistRow & LarkMessageRow>)
     .map(row => ({ ...row, ownerResponses: ownerMessages(row, row).messages, enabled: currentPolicy(row, row) && !["queued","running"].includes(row.codex_status) }));
 }

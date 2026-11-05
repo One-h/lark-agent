@@ -6,8 +6,8 @@ import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
 import { createRuntime } from "./index.js";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
-import { ingestLarkEvent, isOwnerMentionAssistMessage, ownerAssistMayExecute, ownerAssistRow, retryOwnerAssistNotifications,
-  retryPendingLarkTextReplies, setAppSettingValue, decideLarkExecutionApprovalFromCard, reconcileOwnerMentionAssists,
+import { ingestLarkEvent, enqueueLarkCodexReply, isOwnerMentionAssistMessage, ownerAssistMayExecute, ownerAssistPublicAllowed, ownerAssistRow, retryOwnerAssistNotifications,
+  retryPendingLarkTextReplies, retryPendingLarkExecutionReceipts, setAppSettingValue, decideLarkExecutionApprovalFromCard, reconcileOwnerMentionAssists,
   activeOwnerAssistRequests, drainOwnerAssistNotifications } from "@lark-agent/conversation-runtime";
 
 async function until(check: () => boolean) {
@@ -101,6 +101,58 @@ test("owner assistance global/group settings validate, inherit and do not affect
   }finally{await f.close();}
 });
 
+test("bot owner mentions require an authenticated allowlist, real mentions and enabled group policy", async()=>{
+  const f=fixture();try {
+    const url="/v1/settings";
+    const patch=(payload:Record<string,unknown>,headers=f.headers)=>f.runtime.app.inject({method:"PATCH",url,headers,payload});
+    assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,[]);
+    assert.equal((await patch({ownerMentionAssistBotIds:["ou_alert"]},{} as typeof f.headers)).statusCode,401);
+    for(const value of [null,"ou_alert",[1],["all"],["oc_group"],["ou_"+"a".repeat(200)],Array(101).fill("ou_alert")]) {
+      assert.equal((await patch({ownerMentionAssistBotIds:value,ownerMentionAssistEnabled:false})).statusCode,400);
+    }
+    assert.equal((await f.runtime.app.inject({url})).json().ownerMentionAssistEnabled,true);
+    const bot=(id:string,extra:Record<string,unknown>={})=>f.event(id,{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive",content:"告警，负责人 @本人",...extra});
+    const old=ingestLarkEvent(bot("om_old_alert"));
+    assert.equal(old.responded,false);
+    assert.equal((await patch({ownerMentionAssistBotIds:[" ou_alert ","ou_alert","ou_bot"]})).statusCode,200);
+    assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,["ou_alert","ou_bot"]);
+    assert.equal(ingestLarkEvent(bot("om_old_alert")).responded,false);
+    assert.equal(isOwnerMentionAssistMessage(bot("om_allowed")),true);
+    for(const extra of [{mentions:[]},{mentions:[{id:{open_id:"all"}}]},{mentions:[{id:{open_id:"ou_bot"}}]},{sender_id:"ou_other"},{sender_id:"ou_bot"},{chat_type:"p2p"}]) {
+      assert.equal(isOwnerMentionAssistMessage(bot("om_rejected",extra)),false);
+    }
+    assert.equal(ingestLarkEvent(bot("om_bot_only",{sender_id:"ou_other",mentions:[{id:{open_id:"ou_bot"}}]})).responded,false);
+    f.runtime.store.db.prepare("UPDATE lark_messages SET mentioned=1,reply_trigger='mention',codex_status='failed' WHERE message_id='om_bot_only'").run();
+    assert.equal(enqueueLarkCodexReply(f.row("om_bot_only").id),false);
+    const source=await f.start("om_allowed_alert",{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive",content:"告警，需核查"});
+    assert.equal(source.reply_trigger,"owner_mention");
+    const params=f.records().find(r=>r.method==="thread/start").params;
+    assert.equal(params.sandbox,"read-only");
+    assert.equal(params.approvalPolicy,"on-request");
+    assert.equal(ingestLarkEvent(bot("om_allowed_alert")).duplicate,true);
+    await f.decision("om_allowed_alert","handle");
+    assert.equal(ownerAssistMayExecute(source.id),true);
+    assert.equal((await f.decision("om_allowed_alert","handle",{reply:"已核实告警状态。"})).state,"ready");
+    await f.complete("om_allowed_alert","已核实告警状态。");
+    await until(()=>f.sent.length===1);
+    const pending=await f.start("om_pending_alert",{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive",content:"新的告警"});
+    await f.decision("om_pending_alert","handle");
+    assert.equal(ownerAssistMayExecute(pending.id),true);
+    await patch({ownerMentionAssistBotIds:[]});
+    assert.equal(ownerAssistMayExecute(pending.id),false);
+    assert.equal(isOwnerMentionAssistMessage(bot("om_removed")),false);
+    assert.equal(isOwnerMentionAssistMessage(f.event("om_human")),true);
+    assert.deepEqual(f.sent,["已核实告警状态。"]);
+    await patch({ownerMentionAssistBotIds:["ou_alert"]});
+    assert.equal(ownerAssistMayExecute(pending.id),false);
+    await f.runtime.app.inject({method:"PATCH",url:"/v1/chats/oc_group/settings",headers:f.headers,payload:{ownerMentionAssistMode:"off"}});
+    await patch({ownerMentionAssistBotIds:["ou_alert"]});
+    assert.equal(isOwnerMentionAssistMessage(bot("om_disabled")),false);
+    setAppSettingValue("ownerMentionAssistBotIds","malformed");
+    assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,[]);
+  }finally{await f.close();}
+});
+
 test("owner and bot mentions dispatch once; accepted work retains the actual sender permissions",async()=>{
   const f=fixture();try{
     const source=await f.start("om_question",{mentions:[{id:{open_id:"ou_owner"}},{id:{open_id:"ou_bot"}}]});
@@ -113,6 +165,38 @@ test("owner and bot mentions dispatch once; accepted work retains the actual sen
     assert.equal(ingestLarkEvent(f.event("om_question")).duplicate,true);
     assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
     assert.equal(ownerAssistRow(source.id)?.status,"sent");
+  }finally{await f.close();}
+});
+
+test("revoking a bot suppresses pending private notifications and public receipt retries",async()=>{
+  const f=fixture();try{
+    setAppSettingValue("ownerMentionAssistBotIds",JSON.stringify(["ou_alert"]));
+    const source=await f.start("om_bot_retry",{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive"});
+    f.failNotice(true);
+    await f.decision("om_bot_retry","owner_required",{reply:"待本人确认的草稿",question:"是否需要继续？"});
+    await drainOwnerAssistNotifications();
+    assert.equal(f.notices.length,1);
+    assert.equal(ownerAssistRow(source.id)?.notify_attempts,1);
+    await f.complete("om_bot_retry","<lark-no-reply/>");
+    const publicSource=await f.start("om_bot_receipt",{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive"});
+    await f.decision("om_bot_receipt","handle");
+    assert.equal((await f.decision("om_bot_receipt","handle",{reply:"已核实。"})).state,"ready");
+    assert.equal(ownerAssistPublicAllowed(publicSource.id),true);
+    setAppSettingValue("executionReceiptsEnabled","true");
+    const now=new Date().toISOString();
+    f.runtime.store.db.prepare(`INSERT INTO lark_execution_receipts(lark_message_id,turn_id,status,entries_json,delivery_status,delivery_attempts,next_attempt_at,created_at,updated_at)
+      VALUES(?,?,'queried','[]','pending',1,?,?,?)`).run(publicSource.id,publicSource.codex_turn_id,now,now,now);
+    await f.runtime.app.inject({method:"PATCH",url:"/v1/settings",headers:f.headers,payload:{ownerMentionAssistBotIds:[]}});
+    f.failNotice(false);
+    f.runtime.store.db.prepare("UPDATE lark_owner_mention_assists SET notify_after=? WHERE lark_message_id=?").run(now,source.id);
+    await retryOwnerAssistNotifications();
+    retryPendingLarkExecutionReceipts();
+    assert.equal(f.notices.length,1);
+    assert.equal(ownerAssistRow(source.id)?.notify_attempts,5);
+    const receipt=f.runtime.store.db.prepare("SELECT delivery_status,delivery_attempts,card_message_id FROM lark_execution_receipts WHERE lark_message_id=?").get(publicSource.id) as any;
+    assert.equal(receipt.delivery_status,"suppressed");
+    assert.equal(receipt.delivery_attempts,1);
+    assert.equal(receipt.card_message_id,null);
   }finally{await f.close();}
 });
 

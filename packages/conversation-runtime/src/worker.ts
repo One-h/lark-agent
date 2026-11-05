@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { defaultLarkAcknowledgeReactionEmoji, isLarkReactionEmojiType, larkReactionEmojiTypes } from "@lark-agent/adapter-lark-cli";
 import { config, db, getAppSettings, larkReactionSender, nowIso, type LarkMessageRow } from "./context.js";
-import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings } from "./ownerMentionAssist.js";
+import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
 import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply } from "./responder.js";
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
@@ -175,7 +175,11 @@ export function shouldStartSpontaneousLarkReply(
 }
 
 export function isOwnerMentionAssistMessage(event: LarkEvent): boolean {
-  if (event.chat_type !== "group" || event.sender_type !== "user" || typeof event.chat_id !== "string") return false;
+  if (event.chat_type !== "group" || typeof event.chat_id !== "string" || !ownerAssistSourceAllowed(event.sender_type, event.sender_id)) return false;
+  if (event.sender_type === "bot") {
+    const botId = resolveCurrentBotOpenId();
+    if (!botId || event.sender_id === botId) return false;
+  }
   const policy = ownerMentionAssistSettings(event.chat_id);
   return policy.effectiveEnabled && event.sender_id !== policy.ownerId && isAtMeMessage(event, policy.ownerId);
 }
@@ -273,7 +277,7 @@ function persistLarkEvent(event: LarkEvent): void {
   const eventId = stringValue(event.event_id);
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
   if (messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger === "topic") return;
-  const directlyMentioned = isAtMeMessage(event);
+  const directlyMentioned = event.sender_type !== "bot" && isAtMeMessage(event);
   const chatId = stringValue(event.chat_id);
   const rootMessageId = stringValue(event.root_id);
   const threadId = stringValue(event.thread_id);

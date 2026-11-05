@@ -67,6 +67,7 @@ const validators = {
   acknowledgeReactionEmoji: (value: unknown) => emojiValue(value, "acknowledgeReactionEmoji"),
   groupSpontaneousRepliesEnabled: (value: unknown) => booleanValue(value, "groupSpontaneousRepliesEnabled"),
   ownerMentionAssistEnabled: (value: unknown) => booleanValue(value, "ownerMentionAssistEnabled"),
+  ownerMentionAssistBotIds: (value: unknown) => idSet(value, "ownerMentionAssistBotIds", 100, id => /^ou_[A-Za-z0-9]+$/.test(id) && id.length <= 200),
   ownerMentionAssistOwnerId: (value: unknown): string => {
     if (typeof value !== "string" || value.length > 200 || value.trim() !== "" && !/^ou_[A-Za-z0-9]+$/.test(value.trim())) throw new Error("ownerMentionAssistOwnerId must be an open_id or empty");
     return value.trim();

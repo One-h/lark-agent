@@ -30,7 +30,7 @@ import { conversationCodexModelSettings } from "./context.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions } from "./completionReactions.js";
 import { decideOwnerMentionAssist, deferOwnerAssistDelivery, ensureOwnerMentionAssist, finishOwnerMentionAssist, markOwnerAssistSent,
-  ownerAssistMayExecute, ownerAssistPrompt, ownerAssistPublicAllowed, ownerAssistRow, ownerMentionAssistSettings } from "./ownerMentionAssist.js";
+  ownerAssistMayExecute, ownerAssistPrompt, ownerAssistPublicAllowed, ownerAssistRow, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
 import { attachmentDigest, attachmentToolPrompt, createReplyMarkdownAttachment, matchingAttachmentState, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment,
   type AttachmentState, type RegisteredAttachment, type ReplyMedia } from "./replyAttachments.js";
 
@@ -671,7 +671,7 @@ export function buildLarkCodexPrompt(
   const autoFixTaskData = path.join(config.repoRoot, "data", "tasks");
   const style = attachments.conversationStyle ?? captureConversationStyle(message.chat_id);
   const assistantPrompt = style.effectiveInstructions;
-  const groupMentionInstruction = message.chat_type && message.chat_type !== "p2p"
+  const groupMentionInstruction = message.chat_type && message.chat_type !== "p2p" && !isLarkBotSender(message)
     ? "群聊提及：所有发往群里的可见回复（中途回复和最终回复）都会自动真实 @ 当前消息发送者。若还要提及其他明确目标，只能在回复中使用飞书标签 `\u003cat user_id=\"ou_xxx\"\u003e\u003c/at\u003e`；`ou_xxx` 必须来自当前消息或历史消息中已出现的 sender_id/open_id。不要把普通文本 `@名字` 描述成已经真实提及。"
     : "";
   const spontaneousParticipationInstruction = message.reply_trigger === "spontaneous"
@@ -867,7 +867,7 @@ export function buildLarkCodexDeltaPrompt(
     reply_to_content: message.reply_to_content ?? null,
     reply_to_local_id: replyToLocalId
   }, recentContext.selectedIds);
-  const groupMentionInstruction = message.chat_type && message.chat_type !== "p2p"
+  const groupMentionInstruction = message.chat_type && message.chat_type !== "p2p" && !isLarkBotSender(message)
     ? "最终回复会自动真实 @ 当前消息发送者。若还要提及其他明确目标，只能使用飞书标签 \u003cat user_id=\"ou_xxx\"\u003e\u003c/at\u003e，且 ou_xxx 必须来自本次消息或此前已知上下文。"
     : "";
   const spontaneousParticipationInstruction = message.reply_trigger === "spontaneous"
@@ -1784,11 +1784,13 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
     return false;
   }
   const target = db.prepare("SELECT * FROM lark_messages WHERE id=?").get(larkMessageId) as LarkMessageRow | undefined;
+  if (target?.chat_type === "group" && target.sender_type === "bot"
+    && (target.reply_trigger !== "owner_mention" || !ownerAssistSourceAllowed(target.sender_type, target.sender_id))) return false;
   const chatId = target?.chat_id;
   const spontaneousPolicy = target?.reply_trigger === "spontaneous" && chatId ? conversationSpontaneousSettings(chatId) : null;
   const spontaneousChatIds = spontaneousPolicy?.effectiveEnabled && spontaneousPolicy.effectiveReplyRate > 0 && chatId ? [chatId] : [];
   const ownerPolicy = target?.reply_trigger === "owner_mention" && chatId ? ownerMentionAssistSettings(chatId) : null;
-  const canAssist = Boolean(ownerPolicy?.effectiveEnabled && target?.sender_type === "user" && target.sender_id !== ownerPolicy.ownerId
+  const canAssist = Boolean(ownerPolicy?.effectiveEnabled && target && ownerAssistSourceAllowed(target.sender_type, target.sender_id) && target.sender_id !== ownerPolicy.ownerId
     && ownerAssistRow(larkMessageId)?.owner_id === ownerPolicy.ownerId);
   const canContinueTopic = Boolean(target && target.reply_trigger === "topic" && isNativeTopicConversation(target));
 
@@ -2059,6 +2061,10 @@ export function retryPendingLarkExecutionReceipts(limit = 10): number {
     ORDER BY receipts.id LIMIT ?
   `).all(nowIso(), limit) as Array<{ id: number; lark_message_id: number; turn_id: string; status: LarkExecutionReceiptEntry["status"]; entries_json: string; message_id: string }>;
   for (const row of rows) {
+    if (!ownerAssistPublicAllowed(row.lark_message_id)) {
+      db.prepare("UPDATE lark_execution_receipts SET delivery_status='suppressed',delivery_error='Owner assistance policy changed',updated_at=? WHERE id=?").run(nowIso(), row.id);
+      continue;
+    }
     const entries = JSON.parse(row.entries_json) as LarkExecutionReceiptEntry[];
     const sent = sendLarkExecutionReceiptCard(row.message_id, { status: row.status, entries }, larkReplyIdempotencyKey("receipt", `${row.lark_message_id}:${row.turn_id}`));
     if (sent.ok) {
@@ -2273,10 +2279,10 @@ export async function reconcileLarkCodexStartupWaits(nowMs = Date.now()): Promis
 }
 
 export function formatLarkFinalReply(
-  message: Pick<LarkMessageRow, "chat_type" | "sender_id">,
+  message: Pick<LarkMessageRow, "chat_type" | "sender_id"> & Partial<Pick<LarkMessageRow, "sender_type">>,
   reply: string
 ): string {
-  if (message.chat_type !== "group" || !/^ou_[a-zA-Z0-9]+$/.test(message.sender_id ?? "")) {
+  if (message.sender_type === "bot" || message.chat_type !== "group" || !/^ou_[a-zA-Z0-9]+$/.test(message.sender_id ?? "")) {
     return reply;
   }
   const mention = larkAtTag(message.sender_id!);
