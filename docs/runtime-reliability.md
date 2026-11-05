@@ -1,5 +1,21 @@
 # Local runtime reliability
 
+## Workspace workflows and execution permissions
+
+The responder follows the configured workspace's instructions and applicable
+workflows instead of selecting only read-only query skills. A workflow step that
+needs additional permissions should request them through the existing approval
+mechanism. The user does not need to name each workflow side effect separately;
+explicit user limits still apply, and workspace instructions grant no additional
+permissions. Approval denial or expiry stops the restricted operation.
+
+Prompt checks cover full, incremental and native-topic instructions, including
+ordinary incremental turns that reuse stable instructions. The scenarios are:
+an applicable workflow needs a restricted operation, the user explicitly forbids
+local writes, and no workspace-specific workflow is prescribed by the responder.
+Existing approval tests separately verify sandbox policies and real RPC routing.
+These checks establish the instruction contract, not guaranteed model compliance.
+
 ## Keep child processes on the same runtime
 
 The server may stay alive with an already-loaded library while newly spawned

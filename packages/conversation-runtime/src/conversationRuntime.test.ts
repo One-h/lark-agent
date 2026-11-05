@@ -189,6 +189,45 @@ test("trusted execution retains its existing permission policy without adding re
   } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("workspace workflows remain generic and permission-bound in full, delta and native-topic prompts", () => {
+  const { root, store } = fixture();
+  try {
+    const sections = new Set<string>();
+    for (const trustedSender of [false, true]) {
+      for (const chat_type of ["p2p", "group"]) {
+        const message = { content: "仅查询，不写本地文件", chat_type, sender_id: "ou_sender",
+          reply_to_message_id: null, reply_to_message_type: null, reply_to_content: null };
+        for (const prompt of [
+          buildLarkCodexPrompt(message, { trustedSender }),
+          buildLarkCodexDeltaPrompt(message, { trustedSender }),
+          buildLarkCodexDeltaPrompt(message, { trustedSender, includeStableInstructions: false }),
+          buildLarkCodexDeltaPrompt(message, { trustedSender, nativeTopicMode: true })
+        ]) {
+          const section = prompt.split("\n").find(line => line.startsWith("工作区流程："));
+          assert.ok(section);
+          assert.match(section, /遵守当前工作区的指令和适用工作流/);
+          assert.match(section, /通过现有审批机制申请授权，权限不足不等于省略该步骤/);
+          assert.match(section, /用户明确限定的任务范围和现有权限策略/);
+          assert.match(section, /工作区指令本身不授予额外权限/);
+          assert.equal(prompt.split("工作区流程：").length - 1, 1);
+          assert.doesNotMatch(prompt, /[A-Za-z-]+-task-capture|log-[A-Za-z-]*task|TASKS\.MD/);
+          assert.ok(prompt.includes(message.content));
+          sections.add(section);
+        }
+        const full = buildLarkCodexPrompt(message, { trustedSender });
+        if (!trustedSender) {
+          assert.match(full, /按任务和当前工作区的指令选择适用的 skill/);
+          assert.match(full, /数据查询保持只读/);
+          assert.match(full, /审批前不执行对应受限操作/);
+          assert.match(full, /授权被拒绝时停止对应操作/);
+          assert.doesNotMatch(full, /可以使用明确只读的数据查询类 skill|如果用户明确要求代码修改、文件写入/);
+        }
+      }
+    }
+    assert.equal(sections.size, 1);
+  } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("conversation runtime responder preserves no-reply, sanitization and recovery decisions", () => {
   assert.equal(isLarkNoReplyDecision("<forge-no-reply/>"), true);
   assert.equal(isLarkNoReplyDecision("正常回复"), false);
