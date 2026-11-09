@@ -153,6 +153,23 @@ test("bot owner mentions require an authenticated allowlist, real mentions and e
   }finally{await f.close();}
 });
 
+test("bot-only policy limits a single group and immediately fences existing human requests", async()=>{
+  const f=fixture();try{
+    const group="/v1/chats/oc_group/settings";
+    const pending=await f.start("om_human_before_policy");
+    await f.decision("om_human_before_policy","handle");
+    assert.equal(ownerAssistMayExecute(pending.id),true);
+    assert.equal((await f.runtime.app.inject({method:"PATCH",url:group,headers:f.headers,payload:{ownerMentionAssistBotOnly:"yes"}})).statusCode,400);
+    assert.equal((await f.runtime.app.inject({method:"PATCH",url:group,headers:f.headers,payload:{ownerMentionAssistBotOnly:true}})).json().ownerMentionAssist.botOnly,true);
+    assert.equal(ownerAssistMayExecute(pending.id),false);
+    assert.equal(isOwnerMentionAssistMessage(f.event("om_human_after_policy")),false);
+    assert.equal(isOwnerMentionAssistMessage(f.event("om_human_other_group",{chat_id:"oc_other"})),true);
+    await f.runtime.app.inject({method:"PATCH",url:"/v1/settings",headers:f.headers,payload:{ownerMentionAssistBotIds:["ou_alert"]}});
+    assert.equal(isOwnerMentionAssistMessage(f.event("om_alert_after_policy",{sender_type:"bot",sender_id:"ou_alert"})),true);
+    assert.equal(isOwnerMentionAssistMessage(f.event("om_other_bot",{sender_type:"bot",sender_id:"ou_other"})),false);
+  }finally{await f.close();}
+});
+
 test("owner and bot mentions dispatch once; accepted work retains the actual sender permissions",async()=>{
   const f=fixture();try{
     const source=await f.start("om_question",{mentions:[{id:{open_id:"ou_owner"}},{id:{open_id:"ou_bot"}}]});

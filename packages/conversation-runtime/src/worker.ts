@@ -175,7 +175,7 @@ export function shouldStartSpontaneousLarkReply(
 }
 
 export function isOwnerMentionAssistMessage(event: LarkEvent): boolean {
-  if (event.chat_type !== "group" || typeof event.chat_id !== "string" || !ownerAssistSourceAllowed(event.sender_type, event.sender_id)) return false;
+  if (event.chat_type !== "group" || typeof event.chat_id !== "string" || !ownerAssistSourceAllowed(event.sender_type, event.sender_id, event.chat_id)) return false;
   if (event.sender_type === "bot") {
     const botId = resolveCurrentBotOpenId();
     if (!botId || event.sender_id === botId) return false;
