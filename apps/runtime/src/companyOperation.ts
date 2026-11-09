@@ -21,7 +21,10 @@ export async function executeCompanyOperation(root:string,argv:string[]):Promise
     ||!Array.isArray(argv)||!argv.length||argv.length>40||argv.some(x=>typeof x!=="string"||x.length>2000||x.includes("\0")))throw new Error("无效的公司操作。");
   const control=fs.mkdtempSync(path.join(os.tmpdir(),"lark-company-operation-"));
   const deny=["**/*personal*","**/*private*","**/*个人*","**/*私密*","**/*薪资*","**/*工资*","**/*人事*","**/*backup*","**/.env*","**/*secret*","**/*credential*","**/*password*","**/*token*","**/*.pem","**/*.key","**/*.p12","**/*.sqlite*","**/*session*","**/*history*","**/.ssh/**","**/.aws/**","**/.kube/**","**/.codex/**","**/.git/config"];
-  const entries=['":root"="deny"','":minimal"="read"',`${JSON.stringify(root)}="write"`,...deny.map(pattern=>`${JSON.stringify(path.join(root,pattern))}="deny"`)];
+  // The minimal profile can expose the OS temporary directory. Exclude it
+  // before granting the selected root, which may itself be inside that tree.
+  const temporaryRoots = [...new Set([fs.realpathSync(os.tmpdir()), ...(process.platform === 'darwin' ? [fs.realpathSync('/tmp')] : [])])];
+  const entries=['":root"="deny"','":minimal"="read"',...temporaryRoots.filter(dir=>dir!==root).map(dir=>`${JSON.stringify(dir)}="deny"`),`${JSON.stringify(root)}="write"`,...deny.map(pattern=>`${JSON.stringify(path.join(root,pattern))}="deny"`)];
   const profile=filesystemProfile(root,true).filter(x=>!x.startsWith('permissions.lark-privacy.filesystem='));
   profile.push(`permissions.lark-privacy.filesystem={${entries.join(",")},glob_scan_max_depth=12}`);
   try{
