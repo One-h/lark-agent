@@ -80,12 +80,17 @@ export function ownerMentionAssistSettings(chatId: string) {
   const globalEnabled = appSettingValue("ownerMentionAssistEnabled") === "true";
   const candidate = appSettingValue("ownerMentionAssistOwnerId")?.trim() || config.larkExecutionApproverId;
   const ownerId = /^ou_[A-Za-z0-9]+$/.test(candidate) ? candidate : "";
-  return { mode, globalEnabled, ownerId, effectiveEnabled: Boolean(reviewAvailable && ownerId && (mode === "on" || mode === "global" && globalEnabled)) };
+  const botOnly = appSettingValue(`conversation.ownerMentionAssistBotOnly:${chatId}`) === "true";
+  return { mode, globalEnabled, ownerId, botOnly, effectiveEnabled: Boolean(reviewAvailable && ownerId && (mode === "on" || mode === "global" && globalEnabled)) };
 }
 
 export function setOwnerMentionAssistMode(chatId: string, mode: OwnerMentionAssistMode) {
   if (!["global", "on", "off"].includes(mode)) throw new Error("无效的群聊协同代答模式");
   setAppSettingValue(`conversation.ownerMentionAssist:${chatId}`, mode);
+}
+
+export function setOwnerMentionAssistBotOnly(chatId: string, enabled: boolean): void {
+  setAppSettingValue(`conversation.ownerMentionAssistBotOnly:${chatId}`, String(enabled));
 }
 
 export function configuredOwnerMentionAssistBotIds(): string[] {
@@ -97,8 +102,8 @@ export function configuredOwnerMentionAssistBotIds(): string[] {
   } catch { return []; }
 }
 
-export function ownerAssistSourceAllowed(senderType: unknown, senderId: unknown): boolean {
-  return senderType === "user" || senderType === "bot" && typeof senderId === "string"
+export function ownerAssistSourceAllowed(senderType: unknown, senderId: unknown, chatId?: string | null): boolean {
+  return senderType === "user" && !(chatId && ownerMentionAssistSettings(chatId).botOnly) || senderType === "bot" && typeof senderId === "string"
     && configuredOwnerMentionAssistBotIds().includes(senderId);
 }
 
@@ -122,7 +127,7 @@ export function ensureOwnerMentionAssist(source: LarkMessageRow): void {
 function currentPolicy(source: LarkMessageRow, row: OwnerAssistRow): boolean {
   const policy = source.chat_id ? ownerMentionAssistSettings(source.chat_id) : null;
   return Boolean(source.chat_type === "group" && source.direction === "inbound"
-    && source.sender_id !== row.owner_id && ownerAssistSourceAllowed(source.sender_type, source.sender_id)
+    && source.sender_id !== row.owner_id && ownerAssistSourceAllowed(source.sender_type, source.sender_id, source.chat_id)
     && config.runtimeMode === "active" && !config.groupPrivacyEnforced && policy?.effectiveEnabled && policy.ownerId === row.owner_id);
 }
 

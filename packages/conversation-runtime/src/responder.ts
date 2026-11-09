@@ -1790,7 +1790,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
   const spontaneousPolicy = target?.reply_trigger === "spontaneous" && chatId ? conversationSpontaneousSettings(chatId) : null;
   const spontaneousChatIds = spontaneousPolicy?.effectiveEnabled && spontaneousPolicy.effectiveReplyRate > 0 && chatId ? [chatId] : [];
   const ownerPolicy = target?.reply_trigger === "owner_mention" && chatId ? ownerMentionAssistSettings(chatId) : null;
-  const canAssist = Boolean(ownerPolicy?.effectiveEnabled && target && ownerAssistSourceAllowed(target.sender_type, target.sender_id) && target.sender_id !== ownerPolicy.ownerId
+  const canAssist = Boolean(ownerPolicy?.effectiveEnabled && target && ownerAssistSourceAllowed(target.sender_type, target.sender_id, target.chat_id) && target.sender_id !== ownerPolicy.ownerId
     && ownerAssistRow(larkMessageId)?.owner_id === ownerPolicy.ownerId);
   const canContinueTopic = Boolean(target && target.reply_trigger === "topic" && isNativeTopicConversation(target));
 
