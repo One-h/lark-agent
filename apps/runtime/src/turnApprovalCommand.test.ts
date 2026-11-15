@@ -22,6 +22,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
  }else if(m.method)send({id:m.id,result:{}});
  else if(m.id==="query-approval"){
   fs.writeFileSync(${JSON.stringify(result)},JSON.stringify({decision:m.result?.decision}));
+  send({method:"item/completed",params:{threadId:"query-thread",turnId:"query-turn",item:{type:"commandExecution",id:"query",status:m.result?.decision==="accept"?"completed":"declined"}}});
   const item={type:"agentMessage",id:"answer",phase:"final_answer",text:m.result?.decision==="accept"?"模拟查询完成":"未获授权，未执行查询"};
   send({method:"item/completed",params:{threadId:"query-thread",turnId:"query-turn",item}});
   send({method:"turn/completed",params:{threadId:"query-thread",turn:{id:"query-turn",status:"completed",items:[item]}}});
@@ -59,6 +60,14 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
       assert.equal(audit.source, "model");
       assert.equal(audit.decision, scenario.manual ? "manual" : "approved");
       assert.equal(Boolean(audit.applied_at), !scenario.manual);
+      const task=runtime.store.db.prepare("SELECT codex_task_dir FROM lark_messages WHERE id=1").get() as {codex_task_dir:string};
+      const events=fs.readFileSync(path.join(task.codex_task_dir,"codex.stdout.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line))
+        .filter(event=>event.method==="approval/decision").map(event=>event.params);
+      if(scenario.manual){
+        assert(events.some(e=>e.source==="auto_review"&&e.outcome==="pending"&&e.reasonCode==="review_requires_manual"));
+        assert(events.some(e=>e.source==="manual"&&e.outcome==="declined"&&e.reasonCode==="human_rejected"));
+        assert(!events.some(e=>e.source==="auto_review"&&e.outcome==="rejected"));
+      }else assert(events.some(e=>e.source==="auto_review"&&e.outcome==="approved"&&e.reviewId));
       const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
       const thread = calls.find(call => call.method === "thread/start").params;
       assert.equal(thread.sandbox, "read-only"); assert.equal(thread.approvalPolicy, "on-request");

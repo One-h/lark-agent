@@ -133,6 +133,17 @@ Completion reactions use the durable outbox with at most eight send attempts;
 reaction failures never change a successful text reply into a failed task.
 Only newly completed turns are marked; historical tasks are not backfilled.
 
+Execution approval diagnostics appear as `approval/decision` events in each
+message's `codex.stdout.jsonl` and in `data/tasks/execution-approval-audit.jsonl`
+(relative to the configured database directory). Events include thread, turn,
+item and request IDs, an outcome, a source and a reason code, without copying
+commands or credentials. Sources distinguish policy blocks, human decisions,
+expiry, lifecycle/transport failures and automatic-review handoff. A native
+`declined` without a matching application decision is `native_unknown`, not
+evidence of a human or model rejection. Historical denials retain their explicit
+scope; new tasks request their own authorization, while an explicit rejection
+cannot be bypassed by rewriting the same operation.
+
 ## Layout
 
 - `packages/core`: conversation, trust, and capability contracts.

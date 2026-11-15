@@ -335,11 +335,77 @@ test("trusted owner-assist senders still start read-only and undecided execution
     await codexAppServer.request("fixture/approval",{request:{id:"legacy-permissions",method:"execCommandApproval",params:{conversationId:source.codex_session_id,callId:"legacy",command:["touch","file.txt"],cwd:f.root}}});
     await until(()=>f.records().some(r=>r.id==="legacy-permissions"&&r.result));
     assert.equal(f.records().find(r=>r.id==="legacy-permissions"&&r.result).result,"decline");
+    const audits=fs.readFileSync(path.join(source.codex_task_dir,"codex.stdout.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line))
+      .filter(event=>event.method==="approval/decision").map(event=>event.params);
+    assert.equal(audits.find(a=>a.requestId==="approval-before"&&a.outcome==="rejected").reasonCode,"owner_assist_not_executable");
+    assert.equal(audits.find(a=>a.requestId==="whole-permissions"&&a.outcome==="rejected").reasonCode,"owner_assist_permission_bundle");
+    assert.equal(audits.find(a=>a.requestId==="legacy-permissions"&&a.outcome==="rejected").reasonCode,"owner_assist_legacy_protocol");
+    assert(audits.every(a=>a.outcome!=="rejected"||a.source==="policy"));
     await f.decision("om_question","ignore");await f.complete("om_question","<lark-no-reply/>");
     await f.start("om_direct",{mentions:[{id:{open_id:"ou_bot"}}]});
     assert.equal(f.records().filter(r=>r.method==="thread/start").at(-1).params.sandbox,"danger-full-access");
     await f.complete("om_direct");
   }finally{await f.close();}
+});
+
+test("native declines without an application decision stay unknown and policy declines retain their cause",async()=>{
+  const f=fixture();try{
+    const source=await f.start();
+    await codexAppServer.request("fixture/approval",{request:{id:"policy-request",method:"item/commandExecution/requestApproval",params:{
+      threadId:source.codex_session_id,turnId:source.codex_turn_id,itemId:"policy-item",command:"echo private-fixture-value",cwd:f.root}}});
+    await until(()=>f.records().some(r=>r.id==="policy-request"&&r.result));
+    await codexAppServer.request("fixture/emit",{notifications:["policy-item","unknown-item","unknown-item"].map(id=>({
+      method:"item/completed",params:{threadId:source.codex_session_id,turnId:source.codex_turn_id,
+        item:{id,type:"commandExecution",status:"declined",command:"echo private-fixture-value"}}}))});
+    const events=()=>fs.readFileSync(path.join(source.codex_task_dir,"codex.stdout.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    await until(()=>events().filter(e=>e.method==="approval/decision"&&e.params.outcome==="declined").length===3);
+    const audits=events().filter(e=>e.method==="approval/decision").map(e=>e.params);
+    const known=audits.find(a=>a.outcome==="declined"&&a.itemId==="policy-item");
+    assert.equal(known.source,"policy");assert.equal(known.requestId,"policy-request");assert.equal(known.reasonCode,"owner_assist_not_executable");
+    for(const unknown of audits.filter(a=>a.outcome==="declined"&&a.itemId==="unknown-item")){
+      assert.equal(unknown.source,"native_unknown");assert.equal(unknown.requestId,null);
+      assert.equal(unknown.reasonCode,"native_declined_without_matching_decision");
+    }
+    assert.doesNotMatch(JSON.stringify(audits),/private-fixture-value|context_token|fixture-token/);
+    await f.decision("om_question","ignore");await f.complete("om_question","<lark-no-reply/>");
+    await codexAppServer.request("fixture/approval",{request:{id:"late-unmatched",method:"item/commandExecution/requestApproval",params:{
+      threadId:"thread-gone",turnId:"turn-gone",itemId:"late-item",command:"echo private-fixture-value",cwd:f.root}}});
+    await until(()=>f.records().some(r=>r.id==="late-unmatched"&&r.result?.decision==="decline"));
+    const ledger=fs.readFileSync(path.join(f.root,"tasks","execution-approval-audit.jsonl"),"utf8");
+    const late=ledger.trim().split("\n").map(line=>JSON.parse(line)).find(a=>a.requestId==="late-unmatched"&&a.outcome==="rejected");
+    assert.equal(late.source,"lifecycle");assert.equal(late.reasonCode,"inactive_or_mismatched_turn");
+    assert.equal(late.messageId,null);assert.equal(late.turnId,"turn-gone");
+    assert.doesNotMatch(ledger,/private-fixture-value|fixture-token/);
+  }finally{await f.close();}
+});
+
+test("a prior human rejection or expiry does not prevent a new alert from requesting approval",async()=>{
+  for(const expired of [false,true]){
+    const f=fixture();try{
+      const first=await f.start();await f.decision("om_question","handle");
+      const ask=(source:any,id:string)=>codexAppServer.request("fixture/approval",{request:{id,method:"item/commandExecution/requestApproval",params:{
+        threadId:source.codex_session_id,turnId:source.codex_turn_id,itemId:id,command:"echo readonly-check",cwd:f.root}}});
+      await ask(first,"first-request");
+      const pending=()=>f.runtime.store.db.prepare("SELECT * FROM lark_execution_approvals WHERE status='pending' AND card_message_id IS NOT NULL ORDER BY id DESC LIMIT 1").get() as any;
+      await until(()=>Boolean(pending()));const approval=pending();
+      if(expired)f.runtime.store.db.prepare("UPDATE lark_execution_approvals SET expires_at=? WHERE id=?").run("2000-01-01T00:00:00Z",approval.id);
+      assert.equal(decideLarkExecutionApprovalFromCard({token:approval.token,decision:"reject",operatorId:"ou_owner",messageId:approval.card_message_id}).ok,true);
+      const auditText=fs.readFileSync(path.join(first.codex_task_dir,"codex.stdout.jsonl"),"utf8");
+      const audit=auditText.trim().split("\n").map(line=>JSON.parse(line)).filter(e=>e.method==="approval/decision").map(e=>e.params);
+      assert(audit.some(a=>a.reasonCode===(expired?"approval_expired":"human_rejected")&&a.source===(expired?"timeout":"manual")));
+      await f.decision("om_question","handle",{reply:"本次申请未获授权。"});await f.complete("om_question","本次申请未获授权。");
+      const second=await f.start("om_new_alert",{content:"新的告警时间窗口，请核查当前错误"});await f.decision("om_new_alert","handle");
+      assert.equal(second.codex_session_id,first.codex_session_id);
+      const prompt=fs.readFileSync(path.join(second.codex_task_dir,"prompt.md"),"utf8");
+      assert.match(prompt,/新告警、新任务或新时间窗口按当前范围申请所需授权/);
+      assert.match(prompt,/当前范围内的明确拒绝应停止/);
+      await ask(second,"second-request");await until(()=>pending()?.lark_message_id===second.id);
+      const next=pending();
+      assert.equal(decideLarkExecutionApprovalFromCard({token:next.token,decision:"approve-turn",operatorId:"ou_owner",messageId:next.card_message_id}).ok,true);
+      await until(()=>f.records().some(r=>r.id==="second-request"&&r.result?.decision==="accept"));
+      await f.decision("om_new_alert","handle",{reply:"新告警已核查。"});await f.complete("om_new_alert","新告警已核查。");
+    }finally{await f.close();}
+  }
 });
 
 test("pending native approvals are revoked on owner context, private handoff and group policy changes",async()=>{

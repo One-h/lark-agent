@@ -155,9 +155,14 @@ test("restricted read-only queries request execution approval in group and priva
         assert.match(section, /本地检索可直接进行/);
         assert.match(section, /联网、隧道或系统凭据/);
         assert.match(section, /sandbox_permissions=require_escalated/);
-        assert.match(section, /申请对应命令的授权，再执行或重试/);
+        assert.match(section, /申请对应命令的授权/);
         assert.match(section, /现有自动\/人工审批/);
-        assert.match(section, /审批拒绝或过期即停止对应操作/);
+        assert.match(prompt, /历史拒绝只约束当时请求及明确拒绝的范围/);
+        assert.match(prompt, /新告警、新任务或新时间窗口按当前范围申请所需授权/);
+        assert.match(prompt, /当前范围内的明确拒绝应停止/);
+        assert.match(prompt, /改写同一操作不构成新授权/);
+        assert.match(prompt, /过期表示该申请已失效/);
+        assert.match(prompt, /来源未核实就说明未知/);
         assert.match(section, /账号认证失败、业务权限拒绝或来源白名单拦截/);
         assert.match(section, /不能通过提权、换账号或导出凭据绕过/);
         assert.equal(prompt.split("只读查询执行授权：").length - 1, 1);
@@ -210,6 +215,8 @@ test("workspace workflows remain generic and permission-bound in full, delta and
           assert.match(section, /用户明确限定的任务范围和现有权限策略/);
           assert.match(section, /工作区指令本身不授予额外权限/);
           assert.equal(prompt.split("工作区流程：").length - 1, 1);
+          assert.equal(prompt.split("审批范围：").length - 1, 1);
+          assert.match(prompt, /历史回复不是本轮审批结果/);
           assert.doesNotMatch(prompt, /[A-Za-z-]+-task-capture|log-[A-Za-z-]*task|TASKS\.MD/);
           assert.ok(prompt.includes(message.content));
           sections.add(section);
