@@ -118,12 +118,12 @@ test("bot owner mentions require an authenticated allowlist, real mentions and e
     assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,["ou_alert","ou_bot"]);
     assert.equal(ingestLarkEvent(bot("om_old_alert")).responded,false);
     assert.equal(isOwnerMentionAssistMessage(bot("om_allowed")),true);
-    for(const extra of [{mentions:[]},{mentions:[{id:{open_id:"all"}}]},{mentions:[{id:{open_id:"ou_bot"}}]},{sender_id:"ou_other"},{sender_id:"ou_bot"},{chat_type:"p2p"}]) {
+    for(const extra of [{mentions:[]},{mentions:[{id:{open_id:"all"}}]},{mentions:[{id:{open_id:"ou_bot"}}]},
+      {mentions:[{id:{open_id:"ou_owner"}},{id:{open_id:"ou_bot"}}]},{sender_id:"ou_other"},{sender_id:"ou_bot"},{chat_type:"p2p"}]) {
       assert.equal(isOwnerMentionAssistMessage(bot("om_rejected",extra)),false);
     }
-    assert.equal(ingestLarkEvent(bot("om_bot_only",{sender_id:"ou_other",mentions:[{id:{open_id:"ou_bot"}}]})).responded,false);
-    f.runtime.store.db.prepare("UPDATE lark_messages SET mentioned=1,reply_trigger='mention',codex_status='failed' WHERE message_id='om_bot_only'").run();
-    assert.equal(enqueueLarkCodexReply(f.row("om_bot_only").id),false);
+    assert.equal(ingestLarkEvent(bot("om_other_owner_only",{sender_id:"ou_other"})).responded,false);
+    assert.equal(enqueueLarkCodexReply(f.row("om_other_owner_only").id),false);
     const source=await f.start("om_allowed_alert",{sender_type:"bot",sender_id:"ou_alert",message_type:"interactive",content:"告警，需核查"});
     assert.equal(source.reply_trigger,"owner_mention");
     const params=f.records().find(r=>r.method==="thread/start").params;
@@ -150,6 +150,72 @@ test("bot owner mentions require an authenticated allowlist, real mentions and e
     assert.equal(isOwnerMentionAssistMessage(bot("om_disabled")),false);
     setAppSettingValue("ownerMentionAssistBotIds","malformed");
     assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,[]);
+  }finally{await f.close();}
+});
+
+test("external bots directly mentioning the agent bypass only owner-assist policy, not execution approvals",async()=>{
+  const f=fixture();try{
+    setAppSettingValue("ownerMentionAssistEnabled","false");
+    setAppSettingValue("ownerMentionAssistBotIds","[]");
+    await f.runtime.app.inject({method:"PATCH",url:"/v1/chats/oc_group/settings",headers:f.headers,payload:{ownerMentionAssistBotOnly:true}});
+    const extra={sender_type:"bot",sender_id:"ou_external",mentions:[{id:{open_id:"ou_bot"}}],content:"@Agent 请核查任务"};
+    const source=await f.start("om_bot_direct",extra);
+    assert.equal(source.reply_trigger,"mention");assert.equal(source.mentioned,1);
+    assert.equal(source.sender_id,"ou_external");assert.equal(ownerAssistRow(source.id),undefined);
+    assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
+    assert.equal(ingestLarkEvent(f.event("om_bot_direct",extra)).duplicate,true);
+    const thread=f.records().find(r=>r.method==="thread/start").params;
+    assert.equal(thread.sandbox,"read-only");assert.equal(thread.approvalPolicy,"on-request");
+    await codexAppServer.request("fixture/approval",{request:{id:"bot-direct-command",method:"item/commandExecution/requestApproval",params:{
+      threadId:source.codex_session_id,turnId:source.codex_turn_id,itemId:"direct-command",command:"echo check",cwd:f.root}}});
+    const pending=()=>f.runtime.store.db.prepare("SELECT * FROM lark_execution_approvals WHERE lark_message_id=? AND status='pending' AND card_message_id IS NOT NULL").get(source.id) as any;
+    await until(()=>Boolean(pending()));
+    const approval=pending();assert.equal(approval.requester_id,"ou_external");assert.equal(approval.approver_id,"ou_owner");
+    assert(!f.records().some(r=>r.id==="bot-direct-command"&&r.result?.decision==="accept"));
+    assert.equal(decideLarkExecutionApprovalFromCard({token:approval.token,decision:"reject",operatorId:"ou_owner",messageId:approval.card_message_id}).ok,true);
+    await until(()=>f.records().some(r=>r.id==="bot-direct-command"&&r.result?.decision==="decline"));
+    await f.complete("om_bot_direct","该操作未执行。");
+    assert(f.sent.length>0);assert(f.sent.every(text=>!text.includes("<at ")));
+    assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
+  }finally{await f.close();}
+});
+
+test("bot mentions of both owner and agent are direct replies regardless of the owner-assist allowlist",async()=>{
+  for(const allowed of [false,true]){
+    const f=fixture();try{
+      setAppSettingValue("ownerMentionAssistBotIds",JSON.stringify(allowed?["ou_external"]:[]));
+      const source=await f.start("om_bot_both",{sender_type:"bot",sender_id:"ou_external",
+        mentions:allowed?[{id:{open_id:"ou_owner"}},{id:{open_id:"ou_bot"}}]:[{id:"ou_owner"},{id:"ou_bot"}]});
+      assert.equal(source.reply_trigger,"mention");assert.equal(ownerAssistRow(source.id),undefined);
+      await f.complete("om_bot_both","收到你的直接提问。");
+      assert.deepEqual(f.sent,["收到你的直接提问。"]);
+      assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
+    }finally{await f.close();}
+  }
+});
+
+test("self bot, plain text, quoted mentions and unrelated mentions do not trigger direct bot replies",async()=>{
+  const f=fixture();try{
+    const cases=[
+      {sender_id:"ou_bot",mentions:[{id:{open_id:"ou_bot"}}]},
+      {sender_id:"",mentions:[{id:{open_id:"ou_bot"}}]},
+      {mentions:[],content:"@Agent please reply"},
+      {mentions:[{id:{open_id:"all"}}]},
+      {mentions:[{id:{open_id:"ou_someone"}}]},
+      {mentions:[],reply_to:"om_parent",content:'quoted <at user_id="ou_bot"></at>'},
+      {chat_type:"p2p",mentions:[]},
+    ];
+    for(const [i,extra] of cases.entries()){
+      const id=`om_bot_ignored_${i}`;
+      assert.equal(ingestLarkEvent(f.event(id,{sender_type:"bot",sender_id:"ou_external",...extra})).responded,false);
+      assert.equal(f.row(id).mentioned,0);assert.equal(f.row(id).codex_status,"skipped");
+      assert.equal(enqueueLarkCodexReply(f.row(id).id),false);
+    }
+    setAppSettingValue("repliesEnabled","false");
+    ingestLarkEvent(f.event("om_bot_replies_off",{sender_type:"bot",sender_id:"ou_external",mentions:[{id:"ou_bot"}]}));
+    assert.equal(f.row("om_bot_replies_off").mentioned,1);
+    assert.equal(enqueueLarkCodexReply(f.row("om_bot_replies_off").id),false);
+    assert(!f.records().some(r=>r.method==="turn/start"));assert.deepEqual(f.sent,[]);
   }finally{await f.close();}
 });
 

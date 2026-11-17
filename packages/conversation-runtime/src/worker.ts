@@ -178,7 +178,8 @@ export function isOwnerMentionAssistMessage(event: LarkEvent): boolean {
   if (event.chat_type !== "group" || typeof event.chat_id !== "string" || !ownerAssistSourceAllowed(event.sender_type, event.sender_id, event.chat_id)) return false;
   if (event.sender_type === "bot") {
     const botId = resolveCurrentBotOpenId();
-    if (!botId || event.sender_id === botId) return false;
+    // A bot explicitly addressing this agent is not requesting owner assistance.
+    if (!botId || event.sender_id === botId || isAtMeMessage(event, botId)) return false;
   }
   const policy = ownerMentionAssistSettings(event.chat_id);
   return policy.effectiveEnabled && event.sender_id !== policy.ownerId && isAtMeMessage(event, policy.ownerId);
@@ -277,7 +278,12 @@ function persistLarkEvent(event: LarkEvent): void {
   const eventId = stringValue(event.event_id);
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
   if (messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger === "topic") return;
-  const directlyMentioned = event.sender_type !== "bot" && isAtMeMessage(event);
+  const fromBot = event.sender_type === "bot";
+  const botOpenId = fromBot ? resolveCurrentBotOpenId() : undefined;
+  const directlyMentioned = fromBot
+    ? event.chat_type === "group" && typeof event.sender_id === "string" && Boolean(event.sender_id.trim())
+      && typeof botOpenId === "string" && event.sender_id !== botOpenId && isAtMeMessage(event, botOpenId)
+    : isAtMeMessage(event);
   const chatId = stringValue(event.chat_id);
   const rootMessageId = stringValue(event.root_id);
   const threadId = stringValue(event.thread_id);

@@ -1787,6 +1787,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
   }
   const target = db.prepare("SELECT * FROM lark_messages WHERE id=?").get(larkMessageId) as LarkMessageRow | undefined;
   if (target?.chat_type === "group" && target.sender_type === "bot"
+    && !(target.reply_trigger === "mention" && target.mentioned === 1)
     && (target.reply_trigger !== "owner_mention" || !ownerAssistSourceAllowed(target.sender_type, target.sender_id))) return false;
   const chatId = target?.chat_id;
   const spontaneousPolicy = target?.reply_trigger === "spontaneous" && chatId ? conversationSpontaneousSettings(chatId) : null;
