@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
-import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
+import { loadApprovalDirectQuote, loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { configureTurnApprovalReviewer, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews } from "./turnAutoApproval.js";
 import { turnApprovalModelPrompt } from "./turnApprovalReviewer.js";
 import { serializeCodexAppServerMessage } from "@lark-agent/adapter-codex-app-server";
@@ -28,6 +28,14 @@ test("approval background is bounded, chronological and isolated by person, chat
     add(6, { topic: "topic-other" }); add(7, { at: "2025-12-31T00:00:00Z" }); add(8, { type: "app" });
     add(9, { direction: "outbound" }); add(10, { at: "2026-01-02T00:00:00Z" });
     add(20, { at: "2026-01-01T12:00:00Z", content: "这是第一次上线，为什么需要处理旧数据？" });
+    add(17, { sender: "ou_other", content: "查昨天的汇总 https://example.org/report?disposable_login_token=fixture-secret" });
+    const quote = (id: number) => store.db.prepare("UPDATE lark_messages SET reply_to_message_id=?,reply_to_content='unverified snapshot' WHERE id=20").run(`om_${id}`);
+    for (const id of [3, 6, 10, 20, 999]) {
+      quote(id);
+      assert.equal(loadApprovalDirectQuote(store.db, 20, "ou_sender"), undefined);
+    }
+    quote(17);
+    assert.equal(loadApprovalDirectQuote(store.db, 20, "ou_other"), undefined);
     const context = loadApprovalTaskContext(store.db, 20, "ou_sender");
     assert.deepEqual(context.map(row => row.messageId), [1, 2]);
     assert.match(formatApprovalTaskContext(context), /部署 demo-api 和 demo-worker/);
@@ -40,9 +48,12 @@ test("approval background is bounded, chronological and isolated by person, chat
       assert.deepEqual(input.taskContext?.map(row => row.messageId), [1, 2]);
       const prompt = JSON.parse(turnApprovalModelPrompt(input, []));
       assert.equal(prompt.request, input.originalMessage); assert.match(prompt.taskContext[0].request, /部署 demo-api/);
+      assert.equal(prompt.directQuote, "查昨天的汇总 https://example.org/report");
+      assert.equal(prompt.operationIntent, '读取当前状态，Bearer [已隐藏]');
+      assert.equal(prompt.firstOperation, input.operation);
       return { decision: "manual", reason: "背景不是新授权" };
     });
-    const decision = await reviewLarkTurnAutoApproval({ messageId: 20, turnId: "new-turn", senderId: "ou_sender", originalMessage: "这是第一次上线，为什么需要处理旧数据？", operation: 'forge.deploy.production: {"repo":"demo-api","apps":["demo-api"]}', cwd: root });
+    const decision = await reviewLarkTurnAutoApproval({ messageId: 20, turnId: "new-turn", senderId: "ou_sender", originalMessage: "这是第一次上线，为什么需要处理旧数据？", operation: 'forge.deploy.production: {"repo":"demo-api","apps":["demo-api"]}', operationIntent: "读取当前状态，Bearer fixture-secret", cwd: root });
     assert.equal(sawBackground, true); assert.equal(decision.source, "model"); assert.equal(decision.approved, false);
     for (let id = 11; id < 17; id++) add(id, { content: "x".repeat(299) + "\u{1f4dd}" + "x".repeat(1000), result: "y".repeat(99) + "\u{1f4dd}" + "y".repeat(1000) });
     const bounded = loadApprovalTaskContext(store.db, 20, "ou_sender");

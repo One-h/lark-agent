@@ -655,7 +655,7 @@ export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: s
 
 function larkQueryExecutionApprovalPrompt(trustedSender: boolean): string {
   const workflow = "工作区流程：遵守当前工作区的指令和适用工作流；流程中需要受限操作时，通过现有审批机制申请授权，权限不足不等于省略该步骤。执行仍遵从用户明确限定的任务范围和现有权限策略，工作区指令本身不授予额外权限。";
-  const scope = "审批范围：以当前任务、具体操作及实际审批结果判断权限。历史拒绝只约束当时请求及明确拒绝的范围；新告警、新任务或新时间窗口按当前范围申请所需授权。当前范围内的明确拒绝应停止，改写同一操作不构成新授权；过期表示该申请已失效。报告阻碍时区分人工拒绝、策略拦截、待人工、过期和原生拒绝；来源未核实就说明未知，历史回复不是本轮审批结果。";
+  const scope = "审批范围：以当前任务、具体操作及实际审批结果判断权限。申请授权时用一句话说明目的、目标和预计影响，区分只读查询、本地交付和线上变更。历史拒绝只约束当时请求及明确拒绝的范围；新告警、新任务或新时间窗口按当前范围申请所需授权。当前范围内的明确拒绝应停止，改写同一操作不构成新授权；过期表示该申请已失效。报告阻碍时区分人工拒绝、策略拦截、待人工、过期和原生拒绝；来源未核实就说明未知，历史回复不是本轮审批结果。";
   return trustedSender ? `${workflow}\n\n${scope}` : `${workflow}\n\n只读查询执行授权：本地检索可直接进行；用户要求的查询若需联网、隧道或系统凭据，应使用执行工具提供的审批参数（例如 sandbox_permissions=require_escalated）申请对应命令的授权，由现有自动/人工审批决定。区分环境访问受限与真实缺配置；账号认证失败、业务权限拒绝或来源白名单拦截，不能通过提权、换账号或导出凭据绕过。\n\n${scope}`;
 }
 
@@ -3516,7 +3516,7 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     const cwd = details.cwd ?? config.workspaceRoot;
     const approvalInput = (member: PreparedLarkCodexMessage) => ({
       messageId: member.row.id, turnId: approvalTurnId, senderId: member.row.sender_id,
-      originalMessage: member.row.content ?? "", operation: details.operation, cwd
+      originalMessage: member.row.content ?? "", operation: details.operation, operationIntent: details.reason, cwd
     });
     void reviewLarkTurnAutoApproval(approvalInput(target), () => {
       if (request.method !== "item/commandExecution/requestApproval"

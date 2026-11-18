@@ -4,7 +4,7 @@ import { config, appSettingValue, db, nowIso, validLarkCodexModel } from "./cont
 import { reviewTurnWithCodex } from "./turnApprovalReviewer.js";
 import { queueTurnAutoApprovalNotification } from "./turnApprovalNotifications.js";
 import { requiresManualCliApproval } from "./approvalCommands.js";
-import { loadApprovalTaskContext, type ApprovalTaskContext } from "./approvalTaskContext.js";
+import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskContext } from "./approvalTaskContext.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -26,6 +26,8 @@ export type ApprovalTask = { type: "pr_review" | "data_query" | "deployment" | "
 export type TurnApprovalInput = {
   messageId: number; turnId: string; senderId: string | null;
   originalMessage: string; operation: string; cwd: string | null;
+  operationIntent?: string | null;
+  directQuote?: string;
   taskContext?: ApprovalTaskContext;
 };
 export type ApprovalPrecedent = {
@@ -251,7 +253,12 @@ function approvalReuseScope(input: TurnApprovalInput): Pick<ReviewEntry, "deploy
 
 export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInput?: RefreshApprovalInput): Promise<TurnApprovalDecision> {
   if (!turnAutoApprovalEnabled()) return Promise.resolve({ approved: false, source: "disabled", reason: "自动审批未启用" });
-  input = { ...input, taskContext: loadApprovalTaskContext(db, input.messageId, input.senderId) };
+  const withContext = <T extends TurnApprovalInput>(candidate: T) => ({
+    ...candidate,
+    directQuote: loadApprovalDirectQuote(db, candidate.messageId, candidate.senderId),
+    taskContext: loadApprovalTaskContext(db, candidate.messageId, candidate.senderId)
+  });
+  input = withContext(input);
   let current = reviews.get(db);
   if (!current) { current = new Map(); reviews.set(db, current); }
   const key = JSON.stringify([input.turnId, input.senderId, config.larkExecutionApproverId]);
@@ -268,7 +275,7 @@ export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInpu
       const entry = current.get(key);
       if (!entry || entry.controller !== controller) return undefined;
       if (fresh.messageId !== input.messageId) Object.assign(entry, approvalReuseScope(fresh));
-      return { ...fresh, taskContext: loadApprovalTaskContext(db, fresh.messageId, fresh.senderId) };
+      return withContext(fresh);
     }) });
   current.set(key, { controller, result, ...approvalReuseScope(input) });
   return result;

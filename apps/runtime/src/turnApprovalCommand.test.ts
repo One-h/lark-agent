@@ -34,7 +34,12 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${root}:${previousPath ?? ""}`;
     let reviews = 0;
     const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
-      turnApprovalReviewer: async () => { reviews++; return { decision: scenario.manual ? "manual" : "approve_turn", reason: "fixture query review" }; },
+      turnApprovalReviewer: async input => {
+        reviews++;
+        assert.equal(input.operationIntent, "Read-only query requires network and system credentials");
+        assert.match(input.operation, /python3 query-readonly\.py check/);
+        return { decision: scenario.manual ? "manual" : "approve_turn", reason: "fixture query review" };
+      },
       textReplySender: () => ({ ok: true, messageId: "om_fixture_reply", chatId: "oc_query", messageAt: new Date().toISOString(), messageType: "text" }) });
     try {
       await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true, executionReceiptsEnabled: false, interimRepliesEnabled: false } });

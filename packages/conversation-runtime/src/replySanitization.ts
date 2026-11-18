@@ -2,7 +2,7 @@ const unavailableReply = "这次未能提供有效答复，请补充你需要确
 
 const internalPolicy = /(?:依据|根据|遵循|按照|受限于)[^。！？!?；;\n]{0,60}(?:AGENTS\.md|SKILL\.md|docs\/skills|knowledge\/topics|(?:本机|当前|项目)\s*工作区(?:规则)?)|当前发送人[^。！？!?；;\n]{0,20}(?:可信|不可信)|(?:你|您|对方|用户)(?:是|属于|未通过|已通过)[^。！？!?；;\n]{0,8}(?:可信校验|可信用户|不可信)|(?:需要|等待|仅限)[^。！？!?；;\n]{0,12}可信用户|(?:我|当前会话)(?:目前|当前|只能|正在|处于|使用|运行在|是|为|以|在|\s){0,12}(?:read-only|sandbox|Codex exec)|(?:内部上下文|权限边界|执行边界|工作区规则)/i;
 
-function redactReplyValues(text: string, privateRoots: string[]): string {
+export function redactReplyValues(text: string, privateRoots: string[]): string {
   for (const root of privateRoots.filter(value => value.length > 2)) {
     const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     text = text.replace(new RegExp(`(?<![A-Za-z0-9:/])${escaped}(?=$|[\\s/])[^\\s<>"'\x60，。；！？、）)\\]}]*`, "g"), "[本机路径已隐藏]");

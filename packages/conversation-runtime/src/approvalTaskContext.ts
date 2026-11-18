@@ -3,6 +3,18 @@ import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 
 export type ApprovalTaskContext = Array<{ messageId: number; request: string; result: string }>;
 
+export function loadApprovalDirectQuote(database: Database.Database, messageId: number, senderId: string | null): string | undefined {
+  if (!senderId) return;
+  const quote = database.prepare(`SELECT quoted.content FROM lark_messages current
+    JOIN lark_messages quoted ON quoted.message_id=current.reply_to_message_id AND quoted.chat_id=current.chat_id
+      AND COALESCE(quoted.thread_id,'')=COALESCE(current.thread_id,'')
+    WHERE current.id=? AND current.sender_id=? AND current.direction='inbound'
+      AND quoted.id<>current.id
+      AND COALESCE(quoted.message_at,quoted.received_at)<=COALESCE(current.message_at,current.received_at)`)
+    .get(messageId, senderId) as { content: string | null } | undefined;
+  return quote?.content ?? undefined;
+}
+
 export function loadApprovalTaskContext(database: Database.Database, messageId: number, senderId: string | null): ApprovalTaskContext {
   if (!senderId) return [];
   const current = database.prepare("SELECT chat_id,sender_id,codex_session_id,thread_id,received_at FROM lark_messages WHERE id=?")
