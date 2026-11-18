@@ -40,6 +40,29 @@ test("history matches another PR in the same repository without model calls", as
   } finally { f.close(); }
 });
 
+test("message keywords go to the reviewer instead of forcing manual or borrowing a positive precedent", async () => {
+  const f = fixture();
+  try {
+    addHuman(f.store, { id: 1 });
+    let calls = 0;
+    const options = { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async (request: TurnApprovalInput) => {
+      calls++;
+      return request.originalMessage.includes("合并代码")
+        ? { decision: "manual" as const, reason: "PR merge remains manual" }
+        : { decision: "approve_turn" as const, reason: "Read-only data aggregation" };
+    } };
+    const read = { ...input, originalMessage: "合并两张表，查询汇总", operation: "python3 query-report.py" };
+    assert.equal(requiresManualTurnApproval(read), false);
+    assert.equal((await decideTurnAutoApproval(read, options)).source, "model");
+    const mixed = { ...input, turnId: "turn-mixed", originalMessage: input.originalMessage + "，之后合并代码", operation: "git status" };
+    const result = await decideTurnAutoApproval(mixed, options);
+    assert.equal(result.source, "model");
+    assert.equal(result.approved, false);
+    assert.equal(calls, 2);
+    assert.equal(requiresManualTurnApproval({ ...mixed, operation: "git merge topic" }), true);
+  } finally { f.close(); }
+});
+
 test("automatic rows and expired cards do not become human precedents", async () => {
   const f = fixture(); let calls = 0;
   try {
@@ -138,6 +161,7 @@ test("a cached turn grant cannot authorize flagged mutating CLI commands", async
     for (const operation of ["git -C /tmp/repo push origin main", "kubectl --context fixture delete deployment demo"]) {
       assert.equal((await reviewLarkTurnAutoApproval({ ...input, operation })).approved, false);
     }
+    assert.equal((await reviewLarkTurnAutoApproval({ ...input, messageId: input.messageId + 1, originalMessage: "合并代码后再检查" })).approved, false);
     assert.equal(calls, 1);
   } finally { finishLarkTurnAutoApproval(input.turnId); configureTurnApprovalReviewer(); f.close(); }
 });

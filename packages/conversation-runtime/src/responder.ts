@@ -242,6 +242,7 @@ type PendingLarkExecutionApproval = {
     requestId: string | number;
     requestMethod: string;
     operation: string;
+    reason: string | null;
     approvedResponse: unknown;
     rejectedResponse: unknown;
   }>;
@@ -3015,6 +3016,7 @@ function refreshPendingExecutionApprovalBatchCard(
     taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, target.row.id, target.row.sender_id)),
     operation,
     operationCount: pending.requests.length,
+    operationIntents: pending.requests.map(request => request.reason),
     cwd: row.cwd,
     reason: row.reason,
     approvalToken: row.token
@@ -3028,7 +3030,8 @@ function refreshPendingExecutionApprovalBatchCard(
 function refreshExecutionApprovalCard(
   row: LarkExecutionApprovalRow,
   status: "approved" | "rejected" | "expired" | "failed",
-  decidedAt: string
+  decidedAt: string,
+  requests?: PendingLarkExecutionApproval["requests"]
 ): void {
   if (!row.card_message_id) return;
   const source = db.prepare(`
@@ -3042,6 +3045,8 @@ function refreshExecutionApprovalCard(
     originalMessage: source?.content ?? "",
     taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, row.lark_message_id, row.requester_id)),
     operation: row.operation ?? "修改本机状态",
+    operationCount: requests?.length,
+    operationIntents: requests?.map(request => request.reason),
     cwd: row.cwd,
     reason: row.reason,
     status,
@@ -3102,7 +3107,7 @@ function completePendingExecutionApproval(
     pending.run.turnApprovalApproverId = row.approver_id;
     pending.run.turnApprovalAutoReviewId = null;
   }
-  refreshExecutionApprovalCard(decidedRow, nextStatus, decidedAt);
+  refreshExecutionApprovalCard(decidedRow, nextStatus, decidedAt, pending.requests);
   if (decision === "rejected" || decision === "expired") {
     sendApprovalOutcomeToRequester(pending.run, row, decision);
   }
@@ -3134,7 +3139,7 @@ function completePendingExecutionApproval(
           reasonCode: "approval_response_failed", reason: "审批结果回传原生 Codex 失败，不代表人工拒绝。" });
       }
     })();
-    refreshExecutionApprovalCard(row, "failed", decidedAt);
+    refreshExecutionApprovalCard(row, "failed", decidedAt, pending.requests);
     clearPendingExecutionApproval(pending);
     return { ok: false, status: "failed", message: "Codex 执行会话已经断开，请重新发送指令。" };
   }
@@ -3179,7 +3184,7 @@ function cancelRunExecutionApprovals(run: ActiveLarkCodexRun, reason: string): v
         reasonCode: "approval_context_invalidated", reason: "任务已结束或协同/授权范围已变化，待审批申请已失效。" });
       try { codexAppServer.respondToRequest(request.requestId, request.rejectedResponse); } catch { /* The native turn may already be closed. */ }
     }
-    if (row) refreshExecutionApprovalCard({ ...row, reason }, "failed", now);
+    if (row) refreshExecutionApprovalCard(row, "failed", now, pending.requests);
   }
 }
 
@@ -3631,6 +3636,7 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
       requestId: request.id,
       requestMethod: request.method,
       operation: details.operation,
+      reason: details.reason,
       approvedResponse: details.approvedResponse,
       rejectedResponse: details.rejectedResponse
     });
@@ -3690,6 +3696,7 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
       requestId: request.id,
       requestMethod: request.method,
       operation: details.operation,
+      reason: details.reason,
       approvedResponse: details.approvedResponse,
       rejectedResponse: details.rejectedResponse
     }],

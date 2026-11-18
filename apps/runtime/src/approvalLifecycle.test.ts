@@ -50,20 +50,31 @@ async function fixture(reviewer?: RuntimeConfig["turnApprovalReviewer"], native 
 }
 
 test("native and capability cards share actions, fields and truthful once/turn terminal labels", () => {
-  const details = { requester: "Example", originalMessage: "deploy", operation: "deploy demo", cwd: "/workspace", reason: null, taskContext: "previous task" };
+  const details = { requester: "Example", originalMessage: "export", operation: "/bin/zsh -lc " + "creator-row ".repeat(300),
+    cwd: "/workspace", reason: "新建飞书表格并写入核对后的名单", taskContext: "previous task" };
   for (const target of [{ approvalToken: "native-token" }, { approvalId: 10 }]) {
     const card = buildLarkExecutionApprovalCard({ ...details, ...target });
     const text = JSON.stringify(card);
     assert.match(text, /Lark Agent 执行授权/); assert.match(text, /允许本次/); assert.match(text, /允许当前任务/); assert.match(text, /任务背景/);
     assert.match(text, /approve-turn/);
+    assert.match(text, /执行意图：新建飞书表格并写入核对后的名单/);
+    assert.doesNotMatch(text, /creator-row|\/bin\/zsh|\/workspace/);
+    assert.ok(text.indexOf("执行意图") < text.indexOf("原始消息"));
   }
   const once = JSON.stringify(buildLarkExecutionApprovalResultCard({ ...details, status: "approved", approvalScope: "once", decidedAt: new Date().toISOString() }));
   assert.match(once, /已允许本次/); assert.doesNotMatch(once, /已允许当前任务/); assert.match(once, /不代表执行成功/);
+  assert.match(once, /执行意图/); assert.doesNotMatch(once, /creator-row|\/bin\/zsh|\/workspace/);
+  const batch = JSON.stringify(buildLarkExecutionApprovalCard({ ...details, approvalToken: "fixture",
+    operationCount: 4, operationIntents: ["第一项", null, "第三项", "第四项"] }));
+  assert.match(batch, /执行意图（4 项）/);
+  assert.match(batch, /2\. 未提供意图/);
+  assert.match(batch, /其余 1 项请在本地审批记录核对/);
+  assert.doesNotMatch(batch, /第四项|creator-row/);
   assert.equal(capabilityApprovalAction({ action_value: { approval_id: 1, action: "approve" } }), null);
   assert.deepEqual(capabilityApprovalAction({ action_value: { approval_id: 1, action: "approve-turn" }, operator_id: "ou_owner", message_id: "om_card_1" }),
     { id: 1, decision: "approve-turn", actorId: "ou_owner", messageId: "om_card_1" });
   const operation = formatCapabilityApprovalOperation('发布: {"repo":"demo-api","apps":["demo-api"],"expectedRevision":"abcdef0","execute":false}');
-  assert.match(operation, /仓库：/); assert.match(operation, /目标版本：/); assert.match(operation, /"execute":false/);
+  assert.match(operation, /仓库：demo-api/); assert.match(operation, /目标版本：abcdef0/); assert.doesNotMatch(operation, /execute/);
 });
 
 test("single-call authorization is not reused; human turn permission is scoped and replay-safe", async () => {

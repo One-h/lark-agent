@@ -210,6 +210,8 @@ export type LarkExecutionApprovalDetails = {
   originalMessage: string;
   operation: string;
   operationCount?: number;
+  operationIntents?: readonly (string | null)[];
+  operationSummary?: string;
   cwd: string | null;
   reason: string | null;
   taskContext?: string;
@@ -229,21 +231,27 @@ function compactCardText(value: string | null, maxLength: number): string {
   if (!text) {
     return "-";
   }
-  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+  const end = maxLength - 1;
+  return text.length > maxLength ? `${text.slice(0, end).replace(/[\uD800-\uDBFF]$/, "")}…` : text;
+}
+
+function approvalCardDetails(input: LarkExecutionApprovalDetails): string[] {
+  const count = input.operationCount ?? 1;
+  const intents = input.operationIntents ?? [input.reason];
+  const missing = "未提供意图，请核对本地审批记录。";
+  return [
+    count > 1 ? `执行意图（${count} 项）` : `执行意图：${compactCardText(intents[0]?.trim() || missing, 240)}`,
+    ...(count > 1 ? intents.slice(0, 3).map((intent, index) => `${index + 1}. ${compactCardText(intent?.trim() || missing, 100)}`) : []),
+    count > 3 ? `其余 ${count - 3} 项请在本地审批记录核对。` : null,
+    input.operationSummary ? `操作范围：${compactCardText(input.operationSummary, 220)}` : null,
+    `请求人：${compactCardText(input.requester, 80)}`,
+    `原始消息：${compactCardText(input.originalMessage, 180)}`,
+    input.taskContext ? `任务背景（历史）：${compactCardText(input.taskContext, 140)}` : null,
+    "完整操作及参数见本地审批记录。"
+  ].filter((value): value is string => value !== null);
 }
 
 export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardInput): Record<string, unknown> {
-  const operationLabel = input.operationCount && input.operationCount > 1
-    ? `**待执行操作（${input.operationCount} 项）**`
-    : "**待执行操作**";
-  const details = [
-    `**请求人**：${compactCardText(input.requester, 120)}`,
-    `**原始消息**：${compactCardText(input.originalMessage, 500)}`,
-    input.taskContext ? `**任务背景（历史）**：${compactCardText(input.taskContext, 600)}` : null,
-    `${operationLabel}：${compactCardText(input.operation, 800)}`,
-    input.cwd ? `**工作目录**：${compactCardText(input.cwd, 300)}` : null,
-    input.reason ? `**原因**：${compactCardText(input.reason, 300)}` : null
-  ].filter((value): value is string => Boolean(value));
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -251,7 +259,7 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
       title: { tag: "plain_text", content: "Lark Agent 执行授权" }
     },
     elements: [
-      { tag: "div", text: { tag: "lark_md", content: details.join("\n") } },
+      { tag: "div", text: { tag: "plain_text", content: approvalCardDetails(input).join("\n") } },
       {
         tag: "action",
         actions: [
@@ -299,15 +307,9 @@ export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprova
         ? { label: "已过期", template: "grey", note: "该操作未执行，请重新发送指令。" }
         : { label: "处理失败", template: "red", note: "审批请求处理失败，请重新发送指令。" };
   const details = [
-    `**状态**：${status.label}`,
-    `**请求人**：${compactCardText(input.requester, 120)}`,
-    `**原始消息**：${compactCardText(input.originalMessage, 500)}`,
-    input.taskContext ? `**任务背景（历史）**：${compactCardText(input.taskContext, 600)}` : null,
-    `**待执行操作**：${compactCardText(input.operation, 800)}`,
-    input.cwd ? `**工作目录**：${compactCardText(input.cwd, 300)}` : null,
-    input.reason ? `**原因**：${compactCardText(input.reason, 300)}` : null,
-    `**处理时间**：${new Date(input.decidedAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`
-  ].filter((value): value is string => Boolean(value));
+    ...approvalCardDetails(input),
+    `处理时间：${new Date(input.decidedAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`
+  ];
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -315,7 +317,7 @@ export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprova
       title: { tag: "plain_text", content: `Lark Agent 执行授权 · ${status.label}` }
     },
     elements: [
-      { tag: "div", text: { tag: "lark_md", content: details.join("\n") } },
+      { tag: "div", text: { tag: "plain_text", content: details.join("\n") } },
       { tag: "note", elements: [{ tag: "plain_text", content: status.note }] }
     ]
   };

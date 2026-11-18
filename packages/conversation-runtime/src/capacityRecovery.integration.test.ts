@@ -229,7 +229,7 @@ test("an approved command is rechecked once after an accepted same-sender steer"
         await until(() => reviews.length === 1);
         await steer(2, outcome === "restricted" ? "回滚服务" : "只核对就绪状态", outcome === "different-sender" ? "ou_other" : undefined);
         reviews[0].resolve({decision: "approve_turn", reason: "original scope"});
-        if (outcome === "different-sender" || outcome === "restricted") {
+        if (outcome === "different-sender") {
           await until(() => cards().length === 1);
           assert.equal(cards()[0].lark_message_id, 2);
           assert.equal(reviews.length, 1);
@@ -243,7 +243,7 @@ test("an approved command is rechecked once after an accepted same-sender steer"
         assert.deepEqual(cards(), []);
         assert.equal(reviews[1].input.messageId, 2);
         assert.equal(reviews[1].input.operation, reviews[0].input.operation);
-        assert.equal(reviews[1].input.originalMessage, "只核对就绪状态");
+        assert.equal(reviews[1].input.originalMessage, outcome === "restricted" ? "回滚服务" : "只核对就绪状态");
         assert.deepEqual(reviews[1].input.taskContext?.map(row => row.messageId), [1]);
         if (outcome === "parallel-command") {
           await f.approval("parallel-approval", "kubectl get pods");
@@ -252,7 +252,7 @@ test("an approved command is rechecked once after an accepted same-sender steer"
         }
         if (outcome === "superseded") await steer(3, "另一个目标");
         if (outcome === "ended") await f.complete();
-        reviews[1].resolve({decision: outcome === "manual" ? "manual" : "approve_turn", reason: "rechecked scope"});
+        reviews[1].resolve({decision: outcome === "manual" || outcome === "restricted" ? "manual" : "approve_turn", reason: "rechecked scope"});
         const audit = () => f.store.db.prepare("SELECT lark_message_id, decision, applied_at FROM lark_turn_auto_reviews").get() as {lark_message_id: number; decision: string; applied_at: string | null};
         if (outcome === "approve_turn" || outcome === "steer-ack-only" || outcome === "parallel-command") {
           await until(() => response()?.result.decision === "accept");

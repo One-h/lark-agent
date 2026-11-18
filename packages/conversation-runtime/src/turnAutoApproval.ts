@@ -46,7 +46,7 @@ export type TurnApprovalDecision = {
 };
 
 type RefreshApprovalInput = () => (TurnApprovalInput & { requestId: string | number }) | undefined;
-type ReviewEntry = { controller: AbortController; result: Promise<TurnApprovalDecision>; deploymentIntent: boolean; deploymentTargets: string[] };
+type ReviewEntry = { controller: AbortController; result: Promise<TurnApprovalDecision>; messageId: number; deploymentIntent: boolean; deploymentTargets: string[] };
 const reviews = new WeakMap<Database.Database, Map<string, ReviewEntry>>();
 let reviewer: TurnApprovalReviewer = reviewTurnWithCodex;
 
@@ -105,9 +105,13 @@ export function approvalTask(message: string, dataSources: readonly string[] = [
 }
 
 export function requiresManualTurnApproval(input: TurnApprovalInput): boolean {
-  return /回滚|合并|删库|删除数据|修改数据库|改代码|修复代码|\b(?:rollback|merge)\b/i.test(input.originalMessage)
-    || requiresManualCliApproval(input.operation)
+  return requiresManualCliApproval(input.operation)
     || /\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+table|truncate\s+table)\b/i.test(input.operation);
+}
+
+function requiresModelScopeReview(message: string): boolean {
+  // Text can require a fresh judgment, but does not itself make an operation manual-only.
+  return /回滚|合并|删库|删除数据|修改数据库|改代码|修复代码|\b(?:rollback|merge)\b/i.test(message);
 }
 
 export function humanApprovalHistory(database: Database.Database, senderId: string, approverId: string): ApprovalPrecedent[] {
@@ -153,7 +157,8 @@ function isDeploymentExecution(operation: string): boolean {
 export function canReuseLarkTurnAutoApproval(input: TurnApprovalInput): boolean {
   const key=JSON.stringify([input.turnId,input.senderId,config.larkExecutionApproverId]);
   const existing=reviews.get(db)?.get(key);
-  if (!existing || requiresManualTurnApproval(input)) return false;
+  if (!existing || requiresManualTurnApproval(input)
+    || (input.messageId !== existing.messageId && requiresModelScopeReview(input.originalMessage))) return false;
   if (!isDeploymentExecution(input.operation)) return true;
   const targets=deploymentOperationTargets(input.operation);
   return existing.deploymentIntent && Boolean(targets?.length)
@@ -207,8 +212,10 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   if (requiresManualTurnApproval(input)) return finish({ approved: false, source: "manual", reason: "当前任务需要人工授权" });
   const history = humanApprovalHistory(database, input.senderId, approverId);
   const match = matchHumanTurnApproval(input, history, dataSources);
-  if (match) return finish({ approved: match.status === "approved" && match.scope === "turn", source: "history",
+  if (match && (match.status !== "approved" || match.scope !== "turn" || !requiresModelScopeReview(input.originalMessage))) {
+    return finish({ approved: match.status === "approved" && match.scope === "turn", source: "history",
     matchedApprovalId: match.id, reason: match.status === "rejected" ? "最近同类人工审批已拒绝" : match.scope !== "turn" ? "历史授权仅允许单次操作" : "匹配同一发送人、任务类型、目标及工作目录的人工 turn 授权" });
+  }
   try {
     const judge = async (candidate: TurnApprovalInput) => {
       const judged = await (options.reviewer ?? reviewTurnWithCodex)(candidate, history.slice(0, 3), options.signal ?? new AbortController().signal, model);
@@ -239,7 +246,7 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   }
 }
 
-function approvalReuseScope(input: TurnApprovalInput): Pick<ReviewEntry, "deploymentIntent" | "deploymentTargets"> {
+function approvalReuseScope(input: TurnApprovalInput): Pick<ReviewEntry, "messageId" | "deploymentIntent" | "deploymentTargets"> {
   const deploymentExecution = isDeploymentExecution(input.operation);
   const task=approvalTask(input.originalMessage);
   const inspectionIntent=/查询|检查|排查|是否|状态|\b(?:inspect|check|status)\b/i.test(input.originalMessage);
@@ -248,7 +255,7 @@ function approvalReuseScope(input: TurnApprovalInput): Pick<ReviewEntry, "deploy
     && (deploymentExecution || /部署|上线|发布|\b(?:deploy|sync)\b/i.test(input.originalMessage)));
   const deploymentTargets=task?.type === "deployment" || task?.type === "deployment_query"
     ? (JSON.parse(task.target) as {services:string[]}).services : deploymentOperationTargets(input.operation) ?? [];
-  return { deploymentIntent, deploymentTargets };
+  return { messageId: input.messageId, deploymentIntent, deploymentTargets };
 }
 
 export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInput?: RefreshApprovalInput): Promise<TurnApprovalDecision> {
