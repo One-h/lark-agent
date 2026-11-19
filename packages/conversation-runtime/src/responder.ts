@@ -3540,7 +3540,50 @@ export async function runLarkHistoryImageMcpTool(contextToken: string, tool: "se
   return result;
 }
 
+function handleLarkMcpConfirmation(request: CodexAppServerRequest): boolean {
+  if (request.method !== "mcpServer/elicitation/request") return false;
+  const params = request.params as { serverName?: unknown; threadId?: unknown; turnId?: unknown; mode?: unknown;
+    _meta?: { codex_approval_kind?: unknown; tool_name?: unknown; tool_params?: unknown } } | undefined;
+  if (params?.serverName !== "lark_tools") return false;
+  const respond = (approved: boolean) => codexAppServer.respondToRequest(request.id,
+    approved ? { action: "accept", content: {} } : { action: "decline", content: null });
+  const meta = params._meta;
+  const tool = meta?.tool_params as { context_token?: unknown; input?: unknown } | null | undefined;
+  if (params.mode !== "form" || meta?.codex_approval_kind !== "mcp_tool_call" || typeof meta.tool_name !== "string"
+    || !larkMcpHostCapabilityId(meta.tool_name) || !tool || typeof tool !== "object" || Array.isArray(tool)
+    || Object.keys(tool).some(key => !["context_token", "input"].includes(key)) || !("input" in tool)
+    || typeof tool.context_token !== "string" || !config.larkAgentRuntimeUrl || !config.larkAgentMcpToken
+    || typeof params.threadId !== "string" || typeof params.turnId !== "string") {
+    respond(false);
+    return true;
+  }
+  const contextToken = tool.context_token;
+  const turnId = params.turnId;
+  const run = [...activeLarkCodexRuns.values()].find(candidate => candidate.threadId === params.threadId && candidate.turnId === turnId);
+  const context = getLarkMcpToolContext(contextToken);
+  if (!run || !context?.native || context.turnId !== turnId || context.native !== approvalRunMember(run)) {
+    respond(false);
+    return true;
+  }
+  const controller = new AbortController();
+  run.hostToolCalls.add(controller);
+  void (async () => {
+    try {
+      const response = await postHostJson(new URL("/v1/internal/mcp/tools/approve", config.larkAgentRuntimeUrl).href, {
+        tool: meta.tool_name, input: tool.input, contextToken, threadId: params.threadId, turnId
+      }, { authorization: `Bearer ${config.larkAgentMcpToken}` }, controller.signal);
+      const body = JSON.parse(response.body) as { approved?: boolean };
+      const live = getLarkMcpToolContext(contextToken);
+      respond(response.ok && body.approved === true && !controller.signal.aborted && live?.native === context.native && live?.turnId === turnId);
+    } catch {
+      respond(false);
+    } finally { run.hostToolCalls.delete(controller); }
+  })().catch(() => console.warn("lark_mcp_confirmation_callback_failed"));
+  return true;
+}
+
 function handleAppServerRequest(request: CodexAppServerRequest): boolean {
+  if (handleLarkMcpConfirmation(request)) return true;
   if (handleLarkHostDynamicTool(request)) return true;
   const details = approvalRequestDetails(request);
   if (!details) {

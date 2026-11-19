@@ -39,6 +39,13 @@ tokens and invalidates tool access on turn completion. Host calls retain the
 existing approval, idempotency, cancellation and delivery checks; metadata such
 as internal execution receipts is not forwarded to the model.
 
+For a Codex-native `lark_tools` tool confirmation, the runtime first checks
+the live origin and exact arguments from Codex's approval event. The same
+capability policy decides authorization; approval only opens a short-lived
+handoff. The downstream operation starts only when the matching MCP call
+actually arrives, after checking that the turn and plan are still current.
+Missing, altered, expired or unrelated confirmations do not grant access.
+
 The migration tests use actual MCP stdio with a simulated resumed Codex thread,
 mock host operations and approval cards, plus isolated external engine and
 Claude ACP fixtures. They do not send live messages or deploy real services.

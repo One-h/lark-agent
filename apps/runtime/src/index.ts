@@ -28,6 +28,7 @@ import { drainLarkProgressCards, retryPendingLarkProgressCards, type LarkProgres
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
 import { approvalPlanToolName, confirmExternalLarkMcpTurn, getLarkMcpToolContext, larkMcpHostCapabilityId,
   listLarkMcpTools, submitLarkMcpApprovalPlan } from "@lark-agent/conversation-runtime";
+import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
 import { registerOwnerMentionAssistRoutes } from "./ownerMentionAssistRoutes.js";
@@ -339,7 +340,8 @@ export function createRuntime(config: RuntimeConfig) {
   };
   const executeCapabilityInternal = async (id: string, input: unknown,
     context: { larkMessageId?: unknown; chatId?: unknown; trustScope?: unknown; turnId?: unknown; callId?: unknown },
-    requestSignal?: AbortSignal, contextStillCurrent?: () => boolean): Promise<unknown> => {
+    requestSignal?: AbortSignal, contextStillCurrent?: () => boolean,
+    beforeExecution?: (signal: AbortSignal) => Promise<void>): Promise<unknown> => {
     const capability = capabilities().find((entry) => entry.id === id);
     if (!capability) throw new Error("Capability is not registered");
     const larkMessageId = Number(context.larkMessageId);
@@ -361,7 +363,15 @@ export function createRuntime(config: RuntimeConfig) {
         LEFT JOIN lark_messages m ON m.id=i.lark_message_id WHERE i.turn_id=? AND i.capability_id=? AND i.input_hash=?`)
         .get(turnId, id, inputHash) as { status: string; result_json: string | null; error: string | null; sender_id: string | null };
       if (!message.sender_id || message.sender_id !== existing.sender_id) throw new Error("Capability invocation belongs to a different requester");
-      if (existing.status === "completed") return JSON.parse(existing.result_json ?? "null");
+      if (existing.status === "completed") {
+        if (beforeExecution && requestSignal) {
+          requestSignal.throwIfAborted();
+          await beforeExecution(requestSignal);
+          if (requestSignal.aborted || !liveTurn(larkMessageId, turnId) || !contextStillCurrent?.())
+            throw new Error("MCP 审批对应回合已结束，未返回历史结果。");
+        }
+        return JSON.parse(existing.result_json ?? "null");
+      }
       if (existing.status === "failed") throw new Error(existing.error ?? "Previous capability invocation failed");
       throw new Error("The same capability invocation is already running in this turn");
     }
@@ -382,9 +392,7 @@ export function createRuntime(config: RuntimeConfig) {
       if (current.sender_id !== message.sender_id || current.chat_id !== context.chatId || current.codex_session_id !== message.codex_session_id || (isTrustedLarkSender(current.sender_id) ? "trusted" : "untrusted") !== expectedScope)
         throw new Error("Capability identity changed while awaiting authorization");
     };
-    try {
-      assertActive();
-      let ownerMessageApproved = false;
+    const isOwnerMessageExempt = () => {
       if (id === "lark.message.send" && message.codex_status === "running" && message.codex_turn_id === turnId) {
         const payload = input as { recipient?: unknown; text?: unknown } | null;
         if (payload && typeof payload.recipient === "string" && typeof payload.text === "string") {
@@ -394,7 +402,7 @@ export function createRuntime(config: RuntimeConfig) {
             WHERE contacts.open_id=? OR contacts.name=? OR contact_aliases.alias=?`).all(recipient, recipient, recipient) as Array<{ open_id: string; name: string; is_activated: number; is_cross_tenant: number }>;
           const contact = matches.length === 1 ? matches[0] : undefined;
           const aliases = contact ? store.db.prepare("SELECT alias FROM contact_aliases WHERE open_id=?").all(contact.open_id) as Array<{ alias: string }> : [];
-          ownerMessageApproved = ownerMessageAllowed({
+          return ownerMessageAllowed({
             enabled: store.setting("ownerMessageFastPathEnabled", "false") === "true",
             ownerId: store.setting("ownerMessageFastPathOwnerId", ""), approverId: approverId ?? "",
             senderId: message.sender_id ?? "", trusted: expectedScope === "trusted",
@@ -406,11 +414,18 @@ export function createRuntime(config: RuntimeConfig) {
           });
         }
       }
+      return false;
+    };
+    try {
+      assertActive();
+      const ownerMessageApproved = isOwnerMessageExempt();
       const approvalInput: TurnApprovalInput = { messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
         originalMessage: message.content ?? "", operation: `${capability.id}: ${encodedInput}`, operationKind: "capability", cwd: workspaceRoot };
-      const requiresScopedApproval = store.setting("turnAutoApprovalEnabled", "false") === "true" || Boolean(currentApprovalPlan(store.db, approvalInput));
-      let automaticallyApproved = ownerMessageApproved || !requiresScopedApproval && hasLarkManualTurnApproval(store.db,
-        { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
+      const hasLegacyManualGrant = () => store.setting("turnAutoApprovalEnabled", "false") !== "true"
+        && !currentApprovalPlan(store.db, approvalInput) && hasLarkManualTurnApproval(store.db,
+          { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
+      const legacyManualApproved = !ownerMessageApproved && hasLegacyManualGrant();
+      let automaticallyApproved = ownerMessageApproved || legacyManualApproved;
       let authorizedPlan: { plan: ApprovalPlan | undefined; approver: string; automatic: boolean } | undefined;
       let appliedReviewId: number | undefined;
       const planApplied = (plan: ApprovalPlan | undefined, approver: string, automatic = false) => { authorizedPlan = { plan, approver, automatic }; };
@@ -443,6 +458,19 @@ export function createRuntime(config: RuntimeConfig) {
       assertActive();
       if (!await confirmTurn(larkMessageId, turnId)) throw new Error("无法确认原生 turn 仍有效，未执行操作。");
       assertActive();
+      if (beforeExecution) {
+        const reviewApprover = approverId;
+        const plan = currentApprovalPlan(store.db, approvalInput);
+        await beforeExecution(signal);
+        assertActive();
+        if (!await confirmTurn(larkMessageId, turnId)) throw new Error("MCP 审批对应回合已结束，未执行操作。");
+        assertActive();
+        if (reviewApprover !== approverId || plan !== currentApprovalPlan(store.db, approvalInput)) {
+          throw new Error("MCP 审批身份或任务计划已变化，未执行操作。");
+        }
+        if (approvalRequired && (ownerMessageApproved && !isOwnerMessageExempt() || legacyManualApproved && !hasLegacyManualGrant()))
+          throw new Error("MCP 授权条件已变化，未执行操作。");
+      }
       if (authorizedPlan && (authorizedPlan.approver !== approverId || authorizedPlan.plan !== currentApprovalPlan(store.db, approvalInput)
         || authorizedPlan.automatic && store.setting("turnAutoApprovalEnabled", "false") !== "true")) throw new Error("任务计划或审批身份已变化，操作未执行。");
       if (appliedReviewId !== undefined) markTurnAutoApprovalApplied(appliedReviewId);
@@ -823,19 +851,28 @@ export function createRuntime(config: RuntimeConfig) {
     if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
     return { tools: listLarkMcpTools(Boolean(config.runtimeToken)) };
   });
-  app.post("/v1/internal/mcp/tools/call", async (request, reply) => {
+  const mcpApprovals = new McpApprovalBridge();
+  const mcpToolRoute = async (request: FastifyRequest, reply: FastifyReply, prepare: boolean) => {
     if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
-    const payload = request.body as { tool?: unknown; contextToken?: unknown; input?: unknown; callId?: unknown } | null;
+    const payload = request.body as { tool?: unknown; contextToken?: unknown; input?: unknown; callId?: unknown; threadId?: unknown; turnId?: unknown } | null;
+    const keys = prepare ? ["tool", "contextToken", "input", "threadId", "turnId"] : ["tool", "contextToken", "input", "callId"];
     if (!payload || typeof payload.tool !== "string" || typeof payload.contextToken !== "string"
       || !/^[A-Za-z0-9_-]{32}$/.test(payload.contextToken) || !("input" in payload)
       || ("callId" in payload && (typeof payload.callId !== "string" || payload.callId.length > 200))
-      || Object.keys(payload).some(key => !["tool", "contextToken", "input", "callId"].includes(key))) {
+      || Object.keys(payload).some(key => !keys.includes(key))) {
       return reply.code(400).send({ error: "invalid MCP tool request" });
     }
     const token = payload.contextToken;
     const context = getLarkMcpToolContext(token);
     if (!context || !liveTurn(context.larkMessageId, context.turnId)) return reply.code(409).send({ error: "当前回合的工具令牌不可用。" });
+    if (prepare) {
+      const row = store.db.prepare("SELECT codex_session_id FROM lark_messages WHERE id=?").get(context.larkMessageId) as { codex_session_id: string | null };
+      if (!context.native || typeof payload.threadId !== "string" || payload.threadId !== row.codex_session_id || payload.turnId !== context.turnId) {
+        return reply.code(409).send({ error: "MCP 确认与当前原生回合不匹配。" });
+      }
+    }
     if (payload.tool === approvalPlanToolName) {
+      if (prepare) return reply.code(409).send({ error: "该工具不支持预审" });
       const result = submitLarkMcpApprovalPlan(context, payload.input);
       return result.success ? result : reply.code(409).send({ error: result.text });
     }
@@ -847,14 +884,22 @@ export function createRuntime(config: RuntimeConfig) {
       return live?.turnId === bound.turnId && live.larkMessageId === bound.larkMessageId && live.senderId === bound.senderId
         && live.chatId === bound.chatId && live.trustScope === bound.trustScope;
     };
+    const input = payload.input ?? {};
+    const key = mcpApprovalKey(token, payload.tool, payload.input);
+    const boundCall = { ...bound, callId: payload.callId ?? null };
+    if (prepare) return withToolConnection(request, reply, async signal => ({
+      approved: await mcpApprovals.prepare(key, signal, (lifetime, beforeExecution) =>
+        executeCapability(capabilityId, input, boundCall, lifetime, stillCurrent, beforeExecution))
+    }));
     return withToolConnection(request, reply, async signal => {
-      const result = await executeCapability(capabilityId, payload.input ?? {},
-        { ...bound, callId: payload.callId ?? null }, signal, stillCurrent);
+      const result = await (mcpApprovals.take(key, signal) ?? executeCapability(capabilityId, input, boundCall, signal, stillCurrent));
       const visible = result && typeof result === "object" && !Array.isArray(result)
         ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "_receipt")) : result;
       return { success: true, text: JSON.stringify(visible ?? null) };
     });
-  });
+  };
+  app.post("/v1/internal/mcp/tools/call", (request, reply) => mcpToolRoute(request, reply, false));
+  app.post("/v1/internal/mcp/tools/approve", (request, reply) => mcpToolRoute(request, reply, true));
   app.post("/v1/internal/owner-assist/decision", async (request, reply) => {
     if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
     const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
