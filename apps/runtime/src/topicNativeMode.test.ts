@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
-import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
+import { claimLarkCodexReply, config, isNativeTopicConversation, larkCodexAppServerStatus, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime, type RuntimeConfig } from "./index.js";
 import { configuredNativeAcpEngines, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
@@ -61,7 +61,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         content: "continue the investigation", root_id: "om_root", thread_id: "omt_fixture", mentions: [], ...extra };
       const result = await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: event, headers: { authorization: "Bearer fixture-token" } });
       assert.equal(result.statusCode, 200, result.body);
-      return { id, event, row: () => row(id), async started() { await until(() => Boolean(row(id)?.codex_turn_id)); return row(id); } };
+      return { id, event, row: () => row(id), async started() {
+        // The row gets a turn ID before the native steer request is acknowledged.
+        await until(() => {
+          const current = row(id);
+          return Boolean(current?.codex_turn_id && current.codex_task_dir
+            && fs.existsSync(path.join(current.codex_task_dir, "resume-session.json")));
+        });
+        return row(id);
+      } };
     },
     async complete(id: string, text = "fixture answer") {
       const current = row(id); assert(current.codex_turn_id);
@@ -71,7 +79,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       ] });
       await until(() => !["running", "queued"].includes(row(id).codex_status));
     },
-    async restart() { await runtime.app.close(); runtime.stop(); await immediate(); runtime = createRuntime(options); },
+    async restart() {
+      await until(() => larkCodexAppServerStatus().activeTurns === 0);
+      await runtime.app.close(); runtime.stop(); await immediate(); runtime = createRuntime(options);
+    },
     async close() {
       setExternalMessageHandler(null); await runtime.app.close(); runtime.stop(); await immediate();
       if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
