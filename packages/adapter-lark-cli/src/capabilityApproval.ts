@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { buildLarkExecutionApprovalCard, buildLarkExecutionApprovalResultCard } from "./reply.js";
 
 export type CapabilityApprovalCardInput = { approvalId: number; operation: string; originalMessage: string;
-  requester?: string; cwd?: string | null; reason?: string | null; taskContext?: string };
+  requester?: string; cwd?: string | null; reason?: string | null; taskContext?: string; taskPlan?: string; allowPlanApproval?: boolean };
 
 export function formatCapabilityApprovalOperation(operation: string): string {
   const boundary = operation.indexOf(": ");
@@ -30,7 +30,7 @@ export function sendApprovalCard(approverId: string, input: CapabilityApprovalCa
 }
 
 export function updateApprovalCard(messageId: string, input: Omit<CapabilityApprovalCardInput, "approvalId"> & {
-  status: "approved" | "rejected" | "expired" | "failed"; approvalScope: "once" | "turn"; decidedAt: string;
+  status: "approved" | "rejected" | "expired" | "failed"; approvalScope: "once" | "turn"; planApproved?: boolean; decidedAt: string;
 }): void {
   const content = buildLarkExecutionApprovalResultCard({ ...input, operationSummary: formatCapabilityApprovalOperation(input.operation), requester: input.requester ?? "未知发送人", cwd: input.cwd ?? null, reason: input.reason ?? null });
   spawnSync("lark-cli", ["im", "messages", "patch", "--as", "bot", "--message-id", messageId, "--data", JSON.stringify({ content: JSON.stringify(content) })], { encoding: "utf8", timeout: 30_000 });

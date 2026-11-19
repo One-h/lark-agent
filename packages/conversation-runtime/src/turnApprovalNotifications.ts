@@ -20,11 +20,13 @@ export function queueTurnAutoApprovalNotification(reviewId: number): void {
     AND r.applied_at IS NOT NULL AND r.source IN ('history','model')`).get(reviewId) as {
       id:number;lark_message_id:number;requester_id:string;approver_id:string;source:"history"|"model";
       request:string|null;requester:string|null;reason:string;model:string|null;matched_approval_id:number|null;applied_at:string;
+      approval_scope:"once"|"plan"|"turn";plan_summary:string|null;operation_intent:string|null;
     } | undefined;
   if (!row || !row.approver_id) return;
   const payload: NotificationPayload = { recipientId:row.approver_id,card: { reviewId:row.id,messageId:row.lark_message_id,
     requester:row.requester || row.requester_id,request:row.request ?? "",source:row.source,reason:row.reason,
-    model:row.model,matchedApprovalId:row.matched_approval_id,appliedAt:row.applied_at } };
+    model:row.model,matchedApprovalId:row.matched_approval_id,appliedAt:row.applied_at,
+    scope:row.approval_scope,taskPlan:row.plan_summary,currentOperationIntent:row.operation_intent } };
   const now = nowIso();
   db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox (lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'auto-approval',?,?,?,?)")
     .run(row.lark_message_id,JSON.stringify(payload),larkReplyIdempotencyKey("autoapproval",`${row.id}:${row.approver_id}`),now,now);

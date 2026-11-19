@@ -20,7 +20,9 @@ import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFro
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
 import { createHistoryImageBudget, createHistoryImageState, historyImagesAllowed, openLarkHistoryImage, searchLarkHistoryImages, type HistoryImageBudget, type HistoryImageState } from "./historyImages.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
-import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
+import { finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled, type TurnApprovalInput } from "./turnAutoApproval.js";
+import { applyPlanAuthorization, approvalPlanSummary, approvalPlanTool, approvalPlanToolName, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant,
+  declareApprovalPlan, parseApprovalPlan, planCoversOperation, preparePlanAuthorization, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
 import { larkExecutionPolicy, type ExecutionEngineSession, type ExecutionTurnResult } from "./executionEngines.js";
@@ -123,15 +125,17 @@ function larkHostDynamicToolName(capabilityId: string): string {
 }
 
 function larkHostDynamicTools(): Array<Record<string, unknown>> {
-  if (!config.larkAgentRuntimeUrl) return [];
-  return registeredLarkHostCapabilities().map((capability) => ({
+  const tools = config.larkAgentRuntimeUrl ? registeredLarkHostCapabilities() : [];
+  return [approvalPlanTool, ...tools.filter(capability => larkHostDynamicToolName(capability.id) !== approvalPlanToolName).map((capability) => ({
     type: "function",
     name: larkHostDynamicToolName(capability.id),
     description: capability.description,
     inputSchema: capability.inputSchema,
     deferLoading: false
-  }));
+  }))];
 }
+
+const taskApprovalPlanInstruction = "整项任务可能包含受限操作时，在首次申请授权前用 lark_approval_plan 提交用户的完整目标、步骤及预计影响。区分本地登记、线上只读和实际线上变更；不能只填当前一步。为每步提交准确的执行命令与绝对工作目录，或能力 ID 和实际 JSON 参数（operation 格式为 '能力ID: JSON'，cwd=null）。未核实的目标不猜测；补齐信息或计划改变时重新登记，登记不等于批准。";
 
 export function larkCodexTaskPaths(
   message: Pick<LarkMessageRow, "id" | "chat_id" | "message_id"> & Partial<Pick<LarkMessageRow, "root_message_id" | "thread_id">>,
@@ -226,7 +230,6 @@ type ActiveLarkCodexRun = {
   effort: string;
   turnApprovalRequesterId: string | null;
   turnApprovalApproverId: string | null;
-  turnApprovalAutoReviewId: number | null;
   historyImageBudget: HistoryImageBudget;
   deferredCompletion: CodexAppServerNotification | null;
   settled: boolean;
@@ -239,11 +242,15 @@ type PendingLarkExecutionApproval = {
   approvalId: number;
   turnId: string;
   requesterId: string | null;
+  plan?: ApprovalPlan;
+  requiresPlan: boolean;
   requests: Array<{
     approvalId: number;
     requestId: string | number;
     requestMethod: string;
     operation: string;
+    operationKind?: ApprovalOperationKind;
+    cwd: string | null;
     reason: string | null;
     approvedResponse: unknown;
     rejectedResponse: unknown;
@@ -774,6 +781,8 @@ ${contactDirectory}
 
 ${executionBoundary}
 
+${taskApprovalPlanInstruction}
+
 ${larkQueryExecutionApprovalPrompt(trustedSender && message.reply_trigger !== "owner_mention")}
 
 ${replyProfilePrompt}
@@ -896,6 +905,7 @@ export function buildLarkCodexDeltaPrompt(
     return [
       refreshedInstructions,
       "话题续聊：结合本 thread 的既有目标处理新增消息；进度追问先简短回应，再继续可执行任务。",
+      taskApprovalPlanInstruction,
       recentMessages,
       contactDirectory,
       larkPromptTime(message),
@@ -909,6 +919,7 @@ export function buildLarkCodexDeltaPrompt(
   }
   return [
     "这是同一飞书 Codex 会话中的新增消息。此前角色说明、权限范围、技能和历史上下文已经在当前 thread 中，不要重新陈述它们。优先处理以下新增内容。",
+    taskApprovalPlanInstruction,
     attachments.includeStableInstructions === false ? "" : style.effectiveInstructions,
     attachments.includeStableInstructions === false ? "" : groupMentionInstruction,
     larkQueryExecutionApprovalPrompt(Boolean(attachments.trustedSender && message.reply_trigger !== "owner_mention")),
@@ -2664,7 +2675,6 @@ async function retryLarkTurnAfterCapacityFailure(run: ActiveLarkCodexRun, initia
     finishLarkTurnAutoApproval(previousTurnId);
     run.turnApprovalRequesterId = null;
     run.turnApprovalApproverId = null;
-    run.turnApprovalAutoReviewId = null;
     run.pendingInterim = null;
     for (const prepared of run.members.values()) {
       appendPreparedError(prepared, `${error}\nCapacity recovery attempt ${attempt}/3 in ${delayMs}ms, preserving thread ${run.threadId}.`);
@@ -2753,7 +2763,6 @@ async function retryLarkTurnAfterAuthenticationFailure(run: ActiveLarkCodexRun, 
   finishLarkTurnAutoApproval(previousTurnId);
   run.turnApprovalRequesterId = null;
   run.turnApprovalApproverId = null;
-  run.turnApprovalAutoReviewId = null;
   promptInstructionCache.clear();
   codexAppServer.stop();
   try {
@@ -2848,6 +2857,7 @@ type ApprovalRequestDetails = {
   operation: string;
   cwd: string | null;
   reason: string | null;
+  operationKind?: ApprovalOperationKind;
   approvedResponse: unknown;
   rejectedResponse: unknown;
 };
@@ -2976,6 +2986,7 @@ export function approvalRequestDetails(request: CodexAppServerRequest): Approval
     turnId: params.turnId,
     itemId: params.itemId,
     operation: isPermissionRequest ? requestedPermissionSummary(permissions) : command ?? (grantRoot ? `修改 ${grantRoot} 下的文件` : reason ?? "修改本地文件"),
+    ...(request.method === "item/commandExecution/requestApproval" && command ? { operationKind: "command" as const } : {}),
     cwd,
     reason,
     approvedResponse: isPermissionRequest ? { permissions } : { decision: "accept" },
@@ -3026,6 +3037,9 @@ function refreshPendingExecutionApprovalBatchCard(
     requester: requester?.name ?? target.row.sender_id ?? "未知发送人",
     originalMessage: target.row.content ?? "",
     taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, target.row.id, target.row.sender_id)),
+    taskPlan: pending.plan ? approvalPlanSummary(pending.plan) : undefined,
+    allowPlanApproval: pending.plan ? pending.requests.every(request => planCoversOperation(pending.plan!, request))
+      : pending.requiresPlan ? false : undefined,
     operation,
     operationCount: pending.requests.length,
     operationIntents: pending.requests.map(request => request.reason),
@@ -3043,7 +3057,9 @@ function refreshExecutionApprovalCard(
   row: LarkExecutionApprovalRow,
   status: "approved" | "rejected" | "expired" | "failed",
   decidedAt: string,
-  requests?: PendingLarkExecutionApproval["requests"]
+  requests?: PendingLarkExecutionApproval["requests"],
+  plan?: ApprovalPlan,
+  planApproved = false
 ): void {
   if (!row.card_message_id) return;
   const source = db.prepare(`
@@ -3056,6 +3072,7 @@ function refreshExecutionApprovalCard(
     requester: source?.requester_name ?? source?.sender_id ?? row.requester_id ?? "未知发送人",
     originalMessage: source?.content ?? "",
     taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, row.lark_message_id, row.requester_id)),
+    taskPlan: plan ? approvalPlanSummary(plan) : undefined,
     operation: row.operation ?? "修改本机状态",
     operationCount: requests?.length,
     operationIntents: requests?.map(request => request.reason),
@@ -3063,6 +3080,7 @@ function refreshExecutionApprovalCard(
     reason: row.reason,
     status,
     approvalScope: row.approval_scope,
+    planApproved,
     decidedAt
   });
   if (!result.ok) {
@@ -3096,30 +3114,49 @@ function completePendingExecutionApproval(
     return { ok: false, status: "failed", message: "对应的 Codex 执行请求已经结束，请重新发送指令。" };
   }
 
+  if (decision === "approved_turn" && pending.requiresPlan && !pending.plan) {
+    return { ok: false, status: "pending", message: "未登记可核对的任务计划，只能批准本次操作。" };
+  }
+  const identity = { messageId: row.lark_message_id, turnId: row.turn_id, senderId: row.requester_id };
+  if (pending.plan && (decision === "approved_once" || decision === "approved_turn") &&
+    (pending.run.pendingSteers !== 0 || approvalRunMember(pending.run).row.id !== row.lark_message_id ||
+      currentApprovalPlan(db, identity) !== pending.plan)) {
+    return { ok: false, status: "pending", message: "当前任务计划已变化，请重新发起审批。" };
+  }
+  const planApproved = decision === "approved_turn" && Boolean(pending.plan);
+  const commitPlan = planApproved ? preparePlanAuthorization(db, identity, pending.plan!, row.approver_id, pending.requests) : undefined;
+  if (planApproved && !commitPlan) {
+    return { ok: false, status: "pending", message: "待执行操作不在已展示计划内。请核对后仅批准本次操作。" };
+  }
+
   const decidedAt = nowIso();
   const nextStatus = decision === "approved_once" || decision === "approved_turn" ? "approved" : decision === "rejected" ? "rejected" : "expired";
-  const approvalScope: LarkExecutionApprovalRow["approval_scope"] = decision === "approved_turn" ? "turn" : "once";
+  const approvalScope: LarkExecutionApprovalRow["approval_scope"] = decision === "approved_turn" && !planApproved ? "turn" : "once";
   const updateApproval = db.prepare(`
     UPDATE lark_execution_approvals
     SET status = ?, approval_scope = ?, decided_at = ?
     WHERE id = ? AND status = 'pending'
   `);
-  const updatedCount = db.transaction(() => pending.requests.reduce(
-    (count, request) => count + updateApproval.run(nextStatus, approvalScope, decidedAt, request.approvalId).changes,
-    0
-  ))();
-  if (updatedCount === 0) {
-    clearPendingExecutionApproval(pending);
-    return { ok: false, status: row.status, message: "这条审批已经处理过了。" };
+  const batchChanged = new Error("Approval batch changed");
+  try {
+    db.transaction(() => {
+      for (const request of pending.requests) {
+        if (updateApproval.run(nextStatus, approvalScope, decidedAt, request.approvalId).changes !== 1) throw batchChanged;
+      }
+    })();
+  } catch (error) {
+    if (error !== batchChanged) throw error;
+    cancelRunExecutionApprovals(pending.run, "审批批次状态已变化，未放行任何操作。");
+    return { ok: false, status: "failed", message: "审批批次已变化，未放行操作。" };
   }
+  commitPlan?.();
 
   const decidedRow = { ...row, approval_scope: approvalScope };
-  if (decision === "approved_turn") {
+  if (decision === "approved_turn" && !planApproved) {
     pending.run.turnApprovalRequesterId = row.requester_id;
     pending.run.turnApprovalApproverId = row.approver_id;
-    pending.run.turnApprovalAutoReviewId = null;
   }
-  refreshExecutionApprovalCard(decidedRow, nextStatus, decidedAt, pending.requests);
+  refreshExecutionApprovalCard(decidedRow, nextStatus, decidedAt, pending.requests, pending.plan, planApproved);
   if (decision === "rejected" || decision === "expired") {
     sendApprovalOutcomeToRequester(pending.run, row, decision);
   }
@@ -3130,7 +3167,8 @@ function completePendingExecutionApproval(
         source: decision === "expired" ? "timeout" : "manual", outcome: nextStatus,
         reasonCode: decision === "expired" ? "approval_expired" : decision === "rejected" ? "human_rejected" : "human_approved",
         reason: decision === "expired" ? "本次申请等待超时，未取得人工决定；不表示长期权限被拒绝。"
-          : decision === "rejected" ? "审批人明确拒绝了本次申请。" : "审批人已允许本次操作或当前 turn。"
+          : decision === "rejected" ? "审批人明确拒绝了本次申请。"
+            : planApproved ? "审批人只允许已展示计划中的匹配操作。" : "审批人已允许本次操作或当前 turn。"
       });
       codexAppServer.respondToRequest(
         request.requestId,
@@ -3138,6 +3176,7 @@ function completePendingExecutionApproval(
       );
     }
   } catch (error) {
+    if (planApproved) clearApprovalPlan(db, row.turn_id);
     const message = error instanceof Error ? error.message : String(error);
     if (decision === "approved_turn") {
       pending.run.turnApprovalRequesterId = null;
@@ -3174,7 +3213,7 @@ function completePendingExecutionApproval(
   return {
     ok: true,
     status: nextStatus,
-    message: decision === "approved_turn"
+    message: planApproved ? "已允许列出的任务计划；计划以外的操作不会自动放行。" : decision === "approved_turn"
       ? `已允许当前任务；当前批次 ${pending.requests.length} 项操作及本 Codex turn 内的后续受限操作会自动放行。`
       : decision === "approved_once"
         ? `已允许当前批次的 ${pending.requests.length} 项操作，Codex 会继续当前任务。`
@@ -3203,7 +3242,8 @@ function cancelRunExecutionApprovals(run: ActiveLarkCodexRun, reason: string): v
 export function reconcilePendingExecutionTurnApprovals(): void {
   for (const pending of [...pendingExecutionApprovals.values()]) {
     const row = pendingApprovalRow(pending.approvalId);
-    if (row?.status === "pending" && hasLarkManualTurnApproval(db, { turnId: row.turn_id, threadId: row.thread_id, senderId: row.requester_id, approverId: config.larkExecutionApproverId }))
+    if (row?.status === "pending" && !pending.plan && !pending.requiresPlan
+      && hasLarkManualTurnApproval(db, { turnId: row.turn_id, threadId: row.thread_id, senderId: row.requester_id, approverId: config.larkExecutionApproverId }))
       completePendingExecutionApproval(row, "approved_turn");
   }
 }
@@ -3269,12 +3309,14 @@ function autoApproveTurnExecution(
   run: ActiveLarkCodexRun,
   request: CodexAppServerRequest,
   details: ApprovalRequestDetails,
-  target: PreparedLarkCodexMessage
-): void {
+  target: PreparedLarkCodexMessage,
+  scoped?: { scope: "once" | "plan"; reviewId?: number }
+): boolean {
   if (!ownerAssistMayExecute(target.row.id)) {
-    run.turnApprovalRequesterId = null; run.turnApprovalApproverId = null; run.turnApprovalAutoReviewId = null;
+    if (scoped?.scope === "plan") clearApprovalPlan(db, run.turnId);
+    run.turnApprovalRequesterId = null; run.turnApprovalApproverId = null;
     declineExecutionApproval(run, target, request, details, "owner_assist_not_executable", "授权放行前代答上下文已失效。");
-    return;
+    return false;
   }
   const decidedAt = nowIso();
   const token = crypto.randomBytes(24).toString("hex");
@@ -3284,12 +3326,12 @@ function autoApproveTurnExecution(
       thread_id, turn_id, item_id, operation, cwd, reason, status, approval_scope,
       created_at, expires_at, decided_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', 'turn', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?)
   `).run(
     token,
     target.row.id,
     target.row.sender_id,
-    run.turnApprovalApproverId ?? config.larkExecutionApproverId,
+    scoped ? config.larkExecutionApproverId : run.turnApprovalApproverId ?? config.larkExecutionApproverId,
     request.method,
     request.id,
     details.threadId,
@@ -3298,16 +3340,19 @@ function autoApproveTurnExecution(
     details.operation,
     details.cwd,
     details.reason,
+    scoped ? "once" : "turn",
     decidedAt,
     decidedAt,
     decidedAt
   );
   try {
-    auditApprovalRequest(run, target, request, details, { source: run.turnApprovalAutoReviewId === null ? "manual" : "auto_review",
-      outcome: "approved", reasonCode: "current_turn_grant", reason: "复用当前 turn 有效且绑定请求人及审批人的授权。",
-      approvalId: Number(inserted.lastInsertRowid), reviewId: run.turnApprovalAutoReviewId ?? undefined });
+    auditApprovalRequest(run, target, request, details, { source: scoped?.reviewId !== undefined ? "auto_review" : "manual",
+      outcome: "approved", reasonCode: scoped?.scope === "once" ? "current_operation" : scoped?.scope === "plan" ? "task_plan_grant" : "current_turn_grant",
+      reason: scoped ? "实际操作已单独审核或匹配当前已批准任务计划。" : "复用审批人明确授予的当前 turn 授权。",
+      approvalId: Number(inserted.lastInsertRowid), reviewId: scoped?.reviewId });
     codexAppServer.respondToRequest(request.id, details.approvedResponse);
   } catch (error) {
+    if (scoped?.scope === "plan") clearApprovalPlan(db, run.turnId);
     const message = error instanceof Error ? error.message : String(error);
     run.turnApprovalRequesterId = null;
     run.turnApprovalApproverId = null;
@@ -3316,15 +3361,16 @@ function autoApproveTurnExecution(
     auditApprovalRequest(run, target, request, details, { source: "transport", outcome: "failed",
       reasonCode: "approval_response_failed", reason: "授权结果回传原生 Codex 失败，不代表人工拒绝。", approvalId: Number(inserted.lastInsertRowid) });
     appendPreparedError(target, `Unable to reuse current turn approval: ${message}`);
-    return;
+    return false;
   }
   addLocalAuditEvent("lark-execution.turn-auto-approved", "当前 Codex turn 自动放行后续操作", {
     approvalId: Number(inserted.lastInsertRowid),
-    approvalScope: "turn",
+    approvalScope: scoped?.scope ?? "turn",
     larkMessageId: target.row.id,
     requesterId: target.row.sender_id,
     operation: details.operation
   });
+  return true;
 }
 
 function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
@@ -3332,6 +3378,18 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
   const params = request.params as { threadId?: unknown; turnId?: unknown; tool?: unknown; arguments?: unknown; callId?: unknown } | undefined;
   if (typeof params?.threadId !== "string" || typeof params.turnId !== "string" || typeof params.tool !== "string") return false;
   const run = [...activeLarkCodexRuns.values()].find((candidate) => !candidate.settled && candidate.turnId === params.turnId && candidate.threadId === params.threadId);
+  if (params.tool === approvalPlanToolName) {
+    const target = run ? approvalRunMember(run) : undefined;
+    const plan = parseApprovalPlan(params.arguments);
+    if (!run || !target?.row.sender_id || run.pendingSteers !== 0 || !ownerAssistMayExecute(target.row.id) || !plan) {
+      codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: "任务计划无效或会话范围已变化，未授予权限。" }] });
+      return true;
+    }
+    declareApprovalPlan(db, { turnId: run.turnId, messageId: target.row.id, senderId: target.row.sender_id }, plan);
+    appendPreparedLog(target, { method: "approval/planDeclared", params: { turnId: run.turnId, stepCount: plan.steps.length } });
+    codexAppServer.respondToRequest(request.id, { success: true, contentItems: [{ type: "inputText", text: "已登记整项任务计划，尚未授权。实际操作会按审批范围检查。" }] });
+    return true;
+  }
   if (!run || !config.larkAgentRuntimeUrl) {
     codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: "Lark Agent host capability context is unavailable" }] });
     return true;
@@ -3499,24 +3557,34 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     declineExecutionApproval(run, target, request, details, "owner_assist_not_executable", "代答尚未接手或来源/协同上下文已失效，未进入审核模型。");
     return true;
   }
-  if (hasLarkManualTurnApproval(db, { turnId: run.turnId, threadId: run.threadId, senderId: target.row.sender_id, approverId: config.larkExecutionApproverId })) {
+  const approvalInput = (member: PreparedLarkCodexMessage): TurnApprovalInput => ({
+    messageId: member.row.id, turnId: run.turnId, senderId: member.row.sender_id,
+    originalMessage: member.row.content ?? "", operation: details.operation, operationKind: details.cwd ? details.operationKind : undefined,
+    operationIntent: details.reason, cwd: details.cwd ?? config.workspaceRoot
+  });
+  const currentInput = approvalInput(target);
+  const requiresScopedApproval = turnAutoApprovalEnabled() || Boolean(currentApprovalPlan(db, currentInput));
+  if (!requiresScopedApproval && hasLarkManualTurnApproval(db, { turnId: run.turnId, threadId: run.threadId,
+    senderId: target.row.sender_id, approverId: config.larkExecutionApproverId })) {
     run.turnApprovalRequesterId = target.row.sender_id;
     run.turnApprovalApproverId = config.larkExecutionApproverId;
-    run.turnApprovalAutoReviewId = null;
     autoApproveTurnExecution(run, request, details, target);
     return true;
   }
-  if (shouldReuseLarkTurnApproval({
+  const planGrant = run.pendingSteers === 0 ? currentApprovalPlanGrant(db, currentInput, config.larkExecutionApproverId) : undefined;
+  if (planGrant && (planGrant.reviewId === undefined || turnAutoApprovalEnabled())
+    && applyPlanAuthorization(db, currentInput, planGrant.plan, config.larkExecutionApproverId, [currentInput], planGrant.reviewId)) {
+    autoApproveTurnExecution(run, request, details, target, { scope: "plan", reviewId: planGrant.reviewId });
+    return true;
+  }
+  if (!requiresScopedApproval && shouldReuseLarkTurnApproval({
     runTurnId: run.turnId,
     requestTurnId: details.turnId,
     approvedRequesterId: run.turnApprovalRequesterId,
     requesterId: target.row.sender_id,
     approvedApproverId: run.turnApprovalApproverId,
     currentApproverId: config.larkExecutionApproverId
-  }) && (run.turnApprovalAutoReviewId === null || (turnAutoApprovalEnabled() && canReuseLarkTurnAutoApproval({
-    messageId:target.row.id,turnId:run.turnId,senderId:target.row.sender_id,originalMessage:target.row.content ?? "",
-    operation:details.operation,cwd:details.cwd ?? config.workspaceRoot
-  })))) {
+  })) {
     autoApproveTurnExecution(run, request, details, target);
     return true;
   }
@@ -3527,14 +3595,9 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     return true;
   }
 
-  if (turnAutoApprovalEnabled()) {
+  if (turnAutoApprovalEnabled() && request.method !== "item/permissions/requestApproval") {
     const approvalTurnId = run.turnId;
     const approvalThreadId = run.threadId;
-    const cwd = details.cwd ?? config.workspaceRoot;
-    const approvalInput = (member: PreparedLarkCodexMessage) => ({
-      messageId: member.row.id, turnId: approvalTurnId, senderId: member.row.sender_id,
-      originalMessage: member.row.content ?? "", operation: details.operation, operationIntent: details.reason, cwd
-    });
     void reviewLarkTurnAutoApproval(approvalInput(target), () => {
       if (request.method !== "item/commandExecution/requestApproval"
         || run.settled || run.authRecovering || run.turnId !== approvalTurnId || run.threadId !== approvalThreadId
@@ -3555,18 +3618,17 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
       }
       const currentTarget = approvalRunMember(run);
       const review = decision.reviewId ? db.prepare("SELECT model FROM lark_turn_auto_reviews WHERE id=?").get(decision.reviewId) as { model?: string | null } | undefined : undefined;
-      const { recheckedInput, ...audit } = decision;
+      const { recheckedInput, plan, reviewedPlan, ...audit } = decision;
       appendPreparedLog(target, { method: "approval/autoReview", params: { ...audit, recheckedMessageId: recheckedInput?.messageId, turnId: run.turnId, model: review?.model ?? null } });
       if (decision.approved && turnAutoApprovalEnabled() && config.larkExecutionApproverId === approverId
         && run.pendingSteers === 0
         && currentTarget.row.sender_id === target.row.sender_id
         && currentTarget.row.id === (recheckedInput?.messageId ?? target.row.id)
-        && (!recheckedInput || recheckedInput.requestId === request.id)) {
-        run.turnApprovalRequesterId = currentTarget.row.sender_id;
-        run.turnApprovalApproverId = approverId;
-        run.turnApprovalAutoReviewId = decision.reviewId ?? null;
-        autoApproveTurnExecution(run, request, details, currentTarget);
-        if (decision.reviewId && run.turnApprovalRequesterId) markTurnAutoApprovalApplied(decision.reviewId);
+        && (!recheckedInput || recheckedInput.requestId === request.id)
+        && reviewedPlan === currentApprovalPlan(db, approvalInput(currentTarget))
+        && (!plan || applyPlanAuthorization(db, approvalInput(currentTarget), plan, approverId, [currentInput], decision.reviewId))) {
+        const applied = autoApproveTurnExecution(run, request, details, currentTarget, { scope: decision.scope ?? "once", reviewId: decision.reviewId });
+        if (decision.reviewId && applied) markTurnAutoApprovalApplied(decision.reviewId);
       } else {
         auditApprovalRequest(run, currentTarget, request, details, { source: "auto_review", outcome: "pending",
           reasonCode: decision.approved ? "review_scope_changed" : "review_requires_manual",
@@ -3607,10 +3669,14 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
     return true;
   }
 
+  const plan = currentApprovalPlan(db, { messageId: target.row.id, senderId: target.row.sender_id, turnId: run.turnId });
+  const requiresPlan = turnAutoApprovalEnabled();
   const existingBatch = [...pendingExecutionApprovals.values()].find((pending) => (
     pending.run === run
     && pending.turnId === details.turnId
     && pending.requesterId === target.row.sender_id
+    && pending.plan === plan
+    && pending.requiresPlan === requiresPlan
   ));
   if (existingBatch) {
     const primaryRow = pendingApprovalRow(existingBatch.approvalId);
@@ -3648,6 +3714,8 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
       requestId: request.id,
       requestMethod: request.method,
       operation: details.operation,
+      operationKind: details.operationKind,
+      cwd: details.cwd,
       reason: details.reason,
       approvedResponse: details.approvedResponse,
       rejectedResponse: details.rejectedResponse
@@ -3703,11 +3771,15 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
     approvalId,
     turnId: details.turnId,
     requesterId: target.row.sender_id,
+    plan,
+    requiresPlan,
     requests: [{
       approvalId,
       requestId: request.id,
       requestMethod: request.method,
       operation: details.operation,
+      operationKind: details.operationKind,
+      cwd: details.cwd,
       reason: details.reason,
       approvedResponse: details.approvedResponse,
       rejectedResponse: details.rejectedResponse
@@ -3723,6 +3795,8 @@ function requestManualExecutionApproval(run: ActiveLarkCodexRun, request: CodexA
       requester: requester?.name ?? target.row.sender_id ?? "未知发送人",
       originalMessage: target.row.content ?? "",
       taskContext: formatApprovalTaskContext(loadApprovalTaskContext(db, target.row.id, target.row.sender_id)),
+      taskPlan: plan ? approvalPlanSummary(plan) : undefined,
+      allowPlanApproval: plan ? planCoversOperation(plan, details) : requiresPlan ? false : undefined,
       operation: details.operation,
       cwd: details.cwd,
       reason: details.reason,
@@ -4051,7 +4125,6 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
     effort: turnParams.effort,
     turnApprovalRequesterId: null,
     turnApprovalApproverId: null,
-    turnApprovalAutoReviewId: null,
     historyImageBudget: createHistoryImageBudget(),
     deferredCompletion: null,
     settled: false,

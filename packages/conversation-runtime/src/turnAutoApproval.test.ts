@@ -3,10 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { approvalTask, configuredTurnAutoApprovalDataSources, deploymentOperationMatchesTask, configureTurnApprovalReviewer, decideTurnAutoApproval, finishLarkTurnAutoApproval, humanApprovalHistory, requiresManualTurnApproval, reviewLarkTurnAutoApproval, type TurnApprovalInput, type TurnApprovalReviewer } from "./turnAutoApproval.js";
 import { turnApprovalModelPrompt } from "./turnApprovalReviewer.js";
+import { applyPlanAuthorization, currentApprovalPlanGrant, declareApprovalPlan, parseApprovalPlan } from "./approvalPlan.js";
 import { matchesLarkExecutionApprovalTurn, shouldReuseLarkTurnApproval } from "./responder.js";
 
 function fixture() {
@@ -18,6 +20,34 @@ function fixture() {
 
 const input: TurnApprovalInput = { messageId: 100, turnId: "turn-new", senderId: "ou_sender",
   originalMessage: "https://git.example.com/team/repo/pulls/23 please review", operation: "node scripts/record-task.mjs review", cwd: "/tmp/workspace" };
+
+test("operation review migration retains old audit ids and allows multiple records per turn", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-approval-migration-"));
+  const file = path.join(root, "test.sqlite");
+  const legacy = new Database(file);
+  try {
+    legacy.exec(`CREATE TABLE lark_turn_auto_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL, turn_id TEXT NOT NULL,
+      requester_id TEXT NOT NULL, approver_id TEXT NOT NULL, task_type TEXT, target TEXT, cwd TEXT,
+      source TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, matched_approval_id INTEGER,
+      model TEXT, usage_json TEXT, created_at TEXT NOT NULL, completed_at TEXT, applied_at TEXT,
+      UNIQUE(turn_id, requester_id, approver_id)
+    );
+    INSERT INTO lark_turn_auto_reviews(id,lark_message_id,turn_id,requester_id,approver_id,source,decision,reason,created_at,applied_at)
+    VALUES(71,20,'fixture-turn','ou_sender','ou_owner','model','approved','legacy audit','old','applied');`);
+    legacy.close();
+    const migrated = new SqliteAgentStore(file);
+    try {
+      const db = migrated.db;
+      assert.deepEqual(db.prepare("SELECT id,approval_scope,applied_at FROM lark_turn_auto_reviews WHERE id=71").get(),
+        { id: 71, approval_scope: "turn", applied_at: "applied" });
+      const added = db.prepare(`INSERT INTO lark_turn_auto_reviews
+        (lark_message_id,turn_id,requester_id,approver_id,source,decision,reason,created_at,approval_scope)
+        SELECT lark_message_id,turn_id,requester_id,approver_id,'model','approved','operation','new','once' FROM lark_turn_auto_reviews WHERE id=71`).run();
+      assert.equal(added.lastInsertRowid, 72);
+    } finally { migrated.close(); }
+  } finally { if (legacy.open) legacy.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 function addHuman(store: SqliteAgentStore, options: { id: number; message?: string; sender?: string; owner?: string; scope?: string; status?: string; card?: string | null; cwd?: string; operation?: string } ) {
   const now = `2026-10-${String(options.id).padStart(2, "0")}T00:00:00.000Z`;
@@ -33,7 +63,7 @@ function addHuman(store: SqliteAgentStore, options: { id: number; message?: stri
 test("history matches another PR in the same repository without model calls", async () => {
   const f = fixture(); let calls = 0;
   try {
-    addHuman(f.store, { id: 1, message: input.originalMessage.replace("23", "1") });
+    addHuman(f.store, { id: 1, message: input.originalMessage.replace("23", "1"), operation: input.operation });
     const result = await decideTurnAutoApproval(input, { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async () => { calls++; throw new Error("must not call"); } });
     assert.equal(result.approved, true); assert.equal(result.source, "history"); assert.equal(result.matchedApprovalId, 1); assert.equal(calls, 0);
     assert.equal((f.store.db.prepare("SELECT decision FROM lark_turn_auto_reviews").get() as { decision: string }).decision, "approved");
@@ -128,10 +158,9 @@ test("code pushes and SQL mutations never reuse a PR grant", async () => {
   }
 });
 
-test("read-only CLI global options retain history matching", async () => {
+test("read-only CLI global options retain history matching for the same command", async () => {
   const f = fixture();
   try {
-    addHuman(f.store, { id: 1 });
     let index = 0;
     for (const operation of [
     'git -C "/tmp/repo with spaces" status --short', "git -c color.ui=false --no-pager log -1",
@@ -143,6 +172,7 @@ test("read-only CLI global options retain history matching", async () => {
     "git -C /tmp/repo status # push is only a comment"
     ]) {
       const request = { ...input, operation, turnId: `readonly-${++index}` };
+      addHuman(f.store, { id: index, operation });
       assert.equal(requiresManualTurnApproval(request), false, operation);
       const result = await decideTurnAutoApproval(request, { database: f.store.db, enabled: true, approverId: "ou_owner", reviewer: async () => { throw new Error("must not call"); } });
       assert.equal(result.approved, true, operation);
@@ -154,7 +184,8 @@ test("read-only CLI global options retain history matching", async () => {
 test("a cached turn grant cannot authorize flagged mutating CLI commands", async () => {
   const f = fixture();
   let calls = 0;
-  configureTurnApprovalReviewer(async () => { calls++; return { decision: "approve_turn", reason: "PR review" }; });
+  configureTurnApprovalReviewer(async (request) => { calls++; return request.originalMessage.includes("合并")
+    ? { decision: "manual", reason: "New requested scope requires approval" } : { decision: "approve_turn", reason: "PR review" }; });
   try {
     setAppSettingValue("turnAutoApprovalEnabled", "true");
     assert.equal((await reviewLarkTurnAutoApproval(input)).approved, true);
@@ -162,7 +193,7 @@ test("a cached turn grant cannot authorize flagged mutating CLI commands", async
       assert.equal((await reviewLarkTurnAutoApproval({ ...input, operation })).approved, false);
     }
     assert.equal((await reviewLarkTurnAutoApproval({ ...input, messageId: input.messageId + 1, originalMessage: "合并代码后再检查" })).approved, false);
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
   } finally { finishLarkTurnAutoApproval(input.turnId); configureTurnApprovalReviewer(); f.close(); }
 });
 
@@ -185,12 +216,12 @@ test("deployment uses its own human scope first and otherwise asks the model", a
       {originalMessage:"部署生产 demo-api 并检查状态"}
     ].entries()) {
       const result=await decideTurnAutoApproval({...deployment,...change,turnId:`deployment-model-${index}`},{database:f.store.db,enabled:true,approverId:"ou_owner",reviewer});
-      assert.equal(result.source,"model");
+      assert.equal(result.source,[1,2,3,4].includes(index) ? "manual" : "model");
     }
-    assert.equal(calls,9);
+    assert.equal(calls,5);
     addHuman(f.store,{id:2,message:deployment.originalMessage,status:"rejected"});
     const rejected=await decideTurnAutoApproval({...deployment,turnId:"deployment-rejected"},{database:f.store.db,enabled:true,approverId:"ou_owner",reviewer});
-    assert.equal(rejected.source,"history");assert.equal(rejected.approved,false);assert.equal(calls,9);
+    assert.equal(rejected.source,"history");assert.equal(rejected.approved,false);assert.equal(calls,5);
   } finally {f.close();}
 });
 
@@ -244,15 +275,15 @@ test("disabled policy, missing identities, malformed result and reviewer timeout
   } finally { f.close(); }
 });
 
-test("concurrent requests reuse one review but a different sender or turn is reviewed separately", async () => {
+test("concurrent operations without an approved plan are reviewed separately", async () => {
   const f = fixture(); let calls = 0;
   configureTurnApprovalReviewer(async () => { calls++; await new Promise((resolve) => setTimeout(resolve, 10)); return { decision: "approve_turn", reason: "query only" }; });
   try {
     setAppSettingValue("turnAutoApprovalEnabled", "true");
     const results = await Promise.all([reviewLarkTurnAutoApproval(input), reviewLarkTurnAutoApproval({ ...input, operation: "next command" })]);
-    assert(results.every((result) => result.approved)); assert.equal(calls, 1);
-    await reviewLarkTurnAutoApproval({ ...input, senderId: "ou_other" }); assert.equal(calls, 2);
-    await reviewLarkTurnAutoApproval({ ...input, turnId: "turn-next" }); assert.equal(calls, 3);
+    assert(results.every((result) => result.approved && result.scope === "once")); assert.equal(calls, 2);
+    await reviewLarkTurnAutoApproval({ ...input, senderId: "ou_other" }); assert.equal(calls, 3);
+    await reviewLarkTurnAutoApproval({ ...input, turnId: "turn-next" }); assert.equal(calls, 4);
     setAppSettingValue("turnAutoApprovalEnabled", "false"); assert.equal((await reviewLarkTurnAutoApproval(input)).approved, false);
   } finally { finishLarkTurnAutoApproval(input.turnId); finishLarkTurnAutoApproval("turn-next"); configureTurnApprovalReviewer(); f.close(); }
 });
@@ -262,7 +293,7 @@ test("review prompt is bounded, keeps only three precedents and treats target sc
   assert.equal(approvalTask("请继续"), null);
   const history = Array.from({ length: 10 }, (_, id) => ({ id, originalMessage: "x".repeat(5000), operation: "x".repeat(5000), cwd: null, status: "approved", scope: "turn", decidedAt: "now" }));
   const prompt = turnApprovalModelPrompt({ ...input, originalMessage: "x".repeat(10000), operation: "x".repeat(10000) }, history);
-  assert(prompt.length < 7200); assert.equal(JSON.parse(prompt).history.length, 3);
+  assert(prompt.length < 13000); assert.equal(JSON.parse(prompt).history.length, 3);
 });
 
 test("query precedents use only configured exact data sources and never cross sources", async () => {
@@ -288,23 +319,59 @@ test("query precedents use only configured exact data sources and never cross so
   } finally { f.close(); }
 });
 
-test("deployment without a simple keyword reaches the model but cached PR grants do not authorize deployment",async()=>{
+test("a deployment requires its own review without a matching approved plan",async()=>{
   const f=fixture();let calls=0;
-  configureTurnApprovalReviewer(async()=>{calls++;return {decision:"approve_turn",reason:"明确目标"};});
+  configureTurnApprovalReviewer(async(request)=>{calls++;return request.originalMessage.includes("继续") || !request.operation.startsWith("forge.deploy")
+    ? {decision:"approve_once",reason:"Only this verified operation"} : {decision:"manual",reason:"Production operation not approved by the prior review"};});
   try {
     setAppSettingValue("turnAutoApprovalEnabled","true");
     await reviewLarkTurnAutoApproval(input);
     const deploymentOperation='forge.deploy.production: {"repo":"demo-api","apps":["demo-api"]}';
     const expanded=await reviewLarkTurnAutoApproval({...input,operation:deploymentOperation});
-    assert.equal(expanded.approved,false);assert.equal(calls,1);
+    assert.equal(expanded.approved,false);assert.equal(calls,2);
     const first=await reviewLarkTurnAutoApproval({...input,turnId:"continue-deploy",originalMessage:"继续 demo-api，同样处理",operation:deploymentOperation});
-    assert.equal(first.source,"model");assert.equal(calls,2);
+    assert.equal(first.source,"model");assert.equal(calls,3);
     await reviewLarkTurnAutoApproval({...input,turnId:"continue-deploy",originalMessage:"继续 demo-api，同样处理",operation:deploymentOperation});
-    assert.equal(calls,2);
+    assert.equal(calls,4);
     await reviewLarkTurnAutoApproval({...input,turnId:"inspect-only",originalMessage:"查询 demo-api 部署状态",operation:"node deploy-app.mjs --app demo-api --refresh-only"});
     assert.equal((await reviewLarkTurnAutoApproval({...input,turnId:"inspect-only",originalMessage:"查询 demo-api 部署状态",operation:deploymentOperation})).approved,false);
-    assert.equal(calls,3);
+    assert.equal(calls,6);
   } finally {finishLarkTurnAutoApproval(input.turnId);finishLarkTurnAutoApproval("continue-deploy");finishLarkTurnAutoApproval("inspect-only");configureTurnApprovalReviewer();f.close();}
+});
+
+test("task approval is explicit, matches exact calls and cannot be enlarged or reused after consumption", async () => {
+  const f = fixture();
+  const first: TurnApprovalInput = { ...input, originalMessage: "Prepare the experiment review", operationKind: "command" };
+  const next: TurnApprovalInput = { ...first, operationKind: "capability", operation: 'demo.status: {"limit":100,"id":4}' };
+  const plan = parseApprovalPlan({ goal: "Review experiment 4", impact: "Read experiment state", steps: [
+    { intent: "Record task", effect: "local-write", kind: "command", operation: first.operation, cwd: first.cwd },
+    { intent: "Read experiment 4", effect: "read", kind: "capability", operation: 'demo.status: {"id":4,"limit":100}', cwd: null }
+  ] });
+  assert(plan);
+  let approveSteps = [1];
+  configureTurnApprovalReviewer(async request => {
+    assert.equal(request.approvalPlan?.impact, plan.impact);
+    return { decision: "approve_turn", approvedSteps: approveSteps, reason: "Test selected plan steps" };
+  });
+  try {
+    declareApprovalPlan(f.store.db, first, plan);
+    setAppSettingValue("turnAutoApprovalEnabled", "true");
+    assert.equal((await reviewLarkTurnAutoApproval(first)).scope, "once");
+    assert.equal(currentApprovalPlanGrant(f.store.db, next, "ou_owner"), undefined);
+    approveSteps = [1, 2];
+    const result = await reviewLarkTurnAutoApproval(first);
+    assert.equal(result.scope, "plan");
+    assert.equal(applyPlanAuthorization(f.store.db, first, plan, "ou_owner", [first], result.reviewId), true);
+    assert.equal(currentApprovalPlanGrant(f.store.db, first, "ou_owner"), undefined);
+    assert.equal(currentApprovalPlanGrant(f.store.db, { ...next, operation: 'demo.status: {"id":5,"limit":100}' }, "ou_owner"), undefined);
+    assert.equal(currentApprovalPlanGrant(f.store.db, { ...next, messageId: first.messageId + 1 }, "ou_owner"), undefined);
+    assert.equal(currentApprovalPlanGrant(f.store.db, next, "ou_other"), undefined);
+    assert(currentApprovalPlanGrant(f.store.db, next, "ou_owner"));
+    assert.equal(applyPlanAuthorization(f.store.db, first, plan, "ou_owner", [next], result.reviewId), true);
+    assert.equal(applyPlanAuthorization(f.store.db, first, plan, "ou_owner", [next], result.reviewId), false);
+    declareApprovalPlan(f.store.db, first, { ...plan, goal: "Do not change production" });
+    assert.equal(applyPlanAuthorization(f.store.db, first, plan, "ou_owner", [first], result.reviewId), false);
+  } finally { finishLarkTurnAutoApproval(first.turnId); configureTurnApprovalReviewer(); f.close(); }
 });
 
 test("model settings are captured once per review and the audit keeps the actual model", async () => {
@@ -325,12 +392,33 @@ test("model settings are captured once per review and the audit keeps the actual
     setAppSettingValue("turnAutoApprovalModel", "gpt-6.1-sol");
     release(); await first;
     await reviewLarkTurnAutoApproval(input);
-    assert.deepEqual(models, ["gpt-5.6-terra"]);
-    await reviewLarkTurnAutoApproval({ ...input, turnId: "next-model-turn" });
     assert.deepEqual(models, ["gpt-5.6-terra", "gpt-6.1-sol"]);
+    await reviewLarkTurnAutoApproval({ ...input, turnId: "next-model-turn" });
+    assert.deepEqual(models, ["gpt-5.6-terra", "gpt-6.1-sol", "gpt-6.1-sol"]);
     const audit = f.store.db.prepare("SELECT model FROM lark_turn_auto_reviews ORDER BY id").all() as Array<{ model: string }>;
     assert.deepEqual(audit.map((row) => row.model), models);
   } finally { release(); finishLarkTurnAutoApproval(input.turnId); finishLarkTurnAutoApproval("next-model-turn"); configureTurnApprovalReviewer(); f.close(); }
+});
+
+test("an in-flight single-operation decision is invalidated if the plan is replaced", async () => {
+  const f = fixture();
+  const command = { ...input, operationKind: "command" as const };
+  const plan = parseApprovalPlan({ goal: "Check the current state", impact: "No remote change",
+    steps: [{ kind: "command", intent: "Read current state", effect: "read", operation: command.operation, cwd: command.cwd }] });
+  assert(plan);
+  let release!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  configureTurnApprovalReviewer(async () => { await wait; return { decision: "approve_once", reason: "Only current operation" }; });
+  try {
+    setAppSettingValue("turnAutoApprovalEnabled", "true");
+    declareApprovalPlan(f.store.db, command, plan);
+    const pending = reviewLarkTurnAutoApproval(command);
+    declareApprovalPlan(f.store.db, command, { ...plan, impact: "A different impact" });
+    release();
+    assert.equal((await pending).approved, false);
+    assert.equal(f.store.db.prepare("SELECT applied_at FROM lark_turn_auto_reviews").pluck().get(), null);
+    assert.equal((await reviewLarkTurnAutoApproval(command)).approved, true);
+  } finally { release(); finishLarkTurnAutoApproval(command.turnId); configureTurnApprovalReviewer(); f.close(); }
 });
 
 test("modern execution approvals require both thread and turn, and grants bind their approver", () => {

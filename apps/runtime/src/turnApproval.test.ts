@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import Fastify from "fastify";
 import { createRuntime } from "./index.js";
-import { retryPendingAutoApprovalNotifications } from "@lark-agent/conversation-runtime";
+import { declareApprovalPlan, parseApprovalPlan, retryPendingAutoApprovalNotifications } from "@lark-agent/conversation-runtime";
 
 test("deployment host capability can use automatic turn approval while unrelated external writes stay manual",async()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),"lark-auto-deployment-"));
@@ -24,8 +24,8 @@ test("deployment host capability can use automatic turn approval while unrelated
     const invoke=(id:string,input:unknown)=>runtime.app.inject({method:"POST",url:`/v1/internal/capabilities/${id}/execute`,headers:{authorization:"Bearer secret"},payload:{input,context:{larkMessageId:1,chatId:"oc_test",trustScope:"untrusted",turnId:"deployment-turn"}}});
     assert.equal((await invoke("forge.deploy.production",{repo:"demo-api",apps:["demo-api"],expectedRevision:"aaaaaaa"})).statusCode,200);
     assert.equal((await invoke("forge.deploy.production",{repo:"demo-api",apps:["demo-api"],expectedRevision:"bbbbbbb"})).statusCode,200);
-    assert.equal(reviews,1);assert.equal(deployments,2);assert.equal(cards.length,0);
-    await retryPendingAutoApprovalNotifications();assert.deepEqual(notifications,["ou_owner"]);
+    assert.equal(reviews,2);assert.equal(deployments,2);assert.equal(cards.length,0);
+    await retryPendingAutoApprovalNotifications();assert.deepEqual(notifications,["ou_owner","ou_owner"]);
     const wrongTarget=invoke("forge.deploy.production",{repo:"demo-worker",apps:["demo-worker"],expectedRevision:"aaaaaaa"});
     for(let i=0;!cards.length&&i<30;i++)await new Promise(resolve=>setTimeout(resolve,10));
     assert.equal(cards.length,1);await runtime.app.inject({headers:{authorization:"Bearer secret"},method:"POST",url:`/v1/approvals/${cards[0]}/reject`});
@@ -60,7 +60,61 @@ test("turn approval switch defaults off, validates input and survives reopening"
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("host review tools reuse one model decision per sender and turn, and external writes still ask", async () => {
+test("a host plan approved once covers exact arguments and not a changed target", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-host-plan-"));
+  const host = Fastify();
+  const effects: unknown[] = [], cards: Array<{ approvalId: number; taskPlan?: string }> = [];
+  host.post("/api/lark-agent/capabilities/demo.change", async request => { effects.push(request.body); return { ok: true }; });
+  await host.listen({ host: "127.0.0.1", port: 0 });
+  const address = host.server.address(); assert(address && typeof address !== "string");
+  const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "shadow", trustedSenderIds: [],
+    runtimeToken: "fixture-token", approverId: "ou_owner", turnActivityProbe: async () => true,
+    hostBaseUrl: `http://127.0.0.1:${address.port}`, approvalCardUpdater: () => {},
+    approvalCardSender: (_recipient, card) => { cards.push(card); return { ok: true, messageId: `om_card_${card.approvalId}` }; } });
+  const headers = { authorization: "Bearer fixture-token" };
+  const identity = { messageId: 1, turnId: "fixture-turn", senderId: "ou_sender" };
+  const plan = parseApprovalPlan({ goal: "Apply two verified settings", impact: "Change the two stated fixture targets only",
+    steps: [4, 5].map(id => ({ kind: "capability", effect: "remote-write", cwd: null, intent: `Apply to target ${id}`,
+      operation: `demo.change: {"target":${id},"value":100}` })) });
+  assert(plan);
+  const waitForCards = async (count: number) => {
+    const deadline = Date.now() + 3_000;
+    while (cards.length < count) { assert(Date.now() < deadline, "fixture card not delivered"); await new Promise(resolve => setTimeout(resolve, 20)); }
+  };
+  const invokeInput = (input: unknown) => runtime.app.inject({ method: "POST", url: "/v1/internal/capabilities/demo.change/execute", headers,
+    payload: { input, context: { larkMessageId: 1, chatId: "oc_fixture", trustScope: "untrusted", turnId: identity.turnId } } });
+  const invoke = (target: number) => invokeInput({ value: 100, target });
+  const decide = (id: number, action: string) => runtime.app.inject({ method: "POST", url: `/v1/approvals/${id}/${action}`, headers });
+  try {
+    const now = new Date().toISOString();
+    runtime.store.db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (1,'oc_fixture','ou_sender',?,?,'running','{}',?,?)")
+      .run(plan.goal, identity.turnId, now, now);
+    await runtime.app.inject({ method: "POST", url: "/v1/capabilities/register", headers,
+      payload: { capabilities: [{ id: "demo.change", title: "Fixture change", description: "Apply fixture value", inputSchema: {}, risk: "external-write" }] } });
+    declareApprovalPlan(runtime.store.db, identity, plan);
+    const first = invoke(4);
+    await waitForCards(1);
+    assert.match(cards[0].taskPlan ?? "", /Change the two stated fixture targets only/);
+    assert.equal(effects.length, 0);
+    assert.equal((await decide(cards[0].approvalId, "approve-turn")).statusCode, 200);
+    assert.equal((await first).statusCode, 200);
+    const wrongType = invokeInput(JSON.stringify({ target: 5, value: 100 }));
+    await waitForCards(2);
+    assert.equal((await decide(cards[1].approvalId, "approve-turn")).statusCode, 409);
+    assert.equal((await decide(cards[1].approvalId, "reject")).statusCode, 200);
+    assert.equal((await wrongType).statusCode, 409);
+    assert.equal((await invoke(5)).statusCode, 200);
+    assert.equal(cards.length, 2);
+    const changed = invoke(6);
+    await waitForCards(3);
+    assert.equal((await decide(cards[2].approvalId, "approve-turn")).statusCode, 409);
+    assert.equal((await decide(cards[2].approvalId, "reject")).statusCode, 200);
+    assert.equal((await changed).statusCode, 409);
+    assert.equal(effects.length, 2);
+  } finally { await runtime.app.close(); runtime.stop(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("unplanned host operations require individual reviews, and external writes still ask", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-auto-host-"));
   const host = Fastify(); let calls = 0; let reviews = 0; const cards: number[] = [];
   host.post("/api/lark-agent/capabilities/forge.review", async () => ({ call: ++calls }));
@@ -90,16 +144,16 @@ test("host review tools reuse one model decision per sender and turn, and extern
     await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true } });
     assert.equal((await invoke(1, "ou_sender", "turn-one", 1)).statusCode, 200);
     assert.equal((await invoke(2, "ou_sender", "turn-one", 2)).statusCode, 200);
-    assert.equal(reviews, 1); assert.equal(cards.length, 0);
+    assert.equal(reviews, 2); assert.equal(cards.length, 0);
     assert.equal((await invoke(3, "ou_sender", "turn-two", 3)).statusCode, 200);
-    assert.equal((await invoke(4, "ou_other", "turn-two", 4)).statusCode, 200); assert.equal(reviews, 3);
+    assert.equal((await invoke(4, "ou_other", "turn-two", 4)).statusCode, 200); assert.equal(reviews, 4);
     const pending = invoke(5, "ou_sender", "turn-one", 5, "forge.deploy");
     for (let i = 0; !cards.length && i < 30; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(cards.length, 1); assert.equal(calls, 4);
     await runtime.app.inject({ headers:{authorization:"Bearer secret"}, method: "POST", url: `/v1/approvals/${cards[0]}/reject` });
     assert.equal((await pending).statusCode, 409); assert.equal(calls, 4);
     const audit = (await runtime.app.inject({ method: "GET", url: "/v1/approvals" })).json().autoReviews;
-    assert.equal(audit.length, 3); assert(audit.every((row: { applied_at: string }) => row.applied_at));
+    assert.equal(audit.length, 4); assert(audit.every((row: { applied_at: string; approval_scope: string }) => row.applied_at && row.approval_scope === "once"));
   } finally { await runtime.app.close(); runtime.stop(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -6,7 +6,7 @@ const records = `
   SELECT id, 'auto' AS kind, lark_message_id AS messageId, source, decision AS status,
     reason, requester_id AS requesterId, approver_id AS approverId, task_type AS taskType,
     target, model, matched_approval_id AS matchedApprovalId, applied_at AS appliedAt,
-    created_at AS createdAt, completed_at AS completedAt, 'turn' AS scope
+    created_at AS createdAt, completed_at AS completedAt, approval_scope AS scope
   FROM lark_turn_auto_reviews
   UNION ALL
   SELECT a.id, 'execution', a.lark_message_id, 'manual', a.status, a.reason,
@@ -31,9 +31,10 @@ function details(store: SqliteAgentStore, kind: string, id: number, includeMatch
     ? `SELECT id,'auto' AS kind,lark_message_id AS messageId,source,decision AS status,reason,
         requester_id AS requesterId,approver_id AS approverId,task_type AS taskType,target,model,
         matched_approval_id AS matchedApprovalId,applied_at AS appliedAt,created_at AS createdAt,
-        completed_at AS completedAt,'turn' AS scope,cwd,turn_id AS turnId,usage_json AS usageJson,
-        NULL AS error,(SELECT operation FROM lark_execution_approvals a WHERE a.turn_id=r.turn_id
-          AND a.requester_id=r.requester_id ORDER BY a.id LIMIT 1) AS operation
+        completed_at AS completedAt,approval_scope AS scope,cwd,turn_id AS turnId,usage_json AS usageJson,
+        plan_summary AS taskPlan,operation_intent AS currentOperationIntent,
+        NULL AS error,COALESCE(reviewed_operation,(SELECT operation FROM lark_execution_approvals a WHERE a.turn_id=r.turn_id
+          AND a.requester_id=r.requester_id ORDER BY a.id LIMIT 1)) AS operation
        FROM lark_turn_auto_reviews r WHERE id=?`
     : kind === "execution"
     ? `SELECT id,'execution' AS kind,lark_message_id AS messageId,'manual' AS source,status,reason,

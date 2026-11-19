@@ -247,8 +247,8 @@ test("an approved command is rechecked once after an accepted same-sender steer"
         assert.deepEqual(reviews[1].input.taskContext?.map(row => row.messageId), [1]);
         if (outcome === "parallel-command") {
           await f.approval("parallel-approval", "kubectl get pods");
-          // The fixture sends approval RPCs before the subsequent emit response.
-          await f.emit([]);
+          await until(() => reviews.length === 3);
+          reviews[2].resolve({decision: "manual", reason: "Parallel operation requires its own decision"});
         }
         if (outcome === "superseded") await steer(3, "另一个目标");
         if (outcome === "ended") await f.complete();
@@ -276,7 +276,7 @@ test("an approved command is rechecked once after an accepted same-sender steer"
           assert.equal(decideLarkExecutionApproval(cards()[0].token, "reject").ok, true);
           await until(() => response()?.result.decision === "decline");
         }
-        assert.equal(reviews.length, 2);
+        assert.equal(reviews.length, outcome === "parallel-command" ? 3 : 2);
       } finally {
         for (const review of reviews) review.resolve({decision: "manual", reason: "fixture cleanup"});
         configureTurnApprovalReviewer();

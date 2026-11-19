@@ -215,6 +215,8 @@ export type LarkExecutionApprovalDetails = {
   cwd: string | null;
   reason: string | null;
   taskContext?: string;
+  taskPlan?: string;
+  allowPlanApproval?: boolean;
 };
 export type LarkExecutionApprovalCardInput = LarkExecutionApprovalDetails & (
   { approvalToken: string; approvalId?: never } | { approvalId: number; approvalToken?: never }
@@ -223,6 +225,7 @@ export type LarkExecutionApprovalCardInput = LarkExecutionApprovalDetails & (
 export type LarkExecutionApprovalResultCardInput = LarkExecutionApprovalDetails & {
   status: "approved" | "rejected" | "expired" | "failed";
   approvalScope: "once" | "turn";
+  planApproved?: boolean;
   decidedAt: string;
 };
 
@@ -240,7 +243,9 @@ function approvalCardDetails(input: LarkExecutionApprovalDetails): string[] {
   const intents = input.operationIntents ?? [input.reason];
   const missing = "未提供意图，请核对本地审批记录。";
   return [
-    count > 1 ? `执行意图（${count} 项）` : `执行意图：${compactCardText(intents[0]?.trim() || missing, 240)}`,
+    input.taskPlan?.slice(0, 1600) ?? null,
+    count > 1 ? `${input.taskPlan ? "当前操作" : "执行意图"}（${count} 项）`
+      : `${input.taskPlan ? "当前操作" : "执行意图"}：${compactCardText(intents[0]?.trim() || missing, 240)}`,
     ...(count > 1 ? intents.slice(0, 3).map((intent, index) => `${index + 1}. ${compactCardText(intent?.trim() || missing, 100)}`) : []),
     count > 3 ? `其余 ${count - 3} 项请在本地审批记录核对。` : null,
     input.operationSummary ? `操作范围：${compactCardText(input.operationSummary, 220)}` : null,
@@ -269,12 +274,12 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
             text: { tag: "plain_text", content: "允许本次" },
             value: { action: "approve", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
           },
-          {
+          ...(input.allowPlanApproval === false ? [] : [{
             tag: "button",
             type: "default",
-            text: { tag: "plain_text", content: "允许当前任务" },
+            text: { tag: "plain_text", content: input.taskPlan ? "允许列出的计划" : "允许当前任务" },
             value: { action: "approve-turn", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
-          },
+          }]),
           {
             tag: "button",
             type: "default",
@@ -287,7 +292,11 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
         tag: "note",
         elements: [{
           tag: "plain_text",
-          content: input.operationCount && input.operationCount > 1
+          content: input.allowPlanApproval === false
+            ? "没有可授权的匹配计划；仅能批准当前操作。审批 10 分钟后失效。"
+            : input.taskPlan
+            ? "“允许列出的计划”只授权上述计划中匹配的操作；参数或范围变化需重新审批。审批 10 分钟后失效。"
+            : input.operationCount && input.operationCount > 1
             ? `“允许本次”会放行当前批次的 ${input.operationCount} 项操作；“允许当前任务”还会自动放行当前 Codex turn 内的后续受限操作。审批 10 分钟后失效。`
             : "“允许本次”只放行当前操作；“允许当前任务”会自动放行当前 Codex turn 内的后续受限操作。审批 10 分钟后失效。"
         }]
@@ -298,7 +307,9 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
 
 export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprovalResultCardInput): Record<string, unknown> {
   const status = input.status === "approved"
-    ? input.approvalScope === "turn"
+    ? input.planApproved
+      ? { label: "已允许列出的计划", template: "green", note: "只允许已核对的计划操作，范围变化需重新审批。授权不代表执行成功。" }
+      : input.approvalScope === "turn"
       ? { label: "已允许当前任务", template: "green", note: "当前 Codex turn 内的后续受限操作将自动放行；新 turn 会重新审批。授权不代表执行成功。" }
       : { label: "已允许本次", template: "green", note: "仅授权当前操作，不代表执行成功；后续受限操作仍需审批。" }
     : input.status === "rejected"

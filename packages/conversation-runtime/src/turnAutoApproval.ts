@@ -5,6 +5,9 @@ import { reviewTurnWithCodex } from "./turnApprovalReviewer.js";
 import { queueTurnAutoApprovalNotification } from "./turnApprovalNotifications.js";
 import { requiresManualCliApproval } from "./approvalCommands.js";
 import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskContext } from "./approvalTaskContext.js";
+import { approvalPlanSummary, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant, maxReviewedOperationChars,
+  operationIsDeclaredRemoteWrite, planCoversOperation, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
+import { redactReplyValues } from "./replySanitization.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -27,6 +30,8 @@ export type TurnApprovalInput = {
   messageId: number; turnId: string; senderId: string | null;
   originalMessage: string; operation: string; cwd: string | null;
   operationIntent?: string | null;
+  operationKind?: ApprovalOperationKind;
+  approvalPlan?: ApprovalPlan;
   directQuote?: string;
   taskContext?: ApprovalTaskContext;
 };
@@ -35,19 +40,22 @@ export type ApprovalPrecedent = {
   status: string; scope: string; decidedAt: string;
 };
 export type ModelApprovalDecision = {
-  decision: "approve_turn" | "manual"; reason: string;
+  decision: "approve_turn" | "approve_once" | "manual"; reason: string;
+  approvedSteps?: number[];
   usage?: Record<string, unknown>;
 };
 export type TurnApprovalReviewer = (input: TurnApprovalInput, history: ApprovalPrecedent[], signal: AbortSignal, model?: string) => Promise<ModelApprovalDecision>;
 export type TurnApprovalDecision = {
   approved: boolean; source: "history" | "model" | "manual" | "disabled";
   reason: string; matchedApprovalId?: number; reviewId?: number;
+  scope?: "once" | "plan";
+  plan?: ApprovalPlan;
+  reviewedPlan?: ApprovalPlan;
   recheckedInput?: { messageId: number; requestId: string | number };
 };
 
 type RefreshApprovalInput = () => (TurnApprovalInput & { requestId: string | number }) | undefined;
-type ReviewEntry = { controller: AbortController; result: Promise<TurnApprovalDecision>; messageId: number; deploymentIntent: boolean; deploymentTargets: string[] };
-const reviews = new WeakMap<Database.Database, Map<string, ReviewEntry>>();
+const reviews = new WeakMap<Database.Database, Map<AbortController, string>>();
 let reviewer: TurnApprovalReviewer = reviewTurnWithCodex;
 
 export function configureTurnApprovalReviewer(value?: TurnApprovalReviewer): void {
@@ -150,19 +158,16 @@ export function deploymentOperationMatchesTask(task: ApprovalTask | null, operat
   return task.type !== "deployment_query" || !/--execute|\bargocd\s+app\s+sync\b|forge\.deploy\.production/i.test(operation);
 }
 
-function isDeploymentExecution(operation: string): boolean {
+function deploymentWrite(operation: string): boolean {
   return /forge\.deploy\.production:|deploy-app\.[cm]?js[^\n]*--execute|\bargocd(?:\s+--[a-z_-]+)*\s+app\s+sync\b|\bkubectl\s+(?:apply|patch)\b/i.test(operation);
 }
 
-export function canReuseLarkTurnAutoApproval(input: TurnApprovalInput): boolean {
-  const key=JSON.stringify([input.turnId,input.senderId,config.larkExecutionApproverId]);
-  const existing=reviews.get(db)?.get(key);
-  if (!existing || requiresManualTurnApproval(input)
-    || (input.messageId !== existing.messageId && requiresModelScopeReview(input.originalMessage))) return false;
-  if (!isDeploymentExecution(input.operation)) return true;
-  const targets=deploymentOperationTargets(input.operation);
-  return existing.deploymentIntent && Boolean(targets?.length)
-    && targets!.every(target=>existing.deploymentTargets.includes(target));
+function outsideAutomaticOperationScope(input: TurnApprovalInput, task: ApprovalTask | null): boolean {
+  const isDeployment = deploymentWrite(input.operation);
+  return requiresManualTurnApproval(input) || input.operation.length > maxReviewedOperationChars
+    || (isDeployment && task !== null && !deploymentOperationMatchesTask(task, input.operation))
+    || (operationIsDeclaredRemoteWrite(input.approvalPlan, input)
+      && !(isDeployment && task?.type === "deployment" && deploymentOperationMatchesTask(task, input.operation)));
 }
 
 export function matchHumanTurnApproval(input: TurnApprovalInput, history: ApprovalPrecedent[], dataSources: readonly string[] = []): ApprovalPrecedent | null {
@@ -203,59 +208,59 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   const finish = (result: TurnApprovalDecision, usage?: Record<string, unknown>): TurnApprovalDecision => {
     if (!database.open) return { ...result, approved: false };
     database.prepare(`UPDATE lark_turn_auto_reviews SET source=?,decision=?,reason=?,matched_approval_id=?,model=?,usage_json=?,completed_at=?,
-      lark_message_id=?,task_type=?,target=?,cwd=? WHERE id=?`)
+      lark_message_id=?,task_type=?,target=?,cwd=?,approval_scope=?,plan_summary=?,operation_intent=?,reviewed_operation=? WHERE id=?`)
       .run(result.source, result.approved ? "approved" : "manual", result.reason, result.matchedApprovalId ?? null,
         modelAttempted ? model : null, usage ? JSON.stringify(usage) : null, nowIso(), reviewedInput.messageId,
-        reviewedTask?.type ?? null, reviewedTask?.target ?? null, reviewedInput.cwd, reviewId);
-    return { ...result, reviewId, ...(recheckedInput ? { recheckedInput } : {}) };
+        reviewedTask?.type ?? null, reviewedTask?.target ?? null, reviewedInput.cwd, result.scope ?? "once",
+        reviewedInput.approvalPlan ? approvalPlanSummary(reviewedInput.approvalPlan) : null,
+        reviewedInput.operationIntent ? redactReplyValues(reviewedInput.operationIntent.slice(0, 240), []) : null,
+        redactReplyValues(reviewedInput.operation.slice(0, maxReviewedOperationChars), []), reviewId);
+    return { ...result, reviewId, reviewedPlan: reviewedInput.approvalPlan, ...(recheckedInput ? { recheckedInput } : {}) };
   };
-  if (requiresManualTurnApproval(input)) return finish({ approved: false, source: "manual", reason: "当前任务需要人工授权" });
+  if (outsideAutomaticOperationScope(input, task)) {
+    return finish({ approved: false, source: "manual", reason: "当前操作需要人工授权或超出完整审核长度" });
+  }
   const history = humanApprovalHistory(database, input.senderId, approverId);
   const match = matchHumanTurnApproval(input, history, dataSources);
-  if (match && (match.status !== "approved" || match.scope !== "turn" || !requiresModelScopeReview(input.originalMessage))) {
+  if (match && (match.status !== "approved" || match.scope !== "turn" ||
+    (!input.approvalPlan && !requiresModelScopeReview(input.originalMessage) && match.operation === input.operation))) {
     return finish({ approved: match.status === "approved" && match.scope === "turn", source: "history",
-    matchedApprovalId: match.id, reason: match.status === "rejected" ? "最近同类人工审批已拒绝" : match.scope !== "turn" ? "历史授权仅允许单次操作" : "匹配同一发送人、任务类型、目标及工作目录的人工 turn 授权" });
+    scope: "once", matchedApprovalId: match.id, reason: match.status === "rejected" ? "最近同类人工审批已拒绝" : match.scope !== "turn" ? "历史授权仅允许单次操作" : "匹配同一发送人、目标及工作目录的同一已批准操作" });
   }
   try {
     const judge = async (candidate: TurnApprovalInput) => {
       const judged = await (options.reviewer ?? reviewTurnWithCodex)(candidate, history.slice(0, 3), options.signal ?? new AbortController().signal, model);
-      if (!["approve_turn", "manual"].includes(judged.decision) || typeof judged.reason !== "string" || !judged.reason.trim()) throw new Error("Invalid approval reviewer result");
+      if (!["approve_turn", "approve_once", "manual"].includes(judged.decision) || typeof judged.reason !== "string" || !judged.reason.trim()) throw new Error("Invalid approval reviewer result");
       return judged;
     };
     modelAttempted = true;
     let judged = await judge(input);
-    if (!options.signal?.aborted && judged.decision === "approve_turn") {
+    if (!options.signal?.aborted && judged.decision !== "manual") {
       const fresh = options.refreshInput?.();
       if (fresh && fresh.messageId !== input.messageId && fresh.senderId === input.senderId && fresh.turnId === input.turnId) {
         reviewedInput = fresh;
         reviewedTask = approvalTask(fresh.originalMessage, dataSources);
         recheckedInput = { messageId: fresh.messageId, requestId: fresh.requestId };
-        if (requiresManualTurnApproval(fresh) || !deploymentOperationMatchesTask(reviewedTask, fresh.operation)) {
+        if (outsideAutomaticOperationScope(fresh, reviewedTask) || !deploymentOperationMatchesTask(reviewedTask, fresh.operation)) {
           return finish({ approved: false, source: "manual", reason: "追加请求需要人工确认当前操作范围" }, judged.usage);
         }
         judged = await judge(fresh);
-        if (!options.signal?.aborted && judged.decision === "approve_turn" && options.refreshInput?.()?.messageId !== fresh.messageId) {
+        if (!options.signal?.aborted && judged.decision !== "manual" && options.refreshInput?.()?.messageId !== fresh.messageId) {
           return finish({ approved: false, source: "manual", reason: "复审期间任务范围再次变化，需人工确认" }, judged.usage);
         }
       }
     }
     if (options.signal?.aborted) return finish({ approved: false, source: "manual", reason: "自动审核已取消" });
-    return finish({ approved: judged.decision === "approve_turn", source: "model", reason: judged.reason.slice(0, 300) }, judged.usage);
+    const plan = reviewedInput.approvalPlan;
+    const approvePlan = judged.decision === "approve_turn" && plan && planCoversOperation(plan, reviewedInput)
+      && judged.approvedSteps?.length === plan.steps.length && plan.steps.every((_, i) => judged.approvedSteps!.includes(i + 1))
+      && plan.steps.every(step => !outsideAutomaticOperationScope({ ...reviewedInput, operation: step.operation,
+        operationKind: step.kind, cwd: step.cwd }, reviewedTask));
+    return finish({ approved: judged.decision !== "manual", source: "model", reason: judged.reason.slice(0, 300),
+      ...(approvePlan ? { scope: "plan" as const, plan } : { scope: "once" as const }) }, judged.usage);
   } catch (error) {
     return finish({ approved: false, source: "manual", reason: `自动审核失败，转人工：${(error instanceof Error ? error.message : String(error)).slice(0, 180)}` });
   }
-}
-
-function approvalReuseScope(input: TurnApprovalInput): Pick<ReviewEntry, "messageId" | "deploymentIntent" | "deploymentTargets"> {
-  const deploymentExecution = isDeploymentExecution(input.operation);
-  const task=approvalTask(input.originalMessage);
-  const inspectionIntent=/查询|检查|排查|是否|状态|\b(?:inspect|check|status)\b/i.test(input.originalMessage);
-  const explicitDeploymentIntent=/(?:^|[，,。;；]|然后|并且|再)(?:\s*(?:请|帮我|开始|继续|please|can you))?\s*(?:部署|上线|发布|deploy\b|sync\b)/i.test(input.originalMessage);
-  const deploymentIntent=task?.type === "deployment" || (!task && (!inspectionIntent || explicitDeploymentIntent)
-    && (deploymentExecution || /部署|上线|发布|\b(?:deploy|sync)\b/i.test(input.originalMessage)));
-  const deploymentTargets=task?.type === "deployment" || task?.type === "deployment_query"
-    ? (JSON.parse(task.target) as {services:string[]}).services : deploymentOperationTargets(input.operation) ?? [];
-  return { messageId: input.messageId, deploymentIntent, deploymentTargets };
 }
 
 export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInput?: RefreshApprovalInput): Promise<TurnApprovalDecision> {
@@ -263,35 +268,39 @@ export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInpu
   const withContext = <T extends TurnApprovalInput>(candidate: T) => ({
     ...candidate,
     directQuote: loadApprovalDirectQuote(db, candidate.messageId, candidate.senderId),
-    taskContext: loadApprovalTaskContext(db, candidate.messageId, candidate.senderId)
+    taskContext: loadApprovalTaskContext(db, candidate.messageId, candidate.senderId),
+    approvalPlan: currentApprovalPlan(db, candidate)
   });
   input = withContext(input);
   let current = reviews.get(db);
   if (!current) { current = new Map(); reviews.set(db, current); }
-  const key = JSON.stringify([input.turnId, input.senderId, config.larkExecutionApproverId]);
-  const existing = current.get(key);
-  if (existing) {
-    if (!canReuseLarkTurnAutoApproval(input)) return Promise.resolve({approved:false,source:"manual",reason:"当前 turn 授权不包含该操作或部署目标"});
-    return existing.result;
-  }
+  const database = db;
+  const grant = currentApprovalPlanGrant(database, input, config.larkExecutionApproverId);
+  if (grant && !requiresManualTurnApproval(input)) return Promise.resolve({ approved: true, scope: "plan", plan: grant.plan,
+    reviewedPlan: grant.plan, source: "model", reviewId: grant.reviewId, reason: "当前操作在已确认的任务计划内" });
   const controller = new AbortController();
-  const result = decideTurnAutoApproval(input, { database: db, enabled: true, approverId: config.larkExecutionApproverId, reviewer, signal: controller.signal,
+  current.set(controller, input.turnId);
+  const result = decideTurnAutoApproval(input, { database, enabled: true, approverId: config.larkExecutionApproverId, reviewer, signal: controller.signal,
     refreshInput: refreshInput && (() => {
       const fresh = refreshInput();
       if (!fresh || fresh.senderId !== input.senderId || fresh.turnId !== input.turnId) return undefined;
-      const entry = current.get(key);
-      if (!entry || entry.controller !== controller) return undefined;
-      if (fresh.messageId !== input.messageId) Object.assign(entry, approvalReuseScope(fresh));
+      if (!current.has(controller)) return undefined;
       return withContext(fresh);
     }) });
-  current.set(key, { controller, result, ...approvalReuseScope(input) });
-  return result;
+  return result.then(decision => {
+    const identity = { ...input, messageId: decision.recheckedInput?.messageId ?? input.messageId };
+    if (decision.approved && currentApprovalPlan(database, identity) !== decision.reviewedPlan) {
+      return { ...decision, approved: false, reason: "审核期间任务计划已变化，不能放行旧申请" };
+    }
+    return decision;
+  }).finally(() => current.delete(controller));
 }
 
 export function finishLarkTurnAutoApproval(turnId: string): void {
+  clearApprovalPlan(db, turnId);
   const current = reviews.get(db);
   if (!current) return;
-  for (const [key, entry] of current) if (JSON.parse(key)[0] === turnId) { entry.controller.abort(); current.delete(key); }
+  for (const [controller, id] of current) if (id === turnId) { controller.abort(); current.delete(controller); }
 }
 
 export function markTurnAutoApprovalApplied(reviewId: number): void {
@@ -304,6 +313,6 @@ export function markTurnAutoApprovalApplied(reviewId: number): void {
 export function stopLarkTurnAutoApprovalReviews(): void {
   const current = reviews.get(db);
   if (!current) return;
-  for (const entry of current.values()) entry.controller.abort();
+  for (const controller of current.keys()) controller.abort();
   current.clear();
 }

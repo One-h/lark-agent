@@ -2,6 +2,16 @@ import Database from "better-sqlite3";
 import os from "node:os";
 import path from "node:path";
 
+const turnAutoReviewsTable = `CREATE TABLE IF NOT EXISTS lark_turn_auto_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL,
+  turn_id TEXT NOT NULL, requester_id TEXT NOT NULL, approver_id TEXT NOT NULL,
+  task_type TEXT, target TEXT, cwd TEXT, source TEXT NOT NULL,
+  decision TEXT NOT NULL, reason TEXT NOT NULL, matched_approval_id INTEGER,
+  model TEXT, usage_json TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+  applied_at TEXT, approval_scope TEXT NOT NULL DEFAULT 'turn', plan_summary TEXT,
+  operation_intent TEXT, reviewed_operation TEXT
+);`;
+
 function isTestProcess(): boolean {
   return process.env.LARK_AGENT_TEST_DATABASE === "1"
     || process.env.NODE_TEST_CONTEXT !== undefined
@@ -67,6 +77,25 @@ export class SqliteAgentStore {
   private ensureColumn(table: string, column: string, definition: string): void {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (!columns.some((entry) => entry.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+
+  private migrateOperationScopedReviews(): void {
+    const legacy = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='lark_turn_auto_reviews'").pluck().get();
+    if (typeof legacy !== "string" || !/UNIQUE\s*\(turn_id,\s*requester_id,\s*approver_id\)/i.test(legacy)) return;
+    this.db.transaction(() => {
+      this.db.exec(`
+        ALTER TABLE lark_turn_auto_reviews RENAME TO lark_turn_auto_reviews_legacy;
+        ${turnAutoReviewsTable}
+        INSERT INTO lark_turn_auto_reviews (id, lark_message_id, turn_id, requester_id, approver_id,
+          task_type, target, cwd, source, decision, reason, matched_approval_id, model, usage_json, created_at, completed_at, applied_at)
+        SELECT id, lark_message_id, turn_id, requester_id, approver_id,
+          task_type, target, cwd, source, decision, reason, matched_approval_id, model, usage_json, created_at, completed_at, applied_at
+        FROM lark_turn_auto_reviews_legacy;
+        UPDATE sqlite_sequence SET seq = max(seq, COALESCE((SELECT seq FROM sqlite_sequence
+          WHERE name='lark_turn_auto_reviews_legacy'),0)) WHERE name='lark_turn_auto_reviews';
+        DROP TABLE lark_turn_auto_reviews_legacy;
+      `);
+    })();
   }
 
   private migrateLegacyRuntime(): void {
@@ -154,14 +183,7 @@ export class SqliteAgentStore {
       CREATE INDEX IF NOT EXISTS idx_lark_codex_session_resets_chat ON lark_codex_session_resets(chat_id, id DESC);
       CREATE TABLE IF NOT EXISTS lark_group_context_cursors (chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, last_message_id INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(chat_id, trust_scope));
       CREATE TABLE IF NOT EXISTS lark_execution_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE, lark_message_id INTEGER NOT NULL, requester_id TEXT, approver_id TEXT NOT NULL, request_method TEXT NOT NULL, server_request_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL, operation TEXT, cwd TEXT, reason TEXT, status TEXT NOT NULL DEFAULT 'pending', approval_scope TEXT NOT NULL DEFAULT 'once', card_message_id TEXT, card_error TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, decided_at TEXT);
-      CREATE TABLE IF NOT EXISTS lark_turn_auto_reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL,
-        turn_id TEXT NOT NULL, requester_id TEXT NOT NULL, approver_id TEXT NOT NULL,
-        task_type TEXT, target TEXT, cwd TEXT, source TEXT NOT NULL,
-        decision TEXT NOT NULL, reason TEXT NOT NULL, matched_approval_id INTEGER,
-        model TEXT, usage_json TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-        applied_at TEXT, UNIQUE(turn_id, requester_id, approver_id)
-      );
+      ${turnAutoReviewsTable}
       CREATE TABLE IF NOT EXISTS lark_capability_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL, turn_id TEXT, capability_id TEXT, operation TEXT NOT NULL, approver_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', expires_at TEXT NOT NULL, decided_at TEXT, card_message_id TEXT, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS lark_capability_invocations (id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL, turn_id TEXT NOT NULL, capability_id TEXT NOT NULL, input_hash TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT, error TEXT, created_at TEXT NOT NULL, finished_at TEXT, UNIQUE(turn_id, capability_id, input_hash));
       CREATE TABLE IF NOT EXISTS lark_execution_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, lark_message_id INTEGER NOT NULL, turn_id TEXT NOT NULL, status TEXT NOT NULL, entries_json TEXT NOT NULL, card_message_id TEXT, delivery_status TEXT NOT NULL DEFAULT 'pending', delivery_attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, delivery_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(lark_message_id, turn_id));
@@ -180,6 +202,7 @@ export class SqliteAgentStore {
       CREATE INDEX IF NOT EXISTS idx_lark_progress_pending ON lark_progress_cards(next_attempt_at) WHERE pending=1;
     `);
 
+    this.migrateOperationScopedReviews();
     this.ensureColumn("stickers", "content_hash", "TEXT");
     this.ensureColumn("stickers", "usage_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("stickers", "deleted_at", "TEXT");

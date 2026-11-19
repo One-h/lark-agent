@@ -33,12 +33,15 @@ import { configuredOwnerMentionAssistBotIds } from "@lark-agent/conversation-run
 import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
 import { topicNativeModeEnabled, resetTopicNativeEnrollmentEpoch } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
+import { applyPlanAuthorization, approvalPlanSummary, currentApprovalPlan, currentApprovalPlanGrant,
+  planCoversOperation, type ApprovalPlan, type TurnApprovalInput } from "@lark-agent/conversation-runtime";
 import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 export type RuntimeConfig = { executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
-type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void };
+type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void;
+  plan?: ApprovalPlan; requiresPlan: boolean; planInput: TurnApprovalInput; planApplied: (plan: ApprovalPlan, approver: string) => void };
 type MessageCursor = { messageAt: string; id: number };
 
 const messageSelectColumns = `
@@ -203,28 +206,42 @@ export function createRuntime(config: RuntimeConfig) {
   };
   const settleApproval = (id: number, status: "approved" | "rejected" | "expired" | "failed", scope: "once" | "turn" = "once", reason: string | null = null) => {
     const row = store.approval(id);
-    if (row && status === "approved" && !ownerAssistMayExecute(row.lark_message_id)) { status = "failed"; reason = "协同上下文或配置已变化，未放行操作。"; }
-    if (!row || !store.db.prepare("UPDATE lark_capability_approvals SET status=?,approval_scope=?,error=?,decided_at=? WHERE id=? AND status='pending'")
-      .run(status, scope, reason, new Date().toISOString(), id).changes) return false;
     const pending = pendingApprovals.get(id);
+    if (row && status === "approved" && !ownerAssistMayExecute(row.lark_message_id)) { status = "failed"; reason = "协同上下文或配置已变化，未放行操作。"; }
+    if (!row || row.status !== "pending") return false;
+    if (status === "approved" && pending?.plan && currentApprovalPlan(store.db, pending.planInput) !== pending.plan) return false;
+    if (status === "approved" && scope === "turn" && pending?.requiresPlan && !pending.plan) return false;
+    const planApproved = status === "approved" && scope === "turn" && Boolean(pending?.plan);
+    if (planApproved && (!pending || !pending.plan || !applyPlanAuthorization(store.db, pending.planInput, pending.plan, row.approver_id, [pending.planInput]))) return false;
+    const storedScope = planApproved ? "once" : scope;
+    if (!store.db.prepare("UPDATE lark_capability_approvals SET status=?,approval_scope=?,error=?,decided_at=? WHERE id=? AND status='pending'")
+      .run(status, storedScope, reason, new Date().toISOString(), id).changes) return false;
+    if (planApproved && pending?.plan) pending.planApplied(pending.plan, row.approver_id);
     if (pending) { clearTimeout(pending.timer); pending.cleanup(); pendingApprovals.delete(id); pending.resolve(status === "approved"); }
     if (row.card_message_id) {
-      try { (config.approvalCardUpdater ?? updateApprovalCard)(row.card_message_id, { ...approvalDetails(row.lark_message_id, row.operation), status, approvalScope: scope, decidedAt: new Date().toISOString(), reason }); }
+      try { (config.approvalCardUpdater ?? updateApprovalCard)(row.card_message_id, { ...approvalDetails(row.lark_message_id, row.operation),
+        taskPlan: pending?.plan ? approvalPlanSummary(pending.plan) : undefined,
+        status, approvalScope: storedScope, planApproved, decidedAt: new Date().toISOString(), reason }); }
       catch { app.log.warn("capability_approval_card_update_failed"); }
     }
     return true;
   };
-  const awaitApproval = async (input: { messageId: number; turnId: string; capabilityId?: string; operation: string; originalMessage?: string }, signal: AbortSignal): Promise<boolean> => {
+  const awaitApproval = async (input: { messageId: number; turnId: string; capabilityId?: string; operation: string },
+    signal: AbortSignal, planInput: TurnApprovalInput, planApplied: PendingApproval["planApplied"]): Promise<boolean> => {
     if (!approverId || signal.aborted || !liveTurn(input.messageId, input.turnId)) return false;
     const approvalId = store.createApproval({ larkMessageId: input.messageId, turnId: input.turnId, capabilityId: input.capabilityId, operation: input.operation, approverId, expiresAt: new Date(Date.now() + 600000).toISOString() });
+    const plan = currentApprovalPlan(store.db, planInput);
+    const requiresPlan = store.setting("turnAutoApprovalEnabled", "false") === "true";
     const result = new Promise<boolean>(resolve => {
       const abort = () => settleApproval(approvalId, "failed", "once", "会话已结束或调用已断开，操作未执行。");
       const timer = setTimeout(() => settleApproval(approvalId, "expired"), 600000);
       signal.addEventListener("abort", abort, { once: true });
-      pendingApprovals.set(approvalId, { resolve, timer, cleanup: () => signal.removeEventListener("abort", abort) });
+      pendingApprovals.set(approvalId, { resolve, timer, cleanup: () => signal.removeEventListener("abort", abort), plan, requiresPlan, planInput, planApplied });
     });
     try {
-      const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation), reason: "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
+      const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation),
+        taskPlan: plan ? approvalPlanSummary(plan) : undefined, allowPlanApproval: plan ? planCoversOperation(plan, planInput) : requiresPlan ? false : undefined,
+        reason: "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
       if (card.ok && card.messageId) store.setApprovalCardMessage(approvalId, card.messageId);
       else settleApproval(approvalId, "failed", "once", "审批卡未取得发送回执，操作未执行。");
     } catch { settleApproval(approvalId, "failed", "once", "审批卡发送失败，操作未执行。"); }
@@ -239,7 +256,8 @@ export function createRuntime(config: RuntimeConfig) {
       else if (Date.parse(row.expires_at) <= Date.now()) settleApproval(row.id, "expired");
       else {
         const source = store.db.prepare("SELECT sender_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as { sender_id: string };
-        if (hasLarkManualTurnApproval(store.db, { turnId: row.turn_id!, threadId: row.thread_id, senderId: source.sender_id, approverId })) settleApproval(row.id, "approved", "turn");
+        const pending = pendingApprovals.get(row.id);
+        if (!pending?.plan && !pending?.requiresPlan && hasLarkManualTurnApproval(store.db, { turnId: row.turn_id!, threadId: row.thread_id, senderId: source.sender_id, approverId })) settleApproval(row.id, "approved", "turn");
       }
     }
     reconcilePendingExecutionTurnApprovals();
@@ -322,7 +340,8 @@ export function createRuntime(config: RuntimeConfig) {
     const expectedScope = isTrustedLarkSender(message.sender_id) ? "trusted" : "untrusted";
     if (context.trustScope !== expectedScope) throw new Error("Capability trust scope does not match the current sender");
     const turnId = typeof context.turnId === "string" && context.turnId ? context.turnId : message.codex_turn_id ?? `capability:${id}`;
-    const inputHash = createHash("sha256").update(JSON.stringify(input ?? null)).digest("hex");
+    const encodedInput = JSON.stringify(input ?? null);
+    const inputHash = createHash("sha256").update(encodedInput).digest("hex");
     const createdAt = new Date().toISOString();
     const inserted = store.db.prepare("INSERT OR IGNORE INTO lark_capability_invocations (lark_message_id, turn_id, capability_id, input_hash, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)").run(larkMessageId, turnId, id, inputHash, createdAt);
     if (inserted.changes === 0) {
@@ -371,24 +390,44 @@ export function createRuntime(config: RuntimeConfig) {
           });
         }
       }
-      let automaticallyApproved = ownerMessageApproved || hasLarkManualTurnApproval(store.db, { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
-      const deploymentInScope=deploymentOperationMatchesTask(approvalTask(message.content ?? ""),`${capability.id}: ${textResult(input)}`);
+      const approvalInput: TurnApprovalInput = { messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
+        originalMessage: message.content ?? "", operation: `${capability.id}: ${encodedInput}`, operationKind: "capability", cwd: workspaceRoot };
+      const requiresScopedApproval = store.setting("turnAutoApprovalEnabled", "false") === "true" || Boolean(currentApprovalPlan(store.db, approvalInput));
+      let automaticallyApproved = ownerMessageApproved || !requiresScopedApproval && hasLarkManualTurnApproval(store.db,
+        { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
+      let authorizedPlan: { plan: ApprovalPlan | undefined; approver: string; automatic: boolean } | undefined;
+      let appliedReviewId: number | undefined;
+      const planApplied = (plan: ApprovalPlan | undefined, approver: string, automatic = false) => { authorizedPlan = { plan, approver, automatic }; };
+      if (approvalRequired && !automaticallyApproved && approverId) {
+        const grant = currentApprovalPlanGrant(store.db, approvalInput, approverId);
+        if (grant && grant.reviewId === undefined) {
+          automaticallyApproved = applyPlanAuthorization(store.db, approvalInput, grant.plan, approverId, [approvalInput]);
+          if (automaticallyApproved) planApplied(grant.plan, approverId);
+        }
+      }
+      const deploymentInScope=deploymentOperationMatchesTask(approvalTask(message.content ?? ""),approvalInput.operation);
       if (approvalRequired && !automaticallyApproved && (capability.risk === "local-write" || (id === "forge.deploy.production" && deploymentInScope)) && store.setting("turnAutoApprovalEnabled", "false") === "true") {
         const reviewerApprover = approverId;
-        const decision = await waitForTurnAuthorization(reviewLarkTurnAutoApproval({ messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
-          originalMessage: message.content ?? "", operation: `${capability.id}: ${textResult(input)}`, cwd: workspaceRoot }), signal);
+        const decision = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(approvalInput), signal);
         assertActive();
         if (!await confirmTurn(larkMessageId, turnId)) throw new Error("自动审核返回时原生会话已失效，操作未执行。");
         assertActive();
         // A recheck covers the pending native command, not another host operation sharing the turn.
         automaticallyApproved = decision.approved && !decision.recheckedInput
-          && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover;
-        if (automaticallyApproved && decision.reviewId) markTurnAutoApprovalApplied(decision.reviewId);
+          && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover
+          && decision.reviewedPlan === currentApprovalPlan(store.db, approvalInput)
+          && (!decision.plan || !!reviewerApprover && applyPlanAuthorization(store.db, approvalInput, decision.plan, reviewerApprover, [approvalInput], decision.reviewId));
+        if (automaticallyApproved && reviewerApprover) planApplied(decision.reviewedPlan, reviewerApprover, true);
+        if (automaticallyApproved) appliedReviewId = decision.reviewId;
       }
-      if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id, operation: `${capability.title}: ${textResult(input)}`, originalMessage: message.content }, signal)) throw new Error("Operation was not approved or its turn ended");
+      if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id,
+        operation: `${capability.title}: ${textResult(input)}` }, signal, approvalInput, planApplied)) throw new Error("Operation was not approved or its turn ended");
       assertActive();
       if (!await confirmTurn(larkMessageId, turnId)) throw new Error("无法确认原生 turn 仍有效，未执行操作。");
       assertActive();
+      if (authorizedPlan && (authorizedPlan.approver !== approverId || authorizedPlan.plan !== currentApprovalPlan(store.db, approvalInput)
+        || authorizedPlan.automatic && store.setting("turnAutoApprovalEnabled", "false") !== "true")) throw new Error("任务计划或审批身份已变化，操作未执行。");
+      if (appliedReviewId !== undefined) markTurnAutoApprovalApplied(appliedReviewId);
       call.started = true;
       const hostResult = await invokeHost(capability, input, {
         ...context,
@@ -652,7 +691,10 @@ export function createRuntime(config: RuntimeConfig) {
     if (!store.db.prepare("SELECT 1 FROM lark_messages WHERE id=?").get(id)) return reply.code(404).send({ error: "not found" });
     return messageFiles(store, id);
   });
-  app.get("/v1/approvals", async () => ({ appServer: store.db.prepare("SELECT * FROM lark_execution_approvals ORDER BY id DESC LIMIT 200").all(), capabilities: store.db.prepare("SELECT * FROM lark_capability_approvals ORDER BY id DESC LIMIT 200").all(), autoReviews: store.db.prepare("SELECT * FROM lark_turn_auto_reviews ORDER BY id DESC LIMIT 200").all() }));
+  app.get("/v1/approvals", async () => ({ appServer: store.db.prepare("SELECT * FROM lark_execution_approvals ORDER BY id DESC LIMIT 200").all(),
+    capabilities: store.db.prepare("SELECT * FROM lark_capability_approvals ORDER BY id DESC LIMIT 200").all(),
+    autoReviews: store.db.prepare(`SELECT id,lark_message_id,turn_id,requester_id,approver_id,task_type,target,cwd,source,decision,reason,
+      matched_approval_id,model,usage_json,created_at,completed_at,applied_at,approval_scope FROM lark_turn_auto_reviews ORDER BY id DESC LIMIT 200`).all() }));
   registerApprovalHistoryRoutes(app, store, authenticated);
   app.get("/v1/contacts", async () => store.db.prepare("SELECT * FROM contacts ORDER BY name, open_id").all());
   app.post("/v1/contacts/sync", async () => syncLarkContactsFromCli());
