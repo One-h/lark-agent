@@ -41,6 +41,21 @@ Same-turn steering requires a stable Claude ACP release with prompt-lifecycle
 fixes (0.81.1 or later in the 0.x series) and an advertised steering extension.
 Other versions queue follow-up messages instead of attempting an untracked turn.
 
+## Progress and replies
+
+Claude ACP notices, subagent text, and commentary before tool calls are not
+part of the final Feishu reply. The adapter keeps the last foreground answer
+and uses ACP message IDs to join its chunks when available. Tool activity
+feeds the existing single progress card with short status labels, not tool
+arguments, outputs, or raw transcript text. With progress enabled, tool-driven
+turns can show a card after 8 seconds (or the configured delay if shorter);
+turns without tool activity retain the existing delay. A turn that finishes
+before its threshold emits only the final reply.
+
+Successful external-engine replies use the same Markdown delivery as Codex:
+rich text for normal replies, data cards for tables and structured lists,
+and a Markdown attachment for content that exceeds display limits.
+
 ## Configure and verify
 
 `GET` and `PUT /v1/chats/:chatId/topics/:threadId/execution` use the runtime

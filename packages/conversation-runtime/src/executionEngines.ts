@@ -20,7 +20,10 @@ export type ExecutionEngineDescriptor = {
 export type ExecutionTurnResult =
   | { status: "completed"; text: string }
   | { status: "cancelled" };
-export type ExecutionEngineEvent = { type: "text-delta"; text: string };
+export type ExecutionWorkStage = "read" | "search" | "execute" | "change" | "other";
+export type ExecutionEngineEvent =
+  | { type: "text-delta"; text: string }
+  | { type: "work"; stage: ExecutionWorkStage };
 export type ExecutionEngineMcpServer = { name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> };
 
 export interface ExecutionEngineSession {

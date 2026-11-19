@@ -2,10 +2,17 @@ import { spawn } from "node:child_process";
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
-import { client, ndJsonStream, type LoadSessionResponse, type NewSessionResponse, type PromptResponse, type SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
-import type { ExecutionEngine, ExecutionEngineEvent, LarkExecutionPolicy } from "./executionEngines.js";
+import { client, ndJsonStream, type LoadSessionResponse, type NewSessionResponse, type PromptResponse, type SetSessionConfigOptionResponse, type ToolKind } from "@agentclientprotocol/sdk";
+import type { ExecutionEngine, ExecutionEngineEvent, ExecutionWorkStage, LarkExecutionPolicy } from "./executionEngines.js";
 
 const promptText = (text: string) => [{ type: "text" as const, text }];
+
+function workStage(kind: ToolKind | null | undefined): ExecutionWorkStage {
+  if (kind === "read" || kind === "execute" || kind === "search") return kind;
+  if (kind === "fetch") return "search";
+  if (kind === "edit" || kind === "move" || kind === "delete") return "change";
+  return "other";
+}
 
 function supportsOwnedClaudeSteering(version: string | undefined): boolean {
   const [, minor, patch] = /^0\.(\d+)\.(\d+)$/.exec(version ?? "") ?? [];
@@ -36,8 +43,8 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
         .flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
       const child = spawn(launcher, [], { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
       let id = sessionId;
-      let answer: string | null = null;
-      let emit: ((event: ExecutionEngineEvent) => void) | undefined;
+      let output: { text: string; messageId?: string; retiredMessages: Set<string>; tools: Set<string>;
+        emit?: (event: ExecutionEngineEvent) => void } | null = null;
       let turnPermissionSignal: AbortSignal | null = null;
       const connection = client()
         .onRequest("session/request_permission", ({ params, signal: requestSignal }) => {
@@ -46,10 +53,29 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
           return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
         })
         .onNotification("session/update", ({ params: { sessionId: updatedId, update } }) => {
-          if (updatedId === id && answer !== null && update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-            answer = (answer + update.content.text).slice(0, 40_000);
-            emit?.({ type: "text-delta", text: update.content.text });
+          if (updatedId !== id || !output) return;
+          const meta = update._meta?.claudeCode as { parentToolUseId?: unknown; kind?: unknown } | undefined;
+          if (meta?.parentToolUseId || meta?.kind === "informational" || meta?.kind === "mcpServerStatus") return;
+          if (update.sessionUpdate === "tool_call" && !output.tools.has(update.toolCallId)
+            && (update.status == null || update.status === "pending" || update.status === "in_progress")
+            && update.kind !== "think" && update.kind !== "switch_mode") {
+            output.tools.add(update.toolCallId);
+            // Text leading into a tool call is commentary, not the terminal answer.
+            output.text = "";
+            if (output.messageId) output.retiredMessages.add(output.messageId);
+            output.messageId = undefined;
+            output.emit?.({ type: "work", stage: workStage(update.kind) });
+            return;
           }
+          if (update.sessionUpdate !== "agent_message_chunk" || update.content.type !== "text" || !update.content.text) return;
+          if (update.messageId && output.retiredMessages.has(update.messageId)) return;
+          if (update.messageId && update.messageId !== output.messageId) {
+            if (output.messageId) output.retiredMessages.add(output.messageId);
+            output.text = "";
+            output.messageId = update.messageId;
+          }
+          output.text = (output.text + update.content.text).slice(0, 40_000);
+          output.emit?.({ type: "text-delta", text: update.content.text });
         })
         .connect(ndJsonStream(Writable.toWeb(child.stdin) as Parameters<typeof ndJsonStream>[0],
           Readable.toWeb(child.stdout) as unknown as Parameters<typeof ndJsonStream>[1]));
@@ -63,7 +89,7 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
       signal.addEventListener("abort", close, { once: true });
       const startupTimer = setTimeout(close, 15_000);
       try {
-        const hello = await peer.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+        const hello = await peer.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } });
         if (hello.protocolVersion !== 1) throw new Error("Claude ACP protocol version is unsupported");
         const request = { cwd, mcpServers: mcpServers ?? [] };
         const options = sessionId
@@ -98,15 +124,15 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
               void peer.notify("session/cancel", { sessionId: activeId }).catch(() => {});
             };
             turnSignal.addEventListener("abort", cancel, { once: true });
-            answer = "";
-            emit = onEvent;
+            const turnOutput = { text: "", tools: new Set<string>(), retiredMessages: new Set<string>(), emit: onEvent };
+            output = turnOutput;
             turnPermissionSignal = turnSignal;
             try {
               const result = await peer.request<PromptResponse>("session/prompt", { sessionId: activeId, prompt: promptText(text) });
               if (result.stopReason === "cancelled") return { status: "cancelled" };
               if (result.stopReason !== "end_turn") throw new Error("Claude ACP turn did not finish normally");
-              return { status: "completed", text: answer ?? "" };
-            } finally { turnPermissionSignal = null; turnSignal.removeEventListener("abort", cancel); answer = null; emit = undefined; }
+              return { status: "completed", text: turnOutput.text };
+            } finally { turnPermissionSignal = null; turnSignal.removeEventListener("abort", cancel); output = null; }
           },
           ...(steering ? {
             async steer(text: string, steerSignal: AbortSignal) {

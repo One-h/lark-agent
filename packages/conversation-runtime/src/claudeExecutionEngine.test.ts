@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createClaudeExecutionEngine } from "./claudeExecutionEngine.js";
-import { larkExecutionPolicy, type ExecutionEngineSession } from "./executionEngines.js";
+import { larkExecutionPolicy, type ExecutionEngineEvent, type ExecutionEngineSession } from "./executionEngines.js";
 
 test("Claude uses the shared workspace and permits only the active trusted turn's single requests", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "lark-claude-acp-"));
@@ -21,13 +21,18 @@ const config = currentValue => [{id:'model', category:'model', name:'Model', typ
 const once={optionId:'allow',name:'Allow',kind:'allow_once'};
 const permanent={optionId:'always',name:'Always',kind:'allow_always'};
 const permission=(id,sessionId,options)=>write({id,method:'session/request_permission',params:{sessionId,toolCall:{toolCallId:'fixture'},options}});
+const update=(update,sessionId='fixture-session')=>write({method:'session/update',params:{sessionId,update}});
+const text=(text,messageId,_meta)=>update({sessionUpdate:'agent_message_chunk',messageId,content:{type:'text',text},_meta});
 let pending, initial, late, verified=0;
 const verifyMcp = servers => {
  if(servers.length!==1||servers[0].name!=='lark_tools'||servers[0].env[0]?.name!=='LARK_AGENT_MCP_TOKEN') throw Error('shared MCP not configured');
 };
 createInterface({input:process.stdin}).on('line', line => {
  const {id,method,params,...response} = JSON.parse(line);
- if(method==='initialize') result(id,{protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{name:'fixture',version:'0.108.1'},_meta:{steering:{supported:true}}});
+ if(method==='initialize') {
+   if(!params.clientCapabilities.session?.notices) throw Error('notices must not be folded into messages');
+   result(id,{protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{name:'fixture',version:'0.108.1'},_meta:{steering:{supported:true}}});
+ }
  if(method==='session/new') {
    if(realpathSync(params.cwd)!==process.cwd()) throw Error('unexpected workspace');
    verifyMcp(params.mcpServers);
@@ -45,6 +50,14 @@ createInterface({input:process.stdin}).on('line', line => {
  }
  if(method==='session/set_config_option') result(id,{configOptions:config(params.value)});
  if(method==='session/prompt') {
+  if(params.prompt[0].text==='legacy fixture') {
+    text('Reading first.');
+    update({sessionUpdate:'tool_call',toolCallId:'legacy-read',kind:'read'});
+    text('A short ');
+    text('answer without IDs.');
+    result(id,{stopReason:'end_turn'});
+    return;
+  }
   pending=id;
   permission(999,params.sessionId,[permanent,once]);
   permission(998,params.sessionId,[permanent]);
@@ -53,7 +66,18 @@ createInterface({input:process.stdin}).on('line', line => {
  if([999,998,995].includes(id) && !method && pending!==undefined) {
    const out=response.result?.outcome;
    if(id===999 ? out?.outcome!=='selected'||out?.optionId!=='allow' : out?.outcome!=='cancelled') throw Error('incorrect permission decision');
-   if(++verified===3) write({method:'session/update',params:{sessionId:'fixture-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'once granted'} } } });
+   if(++verified===3) {
+     update({sessionUpdate:'notice',severity:'warning',title:'Internal adapter warning'});
+     text('I will look first.', 'preface');
+     update({sessionUpdate:'tool_call',toolCallId:'test-read',kind:'read',status:'in_progress',title:'private file name',rawInput:{path:'/local/private'}});
+     text('**Final', 'answer');
+     text('late preface', 'preface');
+     text('fallback warning', undefined, {claudeCode:{kind:'informational',level:'warning'}});
+     text('subagent text', 'child', {claudeCode:{parentToolUseId:'child-tool'}});
+     update({sessionUpdate:'tool_call_update',toolCallId:'test-read',status:'completed',rawOutput:'private tool output'});
+     text(' answer**', 'answer');
+     update({sessionUpdate:'notice',severity:'info',title:'Trailing adapter notice'});
+   }
  }
  if(method==='_session/steering') {
   if(params._meta?.steering?.idleBehavior!=='promptRequired') throw Error('unsafe idle fallback');
@@ -85,11 +109,18 @@ createInterface({input:process.stdin}).on('line', line => {
     session = await engine.open({ sessionId: null, model: "fixture", policy, signal: controller.signal, mcpServers });
     let streamed!: () => void;
     const chunk = new Promise<void>(resolve => { streamed = resolve; });
-    const run = session.run("test prompt", controller.signal, () => streamed());
+    const events: ExecutionEngineEvent[] = [];
+    const run = session.run("test prompt", controller.signal, event => { events.push(event); if (events.length === 4) streamed(); });
     await Promise.race([chunk, run.then(() => { throw new Error("Expected a live streamed update"); })]);
     assert.equal(await session.steer?.("follow-up", controller.signal), "injected");
-    assert.deepEqual(await run, { status: "completed", text: "once granted" });
+    assert.deepEqual(await run, { status: "completed", text: "**Final answer**" });
+    assert.deepEqual(events, [
+      { type: "text-delta", text: "I will look first." }, { type: "work", stage: "read" },
+      { type: "text-delta", text: "**Final" }, { type: "text-delta", text: " answer**" }
+    ]);
     assert.equal(await session.steer?.("late follow-up", controller.signal), "idle");
+    assert.deepEqual(await session.run("legacy fixture", controller.signal),
+      { status: "completed", text: "A short answer without IDs." });
     const sessionId = session.id;
     session.close();
     session = await engine.open({ sessionId, model: null, policy, signal: controller.signal, mcpServers });

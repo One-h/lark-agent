@@ -6,11 +6,11 @@ import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
-import { createRuntime } from "./index.js";
+import { createRuntime, type RuntimeConfig } from "./index.js";
 import { larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
-async function until(check: () => boolean) {
-  const deadline = performance.now() + 8000;
+async function until(check: () => boolean, timeoutMs = 8000) {
+  const deadline = performance.now() + timeoutMs;
   while (!check()) { assert(performance.now() < deadline, "topic fixture timed out"); await immediate(); }
 }
 
@@ -41,11 +41,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH, oldCodex = process.env.CODEX_EXECUTABLE;
   process.env.PATH = `${root}:${oldPath ?? ""}`; process.env.CODEX_EXECUTABLE = executable;
-  const options = { databasePath: path.join(root, "test.sqlite"), mode: "active" as const, workspaceRoot: root, executionEngines,
+  const options: RuntimeConfig = { databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, executionEngines,
     trustedSenderIds: ["ou_owner"], approverId: "ou_owner", runtimeToken: "fixture-token",
     progressSender: async () => ({ ok: true as const, messageId: "om_fixture_progress", chatId: "oc_fixture", messageAt: null, messageType: "interactive" }),
     progressUpdater: async () => ({ ok: true as const }),
-    reactionSender: () => ({ ok: true as const }), textReplySender: () => ({ ok: true as const, messageId: "om_out_" + (++out), chatId: "oc_fixture", messageAt: null, messageType: "text" }) };
+    reactionSender: () => ({ ok: true as const }), textReplySender: (_id, _text, _key, presentation) =>
+      ({ ok: true, messageId: "om_out_" + (++out), chatId: "oc_fixture", messageAt: null, messageType: presentation?.msgType ?? "text" }) };
   let out = 0, sequence = 0, runtime = createRuntime(options);
   for (const [key, value] of Object.entries({ stickerUsageMode: "off", interimRepliesEnabled: "false", executionReceiptsEnabled: "false", trustedExecutionEnabled: "true" })) setAppSettingValue(key, value);
   const row = (id: string) => runtime.store.db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(id) as any;
@@ -171,6 +172,7 @@ test("topic engine routes are protected, isolated and persistent; live steering 
   const opened: Array<{ sessionId: string | null; model: string | null; policy: LarkExecutionPolicy }> = [];
   const prompts: string[] = [], steered: string[] = [];
   let complete: ((value: ExecutionTurnResult) => void) | undefined;
+  let startSearch: (() => void) | undefined;
   const engine: ExecutionEngine = {
     descriptor: { id: "fixture", label: "Fixture", models: ["fixture-model", "fixture-next"] },
     supportsPolicy: policy => policy.trustScope === "trusted",
@@ -178,8 +180,11 @@ test("topic engine routes are protected, isolated and persistent; live steering 
       opened.push({ sessionId, model, policy });
       return {
         id: sessionId ?? `fixture-session-${opened.length}`,
-        run(text, signal) {
+        run(text, signal, onEvent) {
           prompts.push(text);
+          onEvent?.({ type: "text-delta", text: "Internal interim narrative" });
+          onEvent?.({ type: "work", stage: "read" });
+          startSearch = () => onEvent?.({ type: "work", stage: "search" });
           return new Promise(resolve => {
             complete = resolve;
             signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
@@ -210,12 +215,20 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     await until(() => untrusted.row().codex_status === "failed");
     assert.match(untrusted.row().codex_reply, /未启动任务/);
     assert.deepEqual(opened, []);
-    config.larkCodexInterimReplyDelayMs = 0;
+    config.larkCodexInterimReplyDelayMs = 30_000;
     await f.settings({ interimRepliesEnabled: true });
     const first = await f.message({ content: "start external turn" });
     await until(() => prompts.length === 1);
-    const progress = () => f.runtime().store.db.prepare("SELECT state FROM lark_progress_cards WHERE lark_message_id=?").get(first.row().id) as { state: string } | undefined;
-    await until(() => progress()?.state === "running");
+    const progress = (id = first.row().id) => f.runtime().store.db.prepare("SELECT state,entries_json,card_message_id FROM lark_progress_cards WHERE lark_message_id=?").get(id) as
+      { state: string; entries_json: string; card_message_id: string | null } | undefined;
+    await until(() => Boolean(progress()?.card_message_id), 12_000);
+    assert.match(progress()!.entries_json, /正在读取资料/);
+    assert.doesNotMatch(progress()!.entries_json, /Internal interim narrative/);
+    const progressCardId = progress()!.card_message_id;
+    startSearch!();
+    startSearch!();
+    assert.equal(progress()!.card_message_id, progressCardId);
+    assert.deepEqual(JSON.parse(progress()!.entries_json).map((entry: { id: string }) => entry.id), ["work:read", "work:search"]);
     reconcileLarkProgressCards();
     assert.equal(progress()?.state, "running");
     assert.equal((await select("fixture-next")).statusCode, 409);
@@ -223,10 +236,15 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     await until(() => follow.row().codex_status === "running");
     assert.deepEqual(steered, ["steer current external turn"]);
     assert.deepEqual(prompts, ["start external turn"]);
-    complete!({ status: "completed", text: "external final" });
+    const table = "## Fixture result\n\n| Name | Count |\n| --- | --- |\n| Example | 2 |";
+    complete!({ status: "completed", text: table });
     await until(() => first.row().codex_status === "answered" && follow.row().codex_status === "answered");
     assert.equal(first.row().codex_session_id, null);
-    assert.equal(first.row().codex_reply, "external final");
+    assert.equal(first.row().codex_reply, table);
+    const card = JSON.parse(first.row().reply_delivery_payload);
+    assert.equal(card.msgType, "interactive");
+    assert(card.content.body.elements.some((element: { tag: string }) => element.tag === "table"));
+    assert.equal(follow.row().reply_status, "skipped");
     assert.equal(progress()?.state, "completed");
     await f.restart();
     assert.equal((await select("fixture-next")).statusCode, 200);
@@ -244,8 +262,12 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     const afterMove = await f.message({ content: "continue in the newly configured directory" });
     await until(() => prompts.length === 3);
     assert.deepEqual(opened.at(-1), { sessionId: null, model: "fixture-next", policy: larkExecutionPolicy(moved, true) });
-    complete!({ status: "completed", text: "new workspace final" });
+    complete!({ status: "completed", text: "## New workspace\n\n**Ready**.\n\n- Checked" });
     await until(() => afterMove.row().codex_status === "answered");
+    const post = JSON.parse(afterMove.row().reply_delivery_payload);
+    assert.equal(post.msgType, "post");
+    assert.match(JSON.stringify(post.content.zh_cn), /New workspace/);
+    assert.equal(progress(afterMove.row().id), undefined);
     const cleared = await f.runtime().app.inject({ method: "PUT", url: topicPath, headers, payload: { override: null } });
     assert.equal(cleared.json().effective.engineId, "codex");
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${next.row().id}/retry`, headers })).statusCode, 409);

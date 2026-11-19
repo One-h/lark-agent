@@ -25,7 +25,7 @@ import { applyPlanAuthorization, approvalPlanSummary, approvalPlanTool, approval
   declareApprovalPlan, parseApprovalPlan, planCoversOperation, preparePlanAuthorization, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
-import { larkExecutionPolicy, type ExecutionEngineSession, type ExecutionTurnResult } from "./executionEngines.js";
+import { larkExecutionPolicy, type ExecutionEngineEvent, type ExecutionEngineSession, type ExecutionTurnResult, type ExecutionWorkStage } from "./executionEngines.js";
 import { externalExecutionForMessage, loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicEngineSessionKey, type ExternalExecutionRoute } from "./topicExecution.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
@@ -4307,6 +4307,14 @@ type ExternalTopicTurn = {
 };
 const externalTopicTurns = new Map<string, ExternalTopicTurn>();
 const externalTopicStarts = new Map<AbortController, LarkMessageRow>();
+const externalWorkProgressDelayMs = 8_000;
+const externalWorkProgressText = {
+  read: "正在读取资料。",
+  search: "正在查找相关信息。",
+  execute: "正在执行工具，等待结果。",
+  change: "正在处理所需的更改。",
+  other: "正在处理当前步骤。"
+} satisfies Record<ExecutionWorkStage, string>;
 
 function isExternalMcpTurnActive(run: ExternalTopicTurn, messageId: number) {
   return run.accepting && !run.controller.signal.aborted && run.steering.size === 0 && run.mcp?.source.id === messageId;
@@ -4324,13 +4332,15 @@ export function cancelExternalTopicTurns(chatId: string, threadId: string): numb
   return controllers.length;
 }
 
-function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string): void {
+function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string,
+  final?: { turnId: string; trusted: boolean }): void {
   updateCodexState(message.id, { status, reply: text || null, error, finishedAt: nowIso() });
   if (!text) {
     db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=?").run(message.id);
     return;
   }
-  queueLarkTextReply(message, formatLarkFinalReply(message, text), larkReplyIdempotencyKey("topicengine", String(message.id)));
+  queueLarkTextReply(message, formatLarkFinalReply(message, text), larkReplyIdempotencyKey("topicengine", String(message.id)),
+    final && { taskDir: larkCodexTaskPaths(message, final.trusted).taskDir, turnId: final.turnId, markdown: text });
 }
 
 async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalExecutionRoute, trusted: boolean): Promise<void> {
@@ -4419,9 +4429,23 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const run: ExternalTopicTurn = { source: message, id: progressId, session, controller, members: new Map([[message.id, message]]), steering: new Set(),
     accepting: true, ...(mcpToken ? { mcp: { token: mcpToken, source: message, trusted } } : {}), done: Promise.resolve() };
   externalTopicTurns.set(key, run);
+  const showProgress = (eventId: string, text: string) => {
+    if (run.accepting && !controller.signal.aborted)
+      queueLarkProgressUpdate({ progressId, turnId: progressId, threadId: session.id, source: message, eventId, text });
+  };
+  const workDueAt = Date.now() + Math.min(externalWorkProgressDelayMs, config.larkCodexInterimReplyDelayMs);
+  let workTimer: ReturnType<typeof setTimeout> | undefined;
+  let stage: ExecutionWorkStage | undefined;
+  const showWork = () => { if (stage) showProgress(`work:${stage}`, externalWorkProgressText[stage]); };
+  const onEngineEvent = (event: ExecutionEngineEvent) => {
+    if (!run.accepting || event.type !== "work") return;
+    stage = event.stage;
+    if (Date.now() >= workDueAt) showWork();
+    else workTimer ??= setTimeout(showWork, workDueAt - Date.now());
+  };
   const progress = setTimeout(() => {
-    if (run.accepting) queueLarkProgressUpdate({ progressId, turnId: progressId, threadId: session.id, source: message, eventId: "start",
-      text: `${engine.descriptor.label} 正在处理。` });
+    if (stage) showWork();
+    else showProgress("start", `${engine.descriptor.label} 正在处理。`);
   }, config.larkCodexInterimReplyDelayMs);
   const limit = setTimeout(() => controller.abort(), 180_000);
   run.done = (async () => {
@@ -4429,7 +4453,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     const closeAfterAbort = () => { closeTimer = setTimeout(() => session.close(), 5_000); };
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
-    try { result = await session.run(mcpToken ? `${prompt}\n\n${larkMcpToolsInstruction(mcpToken)}` : prompt, controller.signal); }
+    try { result = await session.run(mcpToken ? `${prompt}\n\n${larkMcpToolsInstruction(mcpToken)}` : prompt, controller.signal, onEngineEvent); }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
@@ -4437,21 +4461,22 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
         finishLarkTurnAutoApproval(progressId);
         notifyLarkTurnEnded(db, progressId);
       }
-      clearTimeout(limit); clearTimeout(progress); clearTimeout(closeTimer);
+      clearTimeout(limit); clearTimeout(progress); clearTimeout(workTimer); clearTimeout(closeTimer);
       controller.signal.removeEventListener("abort", closeAfterAbort);
     }
     await Promise.allSettled([...run.steering]);
     session.close();
     if (externalTopicTurns.get(key) !== run) return;
     try {
-      const answer = result?.status === "completed" ? sanitizeLarkCodexReply(result.text, false) : "";
+      const answer = result?.status === "completed" && !isLarkNoReplyDecision(result.text) ? sanitizeLarkCodexReply(result.text, false) : "";
       const cancelled = result?.status === "cancelled";
       const status = result?.status === "completed" ? answer ? "answered" : "no_reply" : "failed";
       const reply = result?.status === "completed" ? answer : cancelled
         ? "外部引擎已确认取消当前任务。" : "外部引擎未返回可确认的结果，任务不会自动重跑。";
       finishLarkProgressCard(progressId, cancelled ? "cancelled" : result ? "completed" : "failed");
       for (const member of run.members.values()) {
-        finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown");
+        finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
+          status === "answered" ? { turnId: progressId, trusted } : undefined);
       }
     } finally { externalTopicTurns.delete(key); }
   })();
