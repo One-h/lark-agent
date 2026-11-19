@@ -81,6 +81,92 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 }
 const mention = [{ id: { open_id: "ou_bot" } }];
 
+test("group and direct chat execution settings share the registry without mixing sessions or bypassing policy", async () => {
+  const opened: Array<{ engineId: string; sessionId: string | null; model: string | null; policy: LarkExecutionPolicy }> = [];
+  const prompts: string[] = [];
+  let release: (() => void) | undefined;
+  const engine = (id: string): ExecutionEngine => ({
+    descriptor: { id, label: id, models: [`${id}-model[1m]`] },
+    supportsPolicy: policy => policy.trustScope === "trusted",
+    async open({ sessionId, model, policy }) {
+      opened.push({ engineId: id, sessionId, model, policy });
+      return {
+        id: sessionId ?? `${id}-session-${opened.length}`,
+        async run(text) {
+          prompts.push(text);
+          if (text.endsWith("hold the turn")) await new Promise<void>(resolve => { release = resolve; });
+          return { status: "completed", text: "fixture answer" };
+        },
+        close() {}
+      };
+    }
+  });
+  const f = fixture([engine("fixture"), engine("another")]);
+  const group = "oc_group", direct = "oc_direct";
+  const url = (chat: string, topic?: string) => `/v1/chats/${chat}${topic ? `/topics/${topic}` : ""}/execution`;
+  const headers = { authorization: "Bearer fixture-token" };
+  const read = (chat: string, topic?: string) => f.runtime().app.inject({ url: url(chat, topic), headers });
+  const select = (chat: string, override: { engineId: string; model: string | null } | null, topic?: string) =>
+    f.runtime().app.inject({ method: "PUT", url: url(chat, topic), headers, payload: { override } });
+  const send = (chat: string, content: string, extra: Record<string, unknown> = {}) => f.message({
+    chat_id: chat, chat_type: chat === direct ? "p2p" : "group", thread_id: null, root_id: null,
+    mentions: chat === direct ? [] : mention, content, ...extra
+  });
+  const waitForReply = (message: { row(): any }) => until(() => message.row()?.codex_status === "answered");
+  try {
+    saveConversationPersona(group, { mode: "custom", name: "Fixture", instructions: "Use only the fixture style." });
+    assert.equal((await f.runtime().app.inject({ url: url(group) })).statusCode, 401);
+    assert.equal((await select(group, { engineId: "fixture", model: null })).statusCode, 404);
+    const historical = await send(group, "historical group message", { mentions: [] });
+    const oldDirect = await send(direct, "existing Codex direct conversation");
+    await oldDirect.started(); await f.complete(oldDirect.id);
+    assert.equal((await read(group)).json().effective.engineId, "codex");
+    assert.equal((await select(group, { engineId: "codex", model: "fixture-original-codex" })).statusCode, 200);
+    assert.equal((await select(group, { engineId: "fixture", model: "unlisted" })).statusCode, 409);
+    assert.equal((await select(group, { engineId: "fixture", model: "fixture-model[1m]" })).statusCode, 200);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: historical.event })).statusCode, 401);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${historical.row().id}/retry`, headers })).statusCode, 409);
+    const blocked = await send(group, "cannot run", { sender_id: "ou_member" });
+    await until(() => blocked.row().codex_status === "failed");
+    assert.equal(opened.length, 0);
+    const first = await send(group, "hold the turn");
+    await until(() => Boolean(release));
+    assert.equal((await select(group, null)).statusCode, 409);
+    release!(); await waitForReply(first);
+    assert.match(prompts[0], /Use only the fixture style/);
+    assert.doesNotMatch(prompts[0], /historical group message/);
+    assert.deepEqual(opened[0], { engineId: "fixture", sessionId: null, model: "fixture-model[1m]", policy: larkExecutionPolicy(f.root, true) });
+
+    assert.equal((await select(direct, { engineId: "another", model: null })).statusCode, 200);
+    const dm = await send(direct, "first external direct turn");
+    await waitForReply(dm);
+    assert.equal(opened.at(-1)?.engineId, "another"); assert.equal(opened.at(-1)?.sessionId, null);
+    await f.restart();
+    const replyAfterRestart = await send(group, "resume group");
+    await waitForReply(replyAfterRestart);
+    assert.equal(opened.at(-1)?.sessionId, "fixture-session-1");
+    const topic = "omt_child";
+    const inherited = await send(group, "independent topic", { thread_id: topic });
+    await waitForReply(inherited);
+    assert.equal(opened.at(-1)?.sessionId, null);
+    assert.equal((await read(group, topic)).json().effective.engineId, "fixture");
+    assert.equal((await select(group, { engineId: "codex", model: null }, topic)).json().effective.model, "fixture-original-codex");
+    const overridden = await send(group, "use Codex in this topic", { thread_id: topic });
+    await overridden.started(); await f.complete(overridden.id);
+    assert.equal(f.calls().filter(call => call.method === "turn/start").at(-1)?.params.model, "fixture-original-codex");
+    assert.equal((await select(group, null, topic)).json().effective.engineId, "fixture");
+    assert.equal((await select(direct, null)).json().effective.engineId, "codex");
+    const restored = await send(direct, "continue original Codex conversation");
+    assert.equal((await restored.started()).codex_session_id, oldDirect.row().codex_session_id);
+    await f.complete(restored.id);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${dm.row().id}/retry`, headers })).statusCode, 409);
+    assert.equal((await select(direct, { engineId: "another", model: null })).statusCode, 200);
+    const resumedDirect = await send(direct, "continue the original external direct conversation");
+    await waitForReply(resumedDirect);
+    assert.equal(opened.at(-1)?.sessionId, "another-session-2");
+  } finally { release?.(); await f.close(); }
+});
+
 test("topic engine routes are protected, isolated and persistent; live steering does not run a second prompt", async () => {
   const opened: Array<{ sessionId: string | null; model: string | null; policy: LarkExecutionPolicy }> = [];
   const prompts: string[] = [], steered: string[] = [];
