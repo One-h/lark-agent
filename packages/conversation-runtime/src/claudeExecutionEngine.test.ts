@@ -52,7 +52,7 @@ createInterface({input:process.stdin}).on('line', line => {
  if(method==='session/prompt') {
   if(params.prompt[0].text==='legacy fixture') {
     text('Reading first.');
-    update({sessionUpdate:'tool_call',toolCallId:'legacy-read',kind:'read'});
+    update({sessionUpdate:'tool_call',toolCallId:'legacy-read',title:'Read fixture',kind:'read'});
     text('A short ');
     text('answer without IDs.');
     result(id,{stopReason:'end_turn'});
