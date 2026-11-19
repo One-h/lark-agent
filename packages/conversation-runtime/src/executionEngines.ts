@@ -21,6 +21,7 @@ export type ExecutionTurnResult =
   | { status: "completed"; text: string }
   | { status: "cancelled" };
 export type ExecutionEngineEvent = { type: "text-delta"; text: string };
+export type ExecutionEngineMcpServer = { name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> };
 
 export interface ExecutionEngineSession {
   readonly id: string;
@@ -32,8 +33,11 @@ export interface ExecutionEngineSession {
 
 export interface ExecutionEngine {
   readonly descriptor: ExecutionEngineDescriptor;
+  // Local engine adapters opt in to mounting the trusted stdio gateway.
+  readonly supportsLarkMcp?: boolean;
   supportsPolicy(policy: LarkExecutionPolicy): boolean;
-  open(input: { sessionId: string | null; model: string | null; policy: LarkExecutionPolicy; signal: AbortSignal }): Promise<ExecutionEngineSession>;
+  open(input: { sessionId: string | null; model: string | null; policy: LarkExecutionPolicy; signal: AbortSignal;
+    mcpServers?: ExecutionEngineMcpServer[] }): Promise<ExecutionEngineSession>;
 }
 
 export class ExecutionEngineRegistry {

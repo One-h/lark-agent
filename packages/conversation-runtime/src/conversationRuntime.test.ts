@@ -10,7 +10,7 @@ import { findLarkContactByAlias, larkContactAliases, larkContactSearchFromCliOut
 import { ensureLarkStickerSelection, larkStickerImage, resolveLarkStickerQuery, softDeleteLarkSticker, stageLarkStickerSelection, updateLarkSticker, uploadLarkStickers } from "./stickers.js";
 import { ingestLarkEvent, isAtMeMessage, parseLarkExecutionApprovalAction, shouldStartSpontaneousLarkReply } from "./worker.js";
 import { config, setAppSettingValue } from "./context.js";
-import { approvalRequestDetails, buildLarkCodexDeltaPrompt, buildLarkCodexPrompt, buildLarkCodexThreadParams, buildLarkCodexTurnParams, buildLarkCodexUserInput, extractAgentMessageEventsFromCodexJsonl, extractStreamableAgentMessageEventsFromCodexJsonl, formatLarkFinalReply, formatRecentLarkMessages, isLarkCodexAuthenticationFailure, isLarkNoReplyDecision, isLikelyMutatingCommand, larkCodexCompletedMessageEvent, larkCodexSessionKeyForMessage, larkCodexStartedSubstantiveWorkItem, larkCodexTaskPaths, larkCwdRecoveryStrategy, larkFileResourcesFromMessage, larkFinalTextDeliveryDecision, larkImageResourceFromMessage, larkMessageTopicKey, loadLarkGroupContext, parseLarkCodexModels, reconcileOrphanedLarkCodexRuns, sanitizeLarkCodexReply, shouldRecoverLarkStartupStall, shouldRetryLarkTurnWithoutCwd, shouldSendLarkInterimReply } from "./responder.js";
+import { listLarkMcpTools, approvalRequestDetails, buildLarkCodexDeltaPrompt, buildLarkCodexPrompt, buildLarkCodexThreadParams, buildLarkCodexTurnParams, buildLarkCodexUserInput, extractAgentMessageEventsFromCodexJsonl, extractStreamableAgentMessageEventsFromCodexJsonl, formatLarkFinalReply, formatRecentLarkMessages, isLarkCodexAuthenticationFailure, isLarkNoReplyDecision, isLikelyMutatingCommand, larkCodexCompletedMessageEvent, larkCodexSessionKeyForMessage, larkCodexStartedSubstantiveWorkItem, larkCodexTaskPaths, larkCwdRecoveryStrategy, larkFileResourcesFromMessage, larkFinalTextDeliveryDecision, larkImageResourceFromMessage, larkMessageTopicKey, loadLarkGroupContext, parseLarkCodexModels, reconcileOrphanedLarkCodexRuns, sanitizeLarkCodexReply, shouldRecoverLarkStartupStall, shouldRetryLarkTurnWithoutCwd, shouldSendLarkInterimReply } from "./responder.js";
 
 test("Codex model catalog keeps available models and their supported efforts", () => {
   assert.deepEqual(parseLarkCodexModels([
@@ -132,8 +132,9 @@ test("conversation runtime responder preserves prompts, trust profiles and group
     assert.equal(buildLarkCodexTurnParams({ input: [], messageId: "om_test", trustedSender: true }, "thread_test").model, "gpt-5.6-terra");
     store.registerCapabilities([{ id: "host.demo", title: "Demo", description: "Demo capability", inputSchema: { type: "object" }, risk: "read" }]);
     config.larkAgentRuntimeUrl = "http://127.0.0.1:4780";
-    const dynamicTools = buildLarkCodexThreadParams(true).dynamicTools as Array<{ name?: string }>;
-    assert(dynamicTools.some((tool) => tool.name === "host__demo"));
+    assert.equal(buildLarkCodexThreadParams(true).dynamicTools, undefined);
+    assert(listLarkMcpTools(true).some(tool => tool.name === "host__demo"));
+    assert.deepEqual(listLarkMcpTools(false).map(tool => tool.name), ["lark_approval_plan"]);
     assert.deepEqual(buildLarkCodexUserInput("prompt", ["/tmp/image.png"]).at(-1), { type: "localImage", path: "/tmp/image.png" });
     assert.equal(larkAtTag("ou_sender"), '<at user_id="ou_sender"></at>');
     assert.equal(formatLarkFinalReply({ chat_type: "group", sender_id: "ou_sender" }, "收到。"), '<at user_id="ou_sender"></at> 收到。');

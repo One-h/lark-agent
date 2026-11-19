@@ -13,6 +13,7 @@ test("Claude uses the shared workspace and permits only the active trusted turn'
 import { createInterface } from 'node:readline';
 import { realpathSync } from 'node:fs';
 if(process.env.LARK_AGENT_RUNTIME_TOKEN) throw Error('forwarded a host token');
+if(process.env.LARK_AGENT_MCP_TOKEN) throw Error('MCP token must not be inherited by the engine shell');
 const write = m => console.log(JSON.stringify({jsonrpc:'2.0', ...m}));
 const result = (id, data) => write({id, result:data});
 const config = currentValue => [{id:'model', category:'model', name:'Model', type:'select',
@@ -21,11 +22,15 @@ const once={optionId:'allow',name:'Allow',kind:'allow_once'};
 const permanent={optionId:'always',name:'Always',kind:'allow_always'};
 const permission=(id,sessionId,options)=>write({id,method:'session/request_permission',params:{sessionId,toolCall:{toolCallId:'fixture'},options}});
 let pending, initial, late, verified=0;
+const verifyMcp = servers => {
+ if(servers.length!==1||servers[0].name!=='lark_tools'||servers[0].env[0]?.name!=='LARK_AGENT_MCP_TOKEN') throw Error('shared MCP not configured');
+};
 createInterface({input:process.stdin}).on('line', line => {
  const {id,method,params,...response} = JSON.parse(line);
  if(method==='initialize') result(id,{protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{name:'fixture',version:'0.108.1'},_meta:{steering:{supported:true}}});
  if(method==='session/new') {
-   if(realpathSync(params.cwd)!==process.cwd()||params.mcpServers.length) throw Error('unexpected workspace or MCP');
+   if(realpathSync(params.cwd)!==process.cwd()) throw Error('unexpected workspace');
+   verifyMcp(params.mcpServers);
    initial=id;
    permission(997,'fixture-session',[once]);
  }
@@ -35,6 +40,7 @@ createInterface({input:process.stdin}).on('line', line => {
  }
  if(method==='session/load') {
    if(params.sessionId!=='fixture-session') throw Error('wrong resume id');
+   verifyMcp(params.mcpServers);
    result(id,{configOptions:config('default')});
  }
  if(method==='session/set_config_option') result(id,{configOptions:config(params.value)});
@@ -68,12 +74,15 @@ createInterface({input:process.stdin}).on('line', line => {
   const engine = createClaudeExecutionEngine({ launcher, models: ["fixture"] });
   const policy = larkExecutionPolicy(cwd, true);
   const previousToken = process.env.LARK_AGENT_RUNTIME_TOKEN;
+  const previousMcp = process.env.LARK_AGENT_MCP_TOKEN;
   process.env.LARK_AGENT_RUNTIME_TOKEN = "fixture-host-token";
+  process.env.LARK_AGENT_MCP_TOKEN = "fixture-mcp-token";
+  const mcpServers = [{ name: "lark_tools", command: process.execPath, args: ["fixture"], env: [{ name: "LARK_AGENT_MCP_TOKEN", value: "fixture-mcp-token" }] }];
   let session: ExecutionEngineSession | undefined;
   const deadline = setTimeout(() => session?.close(), 6_000);
   try {
     await assert.rejects(engine.open({ sessionId: null, model: null, policy: larkExecutionPolicy(cwd, false), signal: controller.signal }), /execution policy/);
-    session = await engine.open({ sessionId: null, model: "fixture", policy, signal: controller.signal });
+    session = await engine.open({ sessionId: null, model: "fixture", policy, signal: controller.signal, mcpServers });
     let streamed!: () => void;
     const chunk = new Promise<void>(resolve => { streamed = resolve; });
     const run = session.run("test prompt", controller.signal, () => streamed());
@@ -83,7 +92,7 @@ createInterface({input:process.stdin}).on('line', line => {
     assert.equal(await session.steer?.("late follow-up", controller.signal), "idle");
     const sessionId = session.id;
     session.close();
-    session = await engine.open({ sessionId, model: null, policy, signal: controller.signal });
+    session = await engine.open({ sessionId, model: null, policy, signal: controller.signal, mcpServers });
     const cancelled = session.run("cancel this", controller.signal);
     controller.abort();
     assert.deepEqual(await cancelled, { status: "cancelled" });
@@ -92,6 +101,8 @@ createInterface({input:process.stdin}).on('line', line => {
     session?.close();
     if (previousToken === undefined) delete process.env.LARK_AGENT_RUNTIME_TOKEN;
     else process.env.LARK_AGENT_RUNTIME_TOKEN = previousToken;
+    if (previousMcp === undefined) delete process.env.LARK_AGENT_MCP_TOKEN;
+    else process.env.LARK_AGENT_MCP_TOKEN = previousMcp;
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 });

@@ -2,6 +2,7 @@ import { CodexAppServerClient } from "@lark-agent/adapter-codex-app-server";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./context.js";
+import type { ExecutionEngineMcpServer } from "./executionEngines.js";
 
 // All Lark conversations share one App Server and the user's default CODEX_HOME,
 // so their threads stay visible in the desktop app.
@@ -19,14 +20,36 @@ export function larkStickerMcpCodexConfig(): string[] {
   ];
 }
 
+export function larkAgentToolsMcpServer(): ExecutionEngineMcpServer | undefined {
+  if (!config.larkAgentRuntimeUrl || !config.larkAgentMcpToken) return;
+  return {
+    name: "lark_tools", command: process.execPath,
+    args: [path.join(sourceRoot, "node_modules", "tsx", "dist", "cli.mjs"), path.join(sourceRoot, "packages", "mcp-stickers", "src", "agentTools.ts")],
+    env: [{ name: "LARK_AGENT_RUNTIME_URL", value: config.larkAgentRuntimeUrl },
+      { name: "LARK_AGENT_MCP_TOKEN", value: config.larkAgentMcpToken }]
+  };
+}
+
+export function larkMcpCodexConfig(): string[] {
+  const tools = larkAgentToolsMcpServer();
+  return [...larkStickerMcpCodexConfig(), ...(tools ? [
+    `mcp_servers.lark_tools.command=${JSON.stringify(tools.command)}`,
+    `mcp_servers.lark_tools.args=${JSON.stringify(tools.args)}`,
+    'mcp_servers.lark_tools.env_vars=["LARK_AGENT_RUNTIME_URL","LARK_AGENT_MCP_TOKEN"]',
+    "mcp_servers.lark_tools.startup_timeout_sec=10",
+    "mcp_servers.lark_tools.tool_timeout_sec=1200"
+  ] : [])];
+}
+
 export const codexAppServer = new CodexAppServerClient(
   () => config.workspaceRoot || process.cwd(),
   {
-    config: larkStickerMcpCodexConfig,
+    config: larkMcpCodexConfig,
     env: () => ({
       ...process.env,
       LARK_AGENT_RUNTIME_URL: config.larkAgentRuntimeUrl,
-      LARK_AGENT_RUNTIME_TOKEN: config.larkAgentRuntimeToken
+      LARK_AGENT_RUNTIME_TOKEN: config.larkAgentRuntimeToken,
+      LARK_AGENT_MCP_TOKEN: config.larkAgentMcpToken
     })
   }
 );

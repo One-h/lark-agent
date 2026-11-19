@@ -100,6 +100,10 @@ files. Valid legacy media tags remain compatible; malformed tags are reported
 rather than forwarded as reply text. See [the attachment tool contract](docs/attachment-tools.md)
 for scope, limits, retries and completion signals.
 
+Approval plans and registered host capabilities use the separate
+[`lark_tools` stdio MCP](docs/shared-tool-mcp.md). Resumed Codex threads and
+supported local engine adapters use the same runtime authorization checks.
+
 Final replies use [Markdown posts and data cards](docs/rich-replies.md).
 Optional [native topic conversations](docs/native-topics.md) continue an explicitly
 joined topic without repeated mentions, using compact incremental input. This

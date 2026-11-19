@@ -19,8 +19,7 @@ test("sticker tools bind selection to message and turn and never send during sel
     const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL4WQAAAABJRU5ErkJggg==";
     const [sticker] = uploadLarkStickers([{ name: "得意", tags: ["得意", "自夸"], fileName: "image.png", mimeType: "image/png", dataBase64: png }]);
     const context = { threadId: "thread-1", turnId: "turn-1", messageId: 1, taskDir: root };
-    const tools = buildLarkCodexThreadParams(false).dynamicTools as Array<{ name: string }>;
-    assert.equal(tools.some((tool) => tool.name.startsWith("lark_stickers_")), false);
+    assert.equal(buildLarkCodexThreadParams(false).dynamicTools, undefined);
     const mcpConfig = larkStickerMcpCodexConfig().join("\n");
     assert.match(mcpConfig, /mcp_servers\.lark_stickers/);
     assert.match(mcpConfig, /mcp-stickers/);

@@ -25,8 +25,9 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
   accessSync(launcher, constants.X_OK);
   return {
     descriptor: { id: "claude", label: "Claude Code", models: [...new Set(options.models)] },
+    supportsLarkMcp: true,
     supportsPolicy: supportsNativeClaudePolicy,
-    async open({ sessionId, model, policy, signal }) {
+    async open({ sessionId, model, policy, signal, mcpServers }) {
       signal.throwIfAborted();
       if (!supportsNativeClaudePolicy(policy)) throw new Error("Claude cannot enforce this execution policy");
       const { cwd } = policy;
@@ -64,7 +65,7 @@ export function createClaudeExecutionEngine(options: { launcher: string; models:
       try {
         const hello = await peer.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
         if (hello.protocolVersion !== 1) throw new Error("Claude ACP protocol version is unsupported");
-        const request = { cwd, mcpServers: [] };
+        const request = { cwd, mcpServers: mcpServers ?? [] };
         const options = sessionId
           ? await (async () => {
               if (!hello.agentCapabilities?.loadSession) throw new Error("Claude ACP cannot restore the saved session");

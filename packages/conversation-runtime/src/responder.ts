@@ -5,7 +5,7 @@ import path from "node:path";
 import { unicodeSafePrefix, type CodexAppServerNotification, type CodexAppServerRequest } from "@lark-agent/adapter-codex-app-server";
 import { larkAtTag, larkReplyIdempotencyKey, sendLarkExecutionApprovalCard, sendLarkExecutionReceiptCard, sendLarkImagePostReply, sendLarkMediaReply, updateLarkExecutionApprovalCard, updatePendingLarkExecutionApprovalCard, type LarkExecutionReceiptEntry } from "@lark-agent/adapter-lark-cli";
 import { renderLarkReply, parseLarkReplyPresentation, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
-import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegistered, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
+import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
 import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
 import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection } from "./stickers.js";
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
@@ -102,6 +102,7 @@ type LarkHostCapability = {
   title: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  risk: "read" | "local-write" | "external-write";
 };
 
 function safeLarkTaskPathSegment(value: string): string {
@@ -110,10 +111,11 @@ function safeLarkTaskPathSegment(value: string): string {
 
 function registeredLarkHostCapabilities(): LarkHostCapability[] {
   if (!db) return [];
-  const rows = db.prepare("SELECT id, title, description, input_schema FROM capabilities ORDER BY id").all() as Array<{ id: string; title: string; description: string; input_schema: string }>;
+  const rows = db.prepare("SELECT id, title, description, input_schema, risk FROM capabilities ORDER BY id").all() as
+    Array<Omit<LarkHostCapability, "inputSchema"> & { input_schema: string }>;
   return rows.flatMap((row) => {
     try {
-      return [{ id: row.id, title: row.title, description: row.description, inputSchema: JSON.parse(row.input_schema) as Record<string, unknown> }];
+      return [{ id: row.id, title: row.title, description: row.description, risk: row.risk, inputSchema: JSON.parse(row.input_schema) as Record<string, unknown> }];
     } catch {
       return [];
     }
@@ -124,18 +126,39 @@ function larkHostDynamicToolName(capabilityId: string): string {
   return capabilityId.replace(/[^a-zA-Z0-9_-]+/g, "__").slice(0, 64);
 }
 
-function larkHostDynamicTools(): Array<Record<string, unknown>> {
-  const tools = config.larkAgentRuntimeUrl ? registeredLarkHostCapabilities() : [];
-  return [approvalPlanTool, ...tools.filter(capability => larkHostDynamicToolName(capability.id) !== approvalPlanToolName).map((capability) => ({
-    type: "function",
-    name: larkHostDynamicToolName(capability.id),
-    description: capability.description,
-    inputSchema: capability.inputSchema,
-    deferLoading: false
-  }))];
+function larkMcpHostCapabilities(): Map<string, LarkHostCapability> {
+  const capabilities = new Map<string, LarkHostCapability>();
+  const duplicates = new Set<string>([approvalPlanToolName]);
+  for (const capability of registeredLarkHostCapabilities()) {
+    const name = larkHostDynamicToolName(capability.id);
+    if (capabilities.has(name)) duplicates.add(name);
+    capabilities.set(name, capability);
+  }
+  for (const name of duplicates) capabilities.delete(name);
+  return capabilities;
 }
 
-const taskApprovalPlanInstruction = "整项任务可能包含受限操作时，在首次申请授权前用 lark_approval_plan 提交用户的完整目标、步骤及预计影响。区分本地登记、线上只读和实际线上变更；不能只填当前一步。为每步提交准确的执行命令与绝对工作目录，或能力 ID 和实际 JSON 参数（operation 格式为 '能力ID: JSON'，cwd=null）。未核实的目标不猜测；补齐信息或计划改变时重新登记，登记不等于批准。";
+export function listLarkMcpTools(includeHostCapabilities: boolean) {
+  const inputSchema = (input: Record<string, unknown>) => ({ type: "object", additionalProperties: false,
+    properties: { context_token: { type: "string", pattern: "^[A-Za-z0-9_-]{32}$" }, input }, required: ["context_token", "input"] });
+  return [
+    { name: approvalPlanToolName, description: approvalPlanTool.description, inputSchema: inputSchema(approvalPlanTool.inputSchema),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
+    ...(includeHostCapabilities ? [...larkMcpHostCapabilities()].map(([name, capability]) => ({
+      name, title: capability.title, description: capability.description, inputSchema: inputSchema(capability.inputSchema),
+      annotations: { readOnlyHint: capability.risk === "read", destructiveHint: capability.risk === "external-write", openWorldHint: true }
+    })) : [])
+  ];
+}
+
+export function larkMcpHostCapabilityId(tool: string): string | undefined {
+  return larkMcpHostCapabilities().get(tool)?.id;
+}
+
+function larkMcpToolsInstruction(token?: string): string {
+  if (!token) return "";
+  return `发布、PR 评审、Issue 分析、待办、飞书消息等能力通过 lark_tools MCP 调用。工具参数使用本轮 context_token=${token}，业务参数放在 input 内；令牌不可对外展示，不使用历史令牌。可能包含受限操作时，先用 lark_tools 的 lark_approval_plan 提交整项任务的目标、步骤和预计影响。区分本地登记、线上只读和实际线上变更；为每步提供完整命令与绝对目录，或能力 ID 和实际 JSON 参数（operation 格式 '能力ID: JSON'，cwd=null）。未核实的目标不猜测，计划变化时重新登记。登记不等于批准。`;
+}
 
 export function larkCodexTaskPaths(
   message: Pick<LarkMessageRow, "id" | "chat_id" | "message_id"> & Partial<Pick<LarkMessageRow, "root_message_id" | "thread_id">>,
@@ -772,7 +795,7 @@ ${contactDirectory}
 
 知识/技能加载策略：
 - 普通常识或轻量问题：直接回答。
-- 用户要求给飞书同事发消息时，使用飞书 bot 消息工具 lark__message__send，收件人可以是联系人姓名、别名或 open_id；工具结果才是发送是否成功的依据。只有用户明确要求 Agent-to-Agent 通信时才采用对应通道。
+- 用户要求给飞书同事发消息时，使用 lark_tools MCP 的 lark__message__send，收件人可以是联系人姓名、别名或 open_id；工具结果才是发送是否成功的依据。只有用户明确要求 Agent-to-Agent 通信时才采用对应通道。
 - 涉及当前配置工作区、宿主业务能力、仓库协作、PR、issue、线上问题、飞书机器人、Codex job、权限边界、自动评审或修复流程时，先按需读取 ${workspaceRules} 和 ${workspaceSkills}。
 - 如果问题命中某个 skill 或工作流，继续读取对应的 SKILL.md，例如 ${workspaceSkillRoot}/<skill-name>/SKILL.md 或 ${workspaceCodexSkillRoot}/<skill-name>/SKILL.md。
 - 如果问题涉及历史经验、约定或排查材料，用 rg 在 ${workspaceKnowledge} 和 ${autoFixTaskData} 中查找关键词，读取最相关的 1-3 个文件。
@@ -781,7 +804,7 @@ ${contactDirectory}
 
 ${executionBoundary}
 
-${taskApprovalPlanInstruction}
+${larkMcpToolsInstruction(attachments.stickerContextToken)}
 
 ${larkQueryExecutionApprovalPrompt(trustedSender && message.reply_trigger !== "owner_mention")}
 
@@ -821,7 +844,6 @@ export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "n
     approvalPolicy,
     approvalsReviewer: "user",
     sandbox,
-    dynamicTools: larkHostDynamicTools(),
     config: {
       model_reasoning_effort: configuredLarkCodexReasoningEffort()
     }
@@ -905,7 +927,7 @@ export function buildLarkCodexDeltaPrompt(
     return [
       refreshedInstructions,
       "话题续聊：结合本 thread 的既有目标处理新增消息；进度追问先简短回应，再继续可执行任务。",
-      taskApprovalPlanInstruction,
+      larkMcpToolsInstruction(attachments.stickerContextToken),
       recentMessages,
       contactDirectory,
       larkPromptTime(message),
@@ -919,7 +941,7 @@ export function buildLarkCodexDeltaPrompt(
   }
   return [
     "这是同一飞书 Codex 会话中的新增消息。此前角色说明、权限范围、技能和历史上下文已经在当前 thread 中，不要重新陈述它们。优先处理以下新增内容。",
-    taskApprovalPlanInstruction,
+    larkMcpToolsInstruction(attachments.stickerContextToken),
     attachments.includeStableInstructions === false ? "" : style.effectiveInstructions,
     attachments.includeStableInstructions === false ? "" : groupMentionInstruction,
     larkQueryExecutionApprovalPrompt(Boolean(attachments.trustedSender && message.reply_trigger !== "owner_mention")),
@@ -3378,30 +3400,24 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
   const params = request.params as { threadId?: unknown; turnId?: unknown; tool?: unknown; arguments?: unknown; callId?: unknown } | undefined;
   if (typeof params?.threadId !== "string" || typeof params.turnId !== "string" || typeof params.tool !== "string") return false;
   const run = [...activeLarkCodexRuns.values()].find((candidate) => !candidate.settled && candidate.turnId === params.turnId && candidate.threadId === params.threadId);
+  const target = run ? responseRunMember(run) : undefined;
+  const context = target ? getLarkMcpToolContext(target.stickerContextToken) : undefined;
   if (params.tool === approvalPlanToolName) {
-    const target = run ? approvalRunMember(run) : undefined;
-    const plan = parseApprovalPlan(params.arguments);
-    if (!run || !target?.row.sender_id || run.pendingSteers !== 0 || !ownerAssistMayExecute(target.row.id) || !plan) {
-      codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: "任务计划无效或会话范围已变化，未授予权限。" }] });
-      return true;
-    }
-    declareApprovalPlan(db, { turnId: run.turnId, messageId: target.row.id, senderId: target.row.sender_id }, plan);
-    appendPreparedLog(target, { method: "approval/planDeclared", params: { turnId: run.turnId, stepCount: plan.steps.length } });
-    codexAppServer.respondToRequest(request.id, { success: true, contentItems: [{ type: "inputText", text: "已登记整项任务计划，尚未授权。实际操作会按审批范围检查。" }] });
+    const result = submitLarkMcpApprovalPlan(context, params.arguments);
+    codexAppServer.respondToRequest(request.id, { success: result.success, contentItems: [{ type: "inputText", text: result.text }] });
     return true;
   }
-  if (!run || !config.larkAgentRuntimeUrl) {
+  if (!run || !target || !context || !config.larkAgentRuntimeUrl || !config.larkAgentMcpToken) {
     codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: "Lark Agent host capability context is unavailable" }] });
     return true;
   }
   run.hasToolActivity = true;
-  const target = responseRunMember(run);
   if (!ownerAssistMayExecute(target.row.id)) {
     codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: "先提交 owner_assist_decision；本人确认草稿不授予工具权限。" }] });
     return true;
   }
-  const capability = registeredLarkHostCapabilities().find((entry) => larkHostDynamicToolName(entry.id) === params.tool);
-  if (!capability) {
+  const capabilityId = larkMcpHostCapabilityId(params.tool);
+  if (!capabilityId) {
     codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: `Unknown Lark Agent host capability: ${params.tool}` }] });
     return true;
   }
@@ -3410,36 +3426,53 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
   run.hostToolCalls.add(controller);
   void (async () => {
     try {
-      const response = await postHostJson(`${config.larkAgentRuntimeUrl.replace(/\/$/, "")}/v1/internal/capabilities/${encodeURIComponent(capability.id)}/execute`, {
-          input: params.arguments ?? {},
-          context: {
-            larkMessageId: target.row.id,
-            chatId: target.row.chat_id,
-            trustScope: run.trustedSender ? "trusted" : "untrusted",
-            turnId: params.turnId,
-            callId: typeof params.callId === "string" ? params.callId : null
-          }
-        }, config.larkAgentRuntimeToken ? { authorization: `Bearer ${config.larkAgentRuntimeToken}` } : {}, controller.signal);
+      const response = await postHostJson(new URL("/v1/internal/mcp/tools/call", config.larkAgentRuntimeUrl).href, {
+        tool: params.tool, contextToken: target.stickerContextToken, input: params.arguments ?? {},
+        ...(typeof params.callId === "string" && params.callId.length <= 200 ? { callId: params.callId } : {})
+      }, { authorization: `Bearer ${config.larkAgentMcpToken}` }, controller.signal);
       if (run.settled || run.turnId !== params.turnId) return;
-      const body = response.body;
-      if (!response.ok) throw new Error(body || `Host capability returned HTTP ${response.status}`);
-      let modelResult = body || "null";
-      try {
-        const parsed = JSON.parse(modelResult) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "_receipt" in parsed) {
-          const { _receipt: _internalReceipt, ...visible } = parsed as Record<string, unknown>;
-          modelResult = JSON.stringify(visible);
-        }
-      } catch { /* Non-JSON host results are forwarded unchanged. */ }
-      codexAppServer.respondToRequest(request.id, { success: true, contentItems: [{ type: "inputText", text: modelResult }] });
+      const body = JSON.parse(response.body) as { success?: boolean; text?: string; error?: string };
+      if (!response.ok || !body.success || typeof body.text !== "string") throw new Error(body.error ?? `Host capability returned HTTP ${response.status}`);
+      codexAppServer.respondToRequest(request.id, { success: true, contentItems: [{ type: "inputText", text: body.text }] });
     } catch (error) {
       if (run.settled || run.turnId !== params.turnId) return;
       const message = error instanceof Error ? error.message : String(error);
-      appendPreparedError(target, `Host capability ${capability.id} failed: ${message}`);
+      appendPreparedError(target, `Host capability ${capabilityId} failed: ${message}`);
       codexAppServer.respondToRequest(request.id, { success: false, contentItems: [{ type: "inputText", text: message }] });
     } finally { run.hostToolCalls.delete(controller); }
   })().catch(() => console.warn("lark_host_tool_callback_failed"));
   return true;
+}
+
+function toolContext(message: LarkMessageRow, turnId: string, trusted: boolean, native?: PreparedLarkCodexMessage) {
+  if (!message.chat_id || !message.sender_id || config.groupPrivacyEnforced && message.chat_type === "group") return;
+  const trustScope = trusted ? "trusted" as const : "untrusted" as const;
+  return { larkMessageId: message.id, senderId: message.sender_id, chatId: message.chat_id, turnId, trustScope, native };
+}
+
+export function getLarkMcpToolContext(contextToken: string) {
+  for (const run of activeLarkCodexRuns.values()) {
+    if (run.settled || run.pendingSteers !== 0 || run.authRecovering || run.capacityRecovery) continue;
+    const target = approvalRunMember(run);
+    if (target === responseRunMember(run) && target.stickerContextToken === contextToken) {
+      return toolContext(target.row, run.turnId, run.trustedSender, target);
+    }
+  }
+  for (const run of externalTopicTurns.values()) {
+    if (run.mcp?.token === contextToken && isExternalMcpTurnActive(run, run.mcp.source.id)) {
+      return toolContext(run.mcp.source, run.id, run.mcp.trusted);
+    }
+  }
+}
+
+export function submitLarkMcpApprovalPlan(context: ReturnType<typeof toolContext>, input: unknown) {
+  const plan = parseApprovalPlan(input);
+  if (!context || !ownerAssistMayExecute(context.larkMessageId) || !plan) {
+    return { success: false, text: "任务计划无效或会话范围已变化，未授予权限。" };
+  }
+  declareApprovalPlan(db, { turnId: context.turnId, messageId: context.larkMessageId, senderId: context.senderId }, plan);
+  if (context.native) appendPreparedLog(context.native, { method: "approval/planDeclared", params: { turnId: context.turnId, stepCount: plan.steps.length } });
+  return { success: true, text: "已登记整项任务计划，尚未授权。实际操作会按审批范围检查。" };
 }
 
 const ownerAssistMcpCalls = new Set<string>();
@@ -4226,10 +4259,19 @@ type ExternalTopicTurn = {
   members: Map<number, LarkMessageRow>;
   steering: Set<Promise<unknown>>;
   accepting: boolean;
+  mcp?: { token: string; source: LarkMessageRow; trusted: boolean };
   done: Promise<void>;
 };
 const externalTopicTurns = new Map<string, ExternalTopicTurn>();
 const externalTopicStarts = new Map<AbortController, LarkMessageRow>();
+
+function isExternalMcpTurnActive(run: ExternalTopicTurn, messageId: number) {
+  return run.accepting && !run.controller.signal.aborted && run.steering.size === 0 && run.mcp?.source.id === messageId;
+}
+
+export function confirmExternalLarkMcpTurn(messageId: number, turnId: string): boolean {
+  return [...externalTopicTurns.values()].some(run => run.id === turnId && isExternalMcpTurnActive(run, messageId));
+}
 
 export function cancelExternalTopicTurns(chatId: string, threadId: string): number {
   const matches = (source: LarkMessageRow) => source.chat_id === chatId && source.thread_id === threadId;
@@ -4270,16 +4312,31 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
   const active = externalTopicTurns.get(key);
   if (active?.accepting && !active.controller.signal.aborted && active.session.steer) {
     const running = active;
-    const steer = active.session.steer(text, AbortSignal.any([running.controller.signal, AbortSignal.timeout(12_000)])).then(outcome => {
+    const nextToken = running.mcp ? crypto.randomBytes(24).toString("base64url") : undefined;
+    const input = nextToken ? `${text}\n\n${larkMcpToolsInstruction(nextToken)}` : text;
+    const sendSteer = active.session.steer.bind(active.session);
+    const steer = Promise.resolve().then(() => sendSteer(input, AbortSignal.any([running.controller.signal, AbortSignal.timeout(12_000)]))).then(outcome => {
       if (outcome === "injected") {
         recordTopicExecution(message.id, route, running.session.id, running.id);
-        updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso() });
+        updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso(),
+          turnId: nextToken ? running.id : undefined });
+        if (nextToken && running.mcp && message.id > running.mcp.source.id) running.mcp = { token: nextToken, source: message, trusted };
         running.members.set(message.id, message);
       }
       return outcome;
     });
     running.steering.add(steer);
     try { if (await steer === "injected") return; }
+    catch (error) {
+      if (running.mcp) {
+        running.mcp = undefined;
+        running.accepting = false;
+        running.controller.abort();
+        finishLarkTurnAutoApproval(running.id);
+        notifyLarkTurnEnded(db, running.id);
+      }
+      throw error;
+    }
     finally { running.steering.delete(steer); }
   }
   if (active) await active.done;
@@ -4289,10 +4346,13 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
   }
   const controller = new AbortController();
   const progressId = crypto.randomUUID();
+  const mcpServer = engine.supportsLarkMcp ? larkAgentToolsMcpServer() : undefined;
+  const mcpToken = mcpServer ? crypto.randomBytes(24).toString("base64url") : undefined;
   let session: ExecutionEngineSession | undefined;
   externalTopicStarts.set(controller, message);
   try {
-    session = await engine.open({ sessionId: loadTopicExecutionSession(key), model: route.model, policy, signal: controller.signal });
+    session = await engine.open({ sessionId: loadTopicExecutionSession(key), model: route.model, policy, signal: controller.signal,
+      ...(mcpServer ? { mcpServers: [mcpServer] } : {}) });
     controller.signal.throwIfAborted();
     if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
       session.close();
@@ -4301,7 +4361,8 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
     }
     saveTopicExecutionSession(key, session.id);
     recordTopicExecution(message.id, route, session.id, progressId);
-    updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso() });
+    updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso(),
+      turnId: mcpToken ? progressId : undefined });
   } catch (error) {
     session?.close();
     if (controller.signal.aborted) {
@@ -4311,7 +4372,7 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
     throw error;
   } finally { externalTopicStarts.delete(controller); }
   const run: ExternalTopicTurn = { source: message, id: progressId, session, controller, members: new Map([[message.id, message]]), steering: new Set(),
-    accepting: true, done: Promise.resolve() };
+    accepting: true, ...(mcpToken ? { mcp: { token: mcpToken, source: message, trusted } } : {}), done: Promise.resolve() };
   externalTopicTurns.set(key, run);
   const progress = setTimeout(() => {
     if (run.accepting) queueLarkProgressUpdate({ progressId, turnId: progressId, threadId: session.id, source: message, eventId: "start",
@@ -4323,10 +4384,14 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
     const closeAfterAbort = () => { closeTimer = setTimeout(() => session.close(), 5_000); };
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
-    try { result = await session.run(text, controller.signal); }
+    try { result = await session.run(mcpToken ? `${text}\n\n${larkMcpToolsInstruction(mcpToken)}` : text, controller.signal); }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
+      if (run.mcp) {
+        finishLarkTurnAutoApproval(progressId);
+        notifyLarkTurnEnded(db, progressId);
+      }
       clearTimeout(limit); clearTimeout(progress); clearTimeout(closeTimer);
       controller.signal.removeEventListener("abort", closeAfterAbort);
     }

@@ -30,8 +30,11 @@ the offered single-use option. There are no persistent grants, or grants before
 the turn, after it ends, or after cancellation. The operator launcher supplies
 Claude authentication and persistent native sessions. A small environment
 allowlist retains the local profile and executable search paths without
-forwarding Lark or Forge API tokens. The host does not advertise filesystem,
-terminal, or MCP capabilities through ACP.
+forwarding Lark or Forge API tokens. The host does not expose filesystem,
+terminal or an unrestricted ACP tool relay. The trusted Claude adapter passes the
+fixed [`lark_tools` stdio MCP](shared-tool-mcp.md) on session creation and load.
+Only that subprocess receives the limited MCP transport credential. Its calls
+still need a live turn token and the normal Lark runtime approvals.
 
 Same-turn steering requires a stable Claude ACP release with prompt-lifecycle
 fixes (0.81.1 or later in the 0.x series) and an advertised steering extension.

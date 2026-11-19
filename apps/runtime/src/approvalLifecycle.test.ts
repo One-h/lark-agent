@@ -208,6 +208,7 @@ const finish=value=>{status=value;if(status==="completed")send({method:"item/com
 readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.parse(line);
 if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"thread-live"}}});
 else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"turn-live",status:"inProgress"}}});setTimeout(()=>${order === "host-first" ? "host" : "command"}(),20);}
+else if(m.method==="turn/steer")send({id:m.id,result:{turnId:"turn-live"}});
 else if(m.method==="fixture/end"){send({id:m.id,result:{}});finish(m.params.status);}
 else if(m.method==="fixture/state-only"){status=m.params.status;send({id:m.id,result:{}});}
 else if(m.method==="thread/read")send({id:m.id,result:{thread:{id:"thread-live",status:{type:status==="inProgress"?"active":"idle"}}}});
@@ -247,6 +248,28 @@ test("native terminal readback blocks approval even when its completion notifica
     assert.equal(f.row().codex_status, "failed");
     assert.equal((f.runtime.store.db.prepare("SELECT count(*) n FROM lark_delivery_outbox WHERE kind='completion-reaction'").get() as any).n, 0);
     await until(() => f.runtime.store.approval(f.cards[0].approvalId)?.status === "failed");
+  } finally { await f.close(); }
+});
+
+test("legacy host tool callbacks cannot execute after a newer message takes over their turn", async () => {
+  const f = await nativeFixture("host-first");
+  try {
+    await until(() => f.cards.length === 1);
+    const source = f.runtime.store.db.prepare("SELECT * FROM lark_messages WHERE id=1").get() as
+      { chat_id: string; chat_type: string; reply_trigger: string; sender_id: string };
+    const now = new Date().toISOString();
+    f.runtime.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_trigger,
+      reply_status,codex_status,raw_json,received_at,created_at) VALUES (2,'om_new',?,?,?,'user','text','Recheck this scope',1,?,'skipped','failed','{}',?,?)`)
+      .run(source.chat_id, source.chat_type, source.sender_id, source.reply_trigger, now, now);
+    assert.equal(enqueueLarkCodexReply(2), true);
+    await until(() => {
+      const row = f.runtime.store.db.prepare("SELECT codex_task_dir FROM lark_messages WHERE id=2").get() as { codex_task_dir?: string };
+      if (!row.codex_task_dir) return false;
+      const file = path.join(row.codex_task_dir, "resume-session.json");
+      return fs.existsSync(file) && JSON.parse(fs.readFileSync(file, "utf8")).action === "turn/steer";
+    });
+    assert.equal((await f.decide(f.cards[0].approvalId)).statusCode, 409);
+    assert.equal(f.writes(), 0);
   } finally { await f.close(); }
 });
 
