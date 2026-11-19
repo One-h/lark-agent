@@ -7,13 +7,14 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
+import { reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult } from "@lark-agent/conversation-runtime";
 
 async function until(check: () => boolean) {
   const deadline = performance.now() + 8000;
   while (!check()) { assert(performance.now() < deadline, "topic fixture timed out"); await immediate(); }
 }
 
-function fixture() {
+function fixture(executionEngines: ExecutionEngine[] = []) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-native-topic-"));
   const log = path.join(root, "rpc.jsonl"), executable = path.join(root, "codex.mjs"), lookupGate = path.join(root, "hold-lookup");
   fs.writeFileSync(executable, `#!${process.execPath}
@@ -40,8 +41,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH, oldCodex = process.env.CODEX_EXECUTABLE;
   process.env.PATH = `${root}:${oldPath ?? ""}`; process.env.CODEX_EXECUTABLE = executable;
-  const options = { databasePath: path.join(root, "test.sqlite"), mode: "active" as const, workspaceRoot: root,
+  const options = { databasePath: path.join(root, "test.sqlite"), mode: "active" as const, workspaceRoot: root, executionEngines,
     trustedSenderIds: ["ou_owner"], approverId: "ou_owner", runtimeToken: "fixture-token",
+    progressSender: async () => ({ ok: true as const, messageId: "om_fixture_progress", chatId: "oc_fixture", messageAt: null, messageType: "interactive" }),
+    progressUpdater: async () => ({ ok: true as const }),
     reactionSender: () => ({ ok: true as const }), textReplySender: () => ({ ok: true as const, messageId: "om_out_" + (++out), chatId: "oc_fixture", messageAt: null, messageType: "text" }) };
   let out = 0, sequence = 0, runtime = createRuntime(options);
   for (const [key, value] of Object.entries({ stickerUsageMode: "off", interimRepliesEnabled: "false", executionReceiptsEnabled: "false", trustedExecutionEnabled: "true" })) setAppSettingValue(key, value);
@@ -55,7 +58,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       const id = `om_in_${++sequence}`;
       const event = { event_id: `event_${sequence}`, message_id: id, chat_id: "oc_fixture", chat_type: "group", sender_id: "ou_owner", sender_type: "user", message_type: "text",
         content: "continue the investigation", root_id: "om_root", thread_id: "omt_fixture", mentions: [], ...extra };
-      const result = await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: event });
+      const result = await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: event, headers: { authorization: "Bearer fixture-token" } });
       assert.equal(result.statusCode, 200, result.body);
       return { id, event, row: () => row(id), async started() { await until(() => Boolean(row(id)?.codex_turn_id)); return row(id); } };
     },
@@ -77,6 +80,77 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   };
 }
 const mention = [{ id: { open_id: "ou_bot" } }];
+
+test("topic engine routes are protected, isolated and persistent; live steering does not run a second prompt", async () => {
+  const opened: Array<{ sessionId: string | null; model: string | null }> = [];
+  const prompts: string[] = [], steered: string[] = [];
+  let complete: ((value: ExecutionTurnResult) => void) | undefined;
+  const engine: ExecutionEngine = {
+    descriptor: { id: "fixture", label: "Fixture", models: ["fixture-model", "fixture-next"] },
+    async open({ sessionId, model }) {
+      opened.push({ sessionId, model });
+      return {
+        id: sessionId ?? `fixture-session-${opened.length}`,
+        run(text, signal) {
+          prompts.push(text);
+          return new Promise(resolve => {
+            complete = resolve;
+            signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
+          });
+        },
+        async steer(text) { steered.push(text); return "injected"; },
+        close() {}
+      };
+    }
+  };
+  const f = fixture([engine]);
+  const progressDelay = config.larkCodexInterimReplyDelayMs;
+  try {
+    const path = "/v1/chats/oc_fixture/topics/omt_fixture/execution";
+    const headers = { authorization: "Bearer fixture-token" };
+    const select = (model: string) => f.runtime().app.inject({ method: "PUT", url: path, headers, payload: { override: { engineId: "fixture", model } } });
+    assert.equal((await f.runtime().app.inject({ url: path })).statusCode, 401);
+    const before = await f.message({ content: "private history not sent to the new engine" });
+    assert.equal((await select("not-registered")).statusCode, 409);
+    assert.equal((await select("fixture-model")).statusCode, 200);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: before.event })).statusCode, 401);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${before.row().id}/retry`, headers })).statusCode, 409);
+    const outside = await f.message({ thread_id: "omt_other", root_id: "om_other", mentions: mention });
+    await outside.started(); await f.complete(outside.id);
+    assert.deepEqual(opened, []);
+    await f.settings({ topicNativeModeEnabled: true }); await topicCommand(f, "join");
+    config.larkCodexInterimReplyDelayMs = 0;
+    await f.settings({ interimRepliesEnabled: true });
+    const first = await f.message({ content: "start external turn" });
+    await until(() => prompts.length === 1);
+    const progress = () => f.runtime().store.db.prepare("SELECT state FROM lark_progress_cards WHERE lark_message_id=?").get(first.row().id) as { state: string } | undefined;
+    await until(() => progress()?.state === "running");
+    reconcileLarkProgressCards();
+    assert.equal(progress()?.state, "running");
+    assert.equal((await select("fixture-next")).statusCode, 409);
+    const follow = await f.message({ content: "steer current external turn" });
+    await until(() => follow.row().codex_status === "running");
+    assert.deepEqual(steered, ["steer current external turn"]);
+    assert.deepEqual(prompts, ["start external turn"]);
+    complete!({ status: "completed", text: "external final" });
+    await until(() => first.row().codex_status === "answered" && follow.row().codex_status === "answered");
+    assert.equal(first.row().codex_session_id, null);
+    assert.equal(first.row().codex_reply, "external final");
+    assert.equal(progress()?.state, "completed");
+    await f.restart();
+    assert.equal((await select("fixture-next")).statusCode, 200);
+    const next = await f.message({ content: "continue after restart" });
+    await until(() => prompts.length === 2);
+    assert.deepEqual(opened, [{ sessionId: null, model: "fixture-model" }, { sessionId: "fixture-session-1", model: "fixture-next" }]);
+    const cancellation = await f.runtime().app.inject({ method: "POST", url: `${path}/cancel`, headers });
+    assert.deepEqual(cancellation.json(), { requested: 1 });
+    await until(() => next.row().codex_status === "failed");
+    assert.match(next.row().codex_reply, /已确认取消/);
+    const cleared = await f.runtime().app.inject({ method: "PUT", url: path, headers, payload: { override: null } });
+    assert.equal(cleared.json().effective.engineId, "codex");
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${next.row().id}/retry`, headers })).statusCode, 409);
+  } finally { config.larkCodexInterimReplyDelayMs = progressDelay; await f.close(); }
+});
 
 async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "leave", extra: Record<string, unknown> = {}) {
   const m = await f.message({ mentions: mention, content: `@_user_1 /topic ${command}`, ...extra });

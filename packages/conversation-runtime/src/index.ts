@@ -18,3 +18,6 @@ export * from "./hostHttp.js";
 export * from "./progressCards.js";
 export * from "./ownerMentionAssist.js";
 export * from "./topicNativeMode.js";
+export * from "./executionEngines.js";
+export * from "./topicExecution.js";
+export * from "./claudeExecutionEngine.js";

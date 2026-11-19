@@ -13,6 +13,8 @@ import { registerHostOutboundRoutes } from "./outbound.js";
 import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerPersonaRoutes } from "./personaRoutes.js";
+import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
+import { configureTopicExecutionEngines, createClaudeExecutionEngine, topicExecutionPreviouslyDispatched, topicExecutionRoute, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
 import { replaceStickersFromBundle } from "./stickerBundleImport.js";
 import { createLarkAuthProbe, createLarkCliProbe } from "./health.js";
@@ -34,7 +36,7 @@ import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNoti
 import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
-export type RuntimeConfig = { databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
+export type RuntimeConfig = { executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
 type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void };
 type MessageCursor = { messageAt: string; id: number };
@@ -134,6 +136,7 @@ function messageFiles(store: SqliteAgentStore, messageId: number) {
 
 export function createRuntime(config: RuntimeConfig) {
   const app = Fastify({ logger: true });
+  configureTopicExecutionEngines(config.executionEngines ?? []);
   const probeLarkCli = createLarkCliProbe();
   const probeLarkAuth = createLarkAuthProbe();
   const store = new SqliteAgentStore(config.databasePath);
@@ -434,6 +437,7 @@ export function createRuntime(config: RuntimeConfig) {
   registerOwnerMentionAssistRoutes(app, request => Boolean(config.runtimeToken) && authenticated(request));
   if (config.mode === "active") personalInbox.start();
   registerPersonaRoutes(app, authenticated, Boolean(config.runtimeToken));
+  registerTopicExecutionRoutes(app, request => Boolean(config.runtimeToken) && authenticated(request));
   registerHostOutboundRoutes(app, store, authenticated, {
     sendDirect: config.proactiveMessageSender ?? sendLarkTextMessage,
     sendReply: config.textReplySender ?? sendLarkTextReply,
@@ -708,8 +712,20 @@ export function createRuntime(config: RuntimeConfig) {
     const result = await decide(Number((request.params as { id: string }).id), decision);
     return reply.code(result.ok ? 200 : 409).send(result);
   });
-  app.post("/v1/messages", async (request, reply) => { if (!request.body || typeof request.body !== "object") return reply.code(400).send({ error: "invalid Lark event" }); return ingestLarkEvent(request.body as Record<string, unknown>); });
-  app.post("/v1/messages/:id/retry", async (request, reply) => { const id = Number((request.params as { id: string }).id); const message = store.db.prepare("SELECT id, codex_status FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string } | undefined; if (!message) return reply.code(404).send({ error: "message not found" }); return enqueueLarkCodexReply(id) ? reply.code(202).send({ id, status: "queued" }) : reply.code(409).send({ error: `message status ${message.codex_status} cannot be retried` }); });
+  app.post("/v1/messages", async (request, reply) => {
+    if (!request.body || typeof request.body !== "object") return reply.code(400).send({ error: "invalid Lark event" });
+    const event = request.body as Record<string, unknown>;
+    if (typeof event.chat_id === "string" && typeof event.thread_id === "string" && topicExecutionRoute(event.chat_id, event.thread_id)
+      && (!config.runtimeToken || !authenticated(request))) return reply.code(401).send({ error: "Runtime authorization required for external engine topics" });
+    return ingestLarkEvent(event);
+  });
+  app.post("/v1/messages/:id/retry", async (request, reply) => {
+    const id = Number((request.params as { id: string }).id);
+    const message = store.db.prepare("SELECT id, codex_status, chat_id, thread_id FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string; chat_id: string | null; thread_id: string | null } | undefined;
+    if (!message) return reply.code(404).send({ error: "message not found" });
+    if (topicExecutionPreviouslyDispatched(id) || topicExecutionRoute(message.chat_id, message.thread_id)) return reply.code(409).send({ error: "External engine topics require a new message instead of replay" });
+    return enqueueLarkCodexReply(id) ? reply.code(202).send({ id, status: "queued" }) : reply.code(409).send({ error: `message status ${message.codex_status} cannot be retried` });
+  });
   app.post("/v1/capabilities/register", async (request, reply) => {
     if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" });
     const payload = request.body as { capabilities?: Array<{ id: string; title: string; description: string; inputSchema: Record<string, unknown>; risk: string }> };
@@ -840,7 +856,18 @@ export function createRuntime(config: RuntimeConfig) {
 
 if (process.argv[1]?.endsWith("index.ts")) {
   const port = Number(process.env.PORT ?? 4780);
-  const runtime = createRuntime({ databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
+  const executionEngines: ExecutionEngine[] = [];
+  const launcher = process.env.LARK_AGENT_CLAUDE_ACP_LAUNCHER;
+  const isolatedCwd = process.env.LARK_AGENT_CLAUDE_ACP_WORKSPACE;
+  if (launcher && isolatedCwd) {
+    try {
+      const models = (process.env.LARK_AGENT_CLAUDE_ACP_MODELS ?? "").split(",").map(model => model.trim()).filter(Boolean);
+      executionEngines.push(createClaudeExecutionEngine({ launcher, cwd: isolatedCwd, models }));
+    } catch {
+      console.warn("Claude topic engine is unavailable: check the isolated launcher and workspace settings");
+    }
+  }
+  const runtime = createRuntime({ executionEngines, databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
   await runtime.app.listen({ host: "127.0.0.1", port });
   setInterval(() => { runtime.expireApprovals(); runtime.recoverOrphanedRuns(); retryPendingLarkTextReplies(); retryPendingLarkMediaReplies(); retryPendingLarkCompletionReactions(); retryPendingLarkExecutionReceipts();
     void retryPendingLarkProgressCards();
