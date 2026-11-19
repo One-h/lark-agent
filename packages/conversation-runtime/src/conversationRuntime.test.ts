@@ -137,6 +137,16 @@ test("conversation runtime responder preserves prompts, trust profiles and group
     assert.deepEqual(buildLarkCodexUserInput("prompt", ["/tmp/image.png"]).at(-1), { type: "localImage", path: "/tmp/image.png" });
     assert.equal(larkAtTag("ou_sender"), '<at user_id="ou_sender"></at>');
     assert.equal(formatLarkFinalReply({ chat_type: "group", sender_id: "ou_sender" }, "收到。"), '<at user_id="ou_sender"></at> 收到。');
+    const bot = { chat_type: "group", sender_id: "ou_sender", sender_type: "bot", reply_trigger: "mention" as const, mentioned: 1 };
+    const final = { mentionDirectBot: true };
+    assert.equal(formatLarkFinalReply(bot, "notice"), "notice");
+    assert.equal(formatLarkFinalReply({ ...bot, reply_trigger: "owner_mention" }, "answer", final), "answer");
+    assert.equal(formatLarkFinalReply({ ...bot, mentioned: 0 }, "answer", final), "answer");
+    assert.equal(formatLarkFinalReply({ ...bot, chat_type: "p2p" }, "answer", final), "answer");
+    assert.equal(formatLarkFinalReply({ ...bot, sender_id: "app_invalid" }, "answer", final), "answer");
+    const addressed = '<at user_id="ou_sender"></at> answer';
+    assert.equal(formatLarkFinalReply(bot, "answer", final), addressed);
+    assert.equal(formatLarkFinalReply(bot, addressed, final), addressed);
   } finally { store.close(); }
 });
 

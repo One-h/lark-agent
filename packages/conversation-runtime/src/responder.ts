@@ -2185,7 +2185,8 @@ function finishRun(
     });
     finalTextKey = delivery.dependencyKey;
     if (delivery.shouldQueue) {
-      mediaDeliveryIds.push(...queueLarkTextReply(target.row, formatLarkFinalReply(target.row, reply), newKey, { taskDir: target.taskDir, turnId: run.turnId, markdown: reply }));
+      mediaDeliveryIds.push(...queueLarkTextReply(target.row, formatLarkFinalReply(target.row, reply, { mentionDirectBot: true }),
+        newKey, { taskDir: target.taskDir, turnId: run.turnId, markdown: reply }));
       run.sentReplies.set(target.row.id, reply);
       run.sentReplyKeys.set(target.row.id, newKey);
     }
@@ -2288,10 +2289,12 @@ export async function reconcileLarkCodexStartupWaits(nowMs = Date.now()): Promis
 }
 
 export function formatLarkFinalReply(
-  message: Pick<LarkMessageRow, "chat_type" | "sender_id"> & Partial<Pick<LarkMessageRow, "sender_type">>,
-  reply: string
+  message: Pick<LarkMessageRow, "chat_type" | "sender_id"> & Partial<Pick<LarkMessageRow, "sender_type" | "reply_trigger" | "mentioned">>,
+  reply: string,
+  options: { mentionDirectBot?: boolean } = {}
 ): string {
-  if (message.sender_type === "bot" || message.chat_type !== "group" || !/^ou_[a-zA-Z0-9]+$/.test(message.sender_id ?? "")) {
+  const directBotReply = options.mentionDirectBot && message.reply_trigger === "mention" && message.mentioned === 1;
+  if ((message.sender_type === "bot" && !directBotReply) || message.chat_type !== "group" || !/^ou_[a-zA-Z0-9]+$/.test(message.sender_id ?? "")) {
     return reply;
   }
   const mention = larkAtTag(message.sender_id!);
@@ -4190,7 +4193,7 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
       taskDir: prepared?.taskDir,
       finishedAt: nowIso()
     });
-    if (failedMessage?.message_id) queueLarkTextReply(failedMessage, formatLarkFinalReply(failedMessage, failureReply),
+    if (failedMessage?.message_id) queueLarkTextReply(failedMessage, formatLarkFinalReply(failedMessage, failureReply, { mentionDirectBot: true }),
       larkReplyIdempotencyKey("codexfailure", `${larkMessageId}:${dispatchId}`));
     if (prepared && !activeLarkCodexRuns.has(prepared.sessionKey)) {
       const session = larkCodexSessionForMessage(prepared.row, prepared.trustedSender);

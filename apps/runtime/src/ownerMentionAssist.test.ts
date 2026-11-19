@@ -187,8 +187,18 @@ test("bot mentions of both owner and agent are direct replies regardless of the 
       const source=await f.start("om_bot_both",{sender_type:"bot",sender_id:"ou_external",
         mentions:allowed?[{id:{open_id:"ou_owner"}},{id:{open_id:"ou_bot"}}]:[{id:"ou_owner"},{id:"ou_bot"}]});
       assert.equal(source.reply_trigger,"mention");assert.equal(ownerAssistRow(source.id),undefined);
-      await f.complete("om_bot_both","收到你的直接提问。");
-      assert.deepEqual(f.sent,["收到你的直接提问。"]);
+      const answer=allowed?"| Item | Count |\n| --- | --- |\n| Demo | 1 |":"收到你的直接提问。";
+      await f.complete("om_bot_both",answer);
+      assert.deepEqual(f.sent,[`<at user_id="ou_external"></at> ${answer}`]);
+      const presentation=JSON.parse(f.row("om_bot_both").reply_delivery_payload);
+      if(allowed){
+        assert.equal(presentation.msgType,"interactive");
+        assert.match(presentation.content.body.elements[0].content,/<at id=ou_external><\/at>/);
+      }else{
+        assert.equal(presentation.msgType,"post");
+        assert.match(presentation.content.zh_cn.content[0][0].text,/^<at user_id="ou_external"><\/at>/);
+      }
+      assert(!JSON.stringify(presentation.content).includes("ou_owner"));
       assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
     }finally{await f.close();}
   }
