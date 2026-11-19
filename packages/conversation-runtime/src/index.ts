@@ -22,3 +22,4 @@ export * from "./approvalPlan.js";
 export * from "./executionEngines.js";
 export * from "./topicExecution.js";
 export * from "./claudeExecutionEngine.js";
+export { configuredNativeAcpEngines, createNativeAcpExecutionEngine, type NativeAcpEngineId } from "./nativeAcpExecutionEngine.js";

@@ -14,7 +14,7 @@ import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerPersonaRoutes } from "./personaRoutes.js";
 import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
-import { configureTopicExecutionEngines, createClaudeExecutionEngine, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { configuredNativeAcpEngines, configureTopicExecutionEngines, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
 import { replaceStickersFromBundle } from "./stickerBundleImport.js";
 import { createLarkAuthProbe, createLarkCliProbe } from "./health.js";
@@ -1007,17 +1007,9 @@ export function createRuntime(config: RuntimeConfig) {
 
 if (process.argv[1]?.endsWith("index.ts")) {
   const port = Number(process.env.PORT ?? 4780);
-  const executionEngines: ExecutionEngine[] = [];
   // The old pilot launcher must never be promoted to native workspace access implicitly.
-  const launcher = process.env.LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER;
-  if (launcher) {
-    try {
-      const models = (process.env.LARK_AGENT_CLAUDE_ACP_MODELS ?? "").split(",").map(model => model.trim()).filter(Boolean);
-      executionEngines.push(createClaudeExecutionEngine({ launcher, models }));
-    } catch {
-      console.warn("Claude topic engine is unavailable: check the native launcher");
-    }
-  }
+  const executionEngines = configuredNativeAcpEngines(process.env, id =>
+    console.warn(`Native ACP engine ${id} is unavailable: check the configured launcher`));
   const runtime = createRuntime({ executionEngines, databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
   await runtime.app.listen({ host: "127.0.0.1", port });
   setInterval(() => { runtime.expireApprovals(); runtime.recoverOrphanedRuns(); retryPendingLarkTextReplies(); retryPendingLarkMediaReplies(); retryPendingLarkCompletionReactions(); retryPendingLarkExecutionReceipts();

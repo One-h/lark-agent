@@ -7,7 +7,7 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime, type RuntimeConfig } from "./index.js";
-import { larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
+import { configuredNativeAcpEngines, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
 async function until(check: () => boolean, timeoutMs = 8000) {
   const deadline = performance.now() + timeoutMs;
@@ -282,6 +282,140 @@ async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "le
   assert.match(m.row().reply_delivery_text, command === "join" ? /已开启本话题续聊/ : /已退出本话题续聊/);
   return m;
 }
+
+test("DSH, OpenCode and AGY share the Lark workflow over ACP stdio", async () => {
+  const launcherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "lark-native-acp-"));
+  const launcher = path.join(launcherRoot, "peer.mjs"), log = path.join(launcherRoot, "methods.jsonl");
+  fs.writeFileSync(launcher, `#!${process.execPath}
+import { appendFileSync, existsSync, realpathSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+const args=process.argv.slice(2);
+const engine=JSON.stringify(args)===JSON.stringify(['--profile','acp'])?'dsh':
+  JSON.stringify(args)===JSON.stringify(['acp','--disable-telemetry'])?'agy':
+  JSON.stringify(args)===JSON.stringify(['acp'])?'opencode':null;
+if(!engine || process.env.LARK_AGENT_RUNTIME_TOKEN || process.env.LARK_AGENT_MCP_TOKEN) throw Error('Invalid launcher environment');
+const id='session-'+engine;
+const send=body=>console.log(JSON.stringify({jsonrpc:'2.0',...body}));
+const respond=(id,result)=>send({id,result});
+const update=value=>send({method:'session/update',params:{sessionId:id,update:value}});
+const chunk=(text,messageId,annotations)=>update({sessionUpdate:'agent_message_chunk',messageId,content:{type:'text',text,annotations}});
+const config=model=>[{id:'provider-model',name:'Model',category:'model',type:'select',currentValue:model,options:[{value:model,name:model}]}];
+let currentPrompt,gate;
+createInterface({input:process.stdin}).on('line',line=>{
+ const {id:rpc,method,params,result}=JSON.parse(line);
+ if(method) appendFileSync(${JSON.stringify(log)}, JSON.stringify({engine,method,model:params?.value})+'\\n');
+ if(method==='initialize'){
+  if(!params.clientCapabilities.session.notices)throw Error('Notices would leak into transcript');
+  respond(rpc,{protocolVersion:1,agentInfo:{name:engine,version:'0.108.1'},agentCapabilities:{
+   ...(engine==='dsh'?{}:{loadSession:true}),sessionCapabilities:{resume:{},close:{}}},_meta:{steering:{supported:true}}});
+ }else if(method==='session/new'||method==='session/resume'){
+  if(realpathSync(params.cwd)!==process.cwd()||params.mcpServers.length!==1||params.mcpServers[0].name!=='lark_tools')throw Error('Shared workspace or MCP missing');
+  if(method==='session/resume'&&params.sessionId!==id)throw Error('Wrong saved conversation');
+  if(method==='session/resume')chunk('Old transcript', 'replay');
+  respond(rpc,{...(method==='session/new'?{sessionId:id}:{}),configOptions:config('default')});
+ }else if(method==='session/set_config_option'){
+  if(params.sessionId!==id||params.configId!=='provider-model')throw Error('Wrong model selector');
+  respond(rpc,{configOptions:config(params.value)});
+ }else if(method==='session/prompt'){
+  const text=params.prompt[0].text;
+  if(params.sessionId!==id)throw Error('Prompt addressed to wrong session');
+  if(text.includes('cancel fixture')){currentPrompt=rpc;return;}
+  if(text.includes('short fixture')){
+   chunk('**Short answer**','short');respond(rpc,{stopReason:'end_turn'});return;
+  }
+  currentPrompt=rpc;
+  chunk('Internal preliminary commentary','preface');
+  update({sessionUpdate:'tool_call',toolCallId:'read-1',kind:'read',title:'Private tool details'});
+  if(engine==='opencode')send({id:98,method:'session/request_permission',params:{sessionId:id,toolCall:{toolCallId:'child-read',_meta:{'opencode/child-session':{id:'child'}}},options:[{optionId:'once',kind:'allow_once',name:'Once'}]}});
+  send({id:97,method:'session/request_permission',params:{sessionId:id,toolCall:{toolCallId:'read-1'},options:[
+   {optionId:'permanent',kind:'allow_always',name:'Always'},{optionId:'once',kind:'allow_once',name:'Once'}]}});
+ }else if(rpc===98){
+  if(result.outcome?.outcome!=='cancelled')throw Error('Unexpected child authorization');
+ }else if(rpc===97){
+  if(result.outcome?.optionId!=='once')throw Error('Unexpected authorization');
+  gate=setInterval(()=>{
+   if(!existsSync(${JSON.stringify(launcherRoot)}+'/'+engine+'-finish'))return;
+   clearInterval(gate);
+   update({sessionUpdate:'notice',severity:'warning',title:'Adapter diagnostic'});
+   chunk('Private assistant-only detail','private',['assistant']);
+   chunk('| Value | Count |\\n| --- | --- |\\n| Fixture | ','answer');
+   chunk('2 |','answer');
+   if(engine==='opencode')update({sessionUpdate:'agent_message_chunk',messageId:'child-answer',content:{type:'text',text:'Private child output'},_meta:{'opencode/child-session':{id:'child'}}});
+   respond(currentPrompt,{stopReason:'end_turn'});
+  },20);
+ }else if(method==='session/cancel'){
+  clearInterval(gate);respond(currentPrompt,{stopReason:'cancelled'});
+ }else if(method==='session/close'){
+  respond(rpc,{});
+ }else if(method){
+  throw Error('Unexpected ACP method '+method);
+ }
+});`, { mode: 0o700 });
+  const ids = ["dsh", "opencode", "agy"];
+  const env = Object.fromEntries(ids.flatMap(id => [
+    [`LARK_AGENT_${id.toUpperCase()}_ACP_NATIVE_LAUNCHER`, launcher],
+    [`LARK_AGENT_${id.toUpperCase()}_ACP_MODELS`, " fixture-model,fixture-model "]
+  ]));
+  const failures: string[] = [];
+  const engines = configuredNativeAcpEngines({ ...env, LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER: "invalid-relative-launcher" }, id => failures.push(id));
+  assert.deepEqual(configuredNativeAcpEngines({}, () => assert.fail("unexpected enabled engine")), []);
+  assert.deepEqual(failures, ["claude"]);
+  assert.deepEqual(engines.map(e => [e.descriptor.id, e.descriptor.models]), ids.map(id => [id, ["fixture-model"]]));
+  const f = fixture(engines);
+  const delay = config.larkCodexInterimReplyDelayMs;
+  const oldToken = process.env.LARK_AGENT_RUNTIME_TOKEN;
+  process.env.LARK_AGENT_RUNTIME_TOKEN = "host-token-not-for-engine";
+  const headers = { authorization: "Bearer fixture-token" };
+  const topic = "/v1/chats/oc_fixture/topics/omt_fixture/execution";
+  const methods = (engine: string): Array<{ method: string; model?: string }> => fs.existsSync(log)
+    ? fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.engine === engine) : [];
+  const progress = (id: number) => f.runtime().store.db.prepare("SELECT state,entries_json FROM lark_progress_cards WHERE lark_message_id=?").get(id) as
+    { state: string; entries_json: string } | undefined;
+  try {
+    await f.settings({ topicNativeModeEnabled: true, interimRepliesEnabled: true });
+    await topicCommand(f, "join");
+    config.larkCodexInterimReplyDelayMs = 100;
+    for (const id of ids) {
+      const route = await f.runtime().app.inject({ method: "PUT", url: topic, headers, payload: { override: { engineId: id, model: "fixture-model" } } });
+      assert.equal(route.statusCode, 200, route.body);
+      assert.deepEqual(route.json().effective, { engineId: id, model: "fixture-model" });
+      const denied = await f.message({ sender_id: "ou_member", content: "untrusted fixture" });
+      await until(() => denied.row().codex_status === "failed");
+      assert.equal(methods(id).length, 0, `${id} started an untrusted engine`);
+      const first = await f.message({ content: "use fixture tool" });
+      await until(() => progress(first.row().id)?.state === "running");
+      assert.match(progress(first.row().id)!.entries_json, /正在读取资料/);
+      assert.doesNotMatch(progress(first.row().id)!.entries_json, /Private|Internal/);
+      const follow = await f.message({ content: "short fixture" });
+      assert.equal(methods(id).filter(row => row.method === "session/prompt").length, 1);
+      fs.writeFileSync(path.join(launcherRoot, `${id}-finish`), "");
+      await until(() => follow.row().reply_status === "sent");
+      assert.equal(progress(first.row().id)?.state, "completed");
+      assert.equal(progress(follow.row().id), undefined);
+      assert.equal(first.row().codex_reply, "| Value | Count |\n| --- | --- |\n| Fixture | 2 |");
+      assert.equal(JSON.parse(first.row().reply_delivery_payload).msgType, "interactive");
+      assert.equal(follow.row().codex_reply, "**Short answer**");
+      assert.equal(JSON.parse(follow.row().reply_delivery_payload).msgType, "post");
+      const cancelled = await f.message({ content: "cancel fixture" });
+      await until(() => methods(id).filter(row => row.method === "session/prompt").length === 3);
+      assert.deepEqual((await f.runtime().app.inject({ method: "POST", url: topic+"/cancel", headers })).json(), { requested: 1 });
+      await until(() => cancelled.row().codex_status === "failed");
+      assert.match(cancelled.row().codex_reply, /已确认取消/);
+      const events = methods(id);
+      assert.equal(events.filter(row => row.method === "session/new").length, 1);
+      assert.equal(events.filter(row => row.method === "session/resume").length, 2);
+      assert.equal(events.filter(row => row.method === "session/close").length, 3);
+      assert.equal(events.filter(row => row.model === "fixture-model").length, 3);
+      assert(!events.some(row => row.method === "session/load" || row.method === "_session/steering"));
+    }
+  } finally {
+    config.larkCodexInterimReplyDelayMs = delay;
+    if (oldToken === undefined) delete process.env.LARK_AGENT_RUNTIME_TOKEN;
+    else process.env.LARK_AGENT_RUNTIME_TOKEN = oldToken;
+    await f.close();
+    fs.rmSync(launcherRoot, { recursive: true, force: true });
+  }
+});
 
 test("off retains ordinary mentions; turning on does not enroll historical or newly mentioned topics", async () => {
   const f = fixture(); try {

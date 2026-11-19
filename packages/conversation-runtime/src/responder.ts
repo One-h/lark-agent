@@ -4410,7 +4410,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
       ...(mcpServer ? { mcpServers: [mcpServer] } : {}) });
     controller.signal.throwIfAborted();
     if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
-      session.close();
+      await session.close();
       finishExternalTopicMessage(message, "no_reply", "");
       return;
     }
@@ -4419,7 +4419,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso(),
       turnId: mcpToken ? progressId : undefined });
   } catch (error) {
-    session?.close();
+    await session?.close();
     if (controller.signal.aborted) {
       finishExternalTopicMessage(message, "failed", "已取消，未向外部引擎提交本轮消息。", "External engine cancelled before prompt");
       return;
@@ -4450,7 +4450,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const limit = setTimeout(() => controller.abort(), 180_000);
   run.done = (async () => {
     let closeTimer: NodeJS.Timeout | undefined;
-    const closeAfterAbort = () => { closeTimer = setTimeout(() => session.close(), 5_000); };
+    const closeAfterAbort = () => { closeTimer = setTimeout(() => { void session.close(); }, 5_000); };
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
     try { result = await session.run(mcpToken ? `${prompt}\n\n${larkMcpToolsInstruction(mcpToken)}` : prompt, controller.signal, onEngineEvent); }
@@ -4465,7 +4465,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
       controller.signal.removeEventListener("abort", closeAfterAbort);
     }
     await Promise.allSettled([...run.steering]);
-    session.close();
+    await session.close();
     if (externalTopicTurns.get(key) !== run) return;
     try {
       const answer = result?.status === "completed" && !isLarkNoReplyDecision(result.text) ? sanitizeLarkCodexReply(result.text, false) : "";
@@ -4722,7 +4722,7 @@ export function stopLarkCodexResponder(): void {
   for (const run of [...activeLarkCodexRuns.values()]) {
     finishRun(run, "failed", run.finalAgentMessage ?? run.lastAgentMessage, "Codex responder stopped", false);
   }
-  for (const run of externalTopicTurns.values()) { run.controller.abort(); run.session.close(); }
+  for (const run of externalTopicTurns.values()) { run.controller.abort(); void run.session.close(); }
   externalTopicTurns.clear();
   for (const controller of externalTopicStarts.keys()) controller.abort();
   codexAppServer.stop();

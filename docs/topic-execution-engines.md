@@ -8,42 +8,54 @@ External routing applies to human direct messages, group mentions of the agent,
 and enrolled topic follow-ups. Owner assistance, bot mentions, spontaneous
 replies, and the enforced group privacy workflow retain the existing path.
 
-## Enable the native Claude adapter
+## Enable a native ACP engine
 
 By default no external engine is registered. To opt in on a local runtime:
 
-- `LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER`: absolute path to an operator-owned executable
-  that starts a pinned `claude-agent-acp` over stdin/stdout, without installing
-  or signing in at startup. It must use the working directory provided by the
-  runtime. The previous pilot launcher and workspace settings are not used.
-- `LARK_AGENT_CLAUDE_ACP_MODELS`: comma-separated native model IDs that the
-  operator allows. Omit to offer only the engine default.
+| Engine ID | Launcher variable | Arguments supplied by Lark |
+| --- | --- | --- |
+| `claude` | `LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER` | None; the executable starts pinned `claude-agent-acp` |
+| `dsh` | `LARK_AGENT_DSH_ACP_NATIVE_LAUNCHER` | `--profile acp` |
+| `opencode` | `LARK_AGENT_OPENCODE_ACP_NATIVE_LAUNCHER` | `acp` |
+| `agy` | `LARK_AGENT_AGY_ACP_NATIVE_LAUNCHER` | `acp --disable-telemetry` |
 
-The configured Codex workspace and sender trust settings also govern Claude.
-The stock native Claude adapter is supported only for senders authorized for
+Use an absolute executable path, not a shell command. The CLI or an
+operator-owned wrapper uses the supplied working directory and existing
+authentication; the runtime never installs a CLI or signs in at startup. The
+previous Claude pilot launcher and workspace settings are not used. An invalid
+launcher leaves only that engine unavailable. Each optional
+`LARK_AGENT_<ENGINE>_ACP_MODELS` value is a comma-separated allowlist of exact
+engine model IDs. Omit it to offer the engine's configured default only.
+
+The configured Codex workspace and sender trust settings also govern these engines.
+Native ACP is supported only for senders authorized for
 Codex full access without additional approval. For an ordinary read-only
 request it refuses before the launcher starts: ACP requests alone cannot enforce
 the Codex sandbox or the existing turn-scoped Feishu approval process.
 There is no silent fallback to Codex and no new trusted-sender list.
 
-For a trusted active turn, a request from that exact Claude session can grant
+For a trusted active turn, a request from that exact ACP session can grant
 the offered single-use option. There are no persistent grants, or grants before
 the turn, after it ends, or after cancellation. The operator launcher supplies
-Claude authentication and persistent native sessions. A small environment
+authentication and persistent native sessions. A small environment
 allowlist retains the local profile and executable search paths without
 forwarding Lark or Forge API tokens. The host does not expose filesystem,
-terminal or an unrestricted ACP tool relay. The trusted Claude adapter passes the
-fixed [`lark_tools` stdio MCP](shared-tool-mcp.md) on session creation and load.
+terminal or an unrestricted ACP tool relay. The trusted adapter passes the
+fixed [`lark_tools` stdio MCP](shared-tool-mcp.md) on session creation and resume.
 Only that subprocess receives the limited MCP transport credential. Its calls
 still need a live turn token and the normal Lark runtime approvals.
 
-Same-turn steering requires a stable Claude ACP release with prompt-lifecycle
-fixes (0.81.1 or later in the 0.x series) and an advertised steering extension.
-Other versions queue follow-up messages instead of attempting an untracked turn.
+DSH, OpenCode and AGY use the advertised `session/resume` and preserve their
+native conversation across processes. A failed resume never starts a new
+conversation silently. Claude retains its existing `session/load` behavior.
+Same-turn steering still requires Claude ACP 0.81.1 or later in the 0.x series
+and its advertised steering extension. Other ACP engines queue follow-ups
+until the current turn ends; sending a second prompt is not treated as a
+confirmed same-turn injection.
 
 ## Progress and replies
 
-Claude ACP notices, subagent text, and commentary before tool calls are not
+ACP notices, assistant-only content, and commentary before tool calls are not
 part of the final Feishu reply. The adapter keeps the last foreground answer
 and uses ACP message IDs to join its chunks when available. Tool activity
 feeds the existing single progress card with short status labels, not tool
@@ -69,8 +81,8 @@ that Codex preference. Changes of external routing while work is queued or runni
 rejected. `POST .../execution/cancel` requests cancellation; a 202 response
 on the topic endpoint reports admission, not proof that the agent stopped.
 
-Only new text is sent; no previous Codex thread, quotes, attachments, or host
-tool access are carried over. Conversation-level routes include the configured
+Only new text is sent; no previous Codex thread, quotes, or attachments are
+carried over. Conversation-level routes include the configured
 assistant persona on each new turn. External sessions are tracked separately by
 binding, trust scope and workspace, and an inherited topic never shares the
 main group's session. Switching a chat back to an engine can reuse its own

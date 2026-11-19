@@ -28,8 +28,9 @@ parallel dynamic tools. Previously stored dynamic calls can still be handled
 for compatibility, through the same approval plan and capability services.
 
 Local external adapters may opt in with `supportsLarkMcp` and mount the supplied
-stdio descriptor on session creation and load. Native Claude opts in only under
-its existing trusted policy. Engine deadlines and capabilities are unchanged;
+stdio descriptor on session creation and resume. Native Claude, DSH, OpenCode
+and AGY opt in only under the existing trusted policy. Engine deadlines and
+capabilities are unchanged;
 for example an engine can end its turn before the human approval deadline.
 
 The gateway uses a separate process-local credential, loopback HTTP, and a
@@ -47,5 +48,5 @@ actually arrives, after checking that the turn and plan are still current.
 Missing, altered, expired or unrelated confirmations do not grant access.
 
 The migration tests use actual MCP stdio with a simulated resumed Codex thread,
-mock host operations and approval cards, plus isolated external engine and
-Claude ACP fixtures. They do not send live messages or deploy real services.
+mock host operations and approval cards, plus isolated external engine ACP
+fixtures. They do not send live messages or deploy real services.

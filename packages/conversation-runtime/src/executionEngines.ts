@@ -31,7 +31,7 @@ export interface ExecutionEngineSession {
   run(text: string, signal: AbortSignal, onEvent?: (event: ExecutionEngineEvent) => void): Promise<ExecutionTurnResult>;
   // "idle" means the engine explicitly did not consume the input.
   steer?(text: string, signal: AbortSignal): Promise<"injected" | "idle">;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export interface ExecutionEngine {
