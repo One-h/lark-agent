@@ -1,11 +1,12 @@
-# Topic execution engines
+# Lark execution engines
 
-Codex remains the default. An operator can opt an existing group topic into an
-external engine; this does not enroll the topic in automatic reply mode.
-Use the normal topic join flow separately when automatic follow-up is desired.
-Only human messages that directly mention the agent or qualify for native topic
-continuation use this route. Other topics, single chats, owner assist, bot
-mentions and spontaneous replies retain the existing behavior.
+Codex remains the default. An operator can select a registered engine and model
+for an existing direct chat or group. A topic override takes precedence over
+its group; it can also explicitly select Codex. Changing the engine does not
+enroll a topic in automatic reply mode. Use the normal topic join flow for that.
+External routing applies to human direct messages, group mentions of the agent,
+and enrolled topic follow-ups. Owner assistance, bot mentions, spontaneous
+replies, and the enforced group privacy workflow retain the existing path.
 
 ## Enable the native Claude adapter
 
@@ -43,15 +44,22 @@ Other versions queue follow-up messages instead of attempting an untracked turn.
 ## Configure and verify
 
 `GET` and `PUT /v1/chats/:chatId/topics/:threadId/execution` use the runtime
-token. A PUT accepts `{"override":{"engineId":"claude","model":null}}` or an
-allowlisted model ID in place of null. `{"override":null}` returns the topic to
-its existing Codex policy. Changes to a topic with queued or running work are
+token, as do `GET` and `PUT /v1/chats/:chatId/execution` for chat settings.
+A PUT accepts `{"override":{"engineId":"claude","model":null}}` or an
+allowlisted model ID in place of null. A null override inherits the group
+selection for a topic, or restores the global Codex model for a chat.
+Choosing Codex at chat level updates the existing per-chat Codex model rather
+than creating a separate model setting. Selecting an external engine preserves
+that Codex preference. Changes of external routing while work is queued or running are
 rejected. `POST .../execution/cancel` requests cancellation; a 202 response
-reports admission, not proof that the agent stopped.
+on the topic endpoint reports admission, not proof that the agent stopped.
 
 Only new text is sent; no previous Codex thread, quotes, attachments, or host
-tool access are carried over. External sessions are tracked separately by
-topic binding, trust scope and workspace. Explicit model replacements are
+tool access are carried over. Conversation-level routes include the configured
+assistant persona on each new turn. External sessions are tracked separately by
+binding, trust scope and workspace, and an inherited topic never shares the
+main group's session. Switching a chat back to an engine can reuse its own
+session; Codex and external session histories stay independent. Explicit model replacements are
 verified on the next turn. Switching a model to or from the engine default
 opens a separate external session. Resume or admission failures do not replay
 work or fall back to Codex. The legacy manual retry endpoint does not resend

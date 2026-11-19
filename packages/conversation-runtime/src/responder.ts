@@ -26,7 +26,7 @@ import { applyPlanAuthorization, approvalPlanSummary, approvalPlanTool, approval
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
 import { larkExecutionPolicy, type ExecutionEngineSession, type ExecutionTurnResult } from "./executionEngines.js";
-import { loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicEngineSessionKey, topicExecutionForMessage, type StoredTopicExecutionRoute } from "./topicExecution.js";
+import { externalExecutionForMessage, loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicEngineSessionKey, type ExternalExecutionRoute } from "./topicExecution.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
@@ -4290,7 +4290,7 @@ function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" 
   queueLarkTextReply(message, formatLarkFinalReply(message, text), larkReplyIdempotencyKey("topicengine", String(message.id)));
 }
 
-async function dispatchExternalTopicMessage(message: LarkMessageRow, route: StoredTopicExecutionRoute, trusted: boolean): Promise<void> {
+async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalExecutionRoute, trusted: boolean): Promise<void> {
   if (message.id <= route.afterMessageId) {
     finishExternalTopicMessage(message, "no_reply", "");
     return;
@@ -4298,17 +4298,17 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
   recordTopicExecution(message.id, route);
   const text = message.message_type === "text" ? message.content?.trim() : "";
   if (!text || text.length > 24_000) {
-    finishExternalTopicMessage(message, "failed", "外部引擎试点只处理不超过 24,000 字符的文本。");
+    finishExternalTopicMessage(message, "failed", "当前外部引擎只处理不超过 24,000 字符的文本。");
     return;
   }
   const engine = resolveTopicExecutionEngine(route);
-  if (!engine) throw new Error("Selected topic engine or model is unavailable");
+  if (!engine) throw new Error("Selected engine or model is unavailable");
   const policy = larkExecutionPolicy(config.workspaceRoot, trusted);
   if (!engine.supportsPolicy(policy)) {
     finishExternalTopicMessage(message, "failed", "所选引擎目前不能执行你的权限规则，未启动任务。", "Selected engine cannot enforce the execution policy");
     return;
   }
-  const key = topicEngineSessionKey(route, policy);
+  const key = topicEngineSessionKey(route, policy, message.chat_type === "group" ? larkMessageTopicKey(message) : null);
   const active = externalTopicTurns.get(key);
   if (active?.accepting && !active.controller.signal.aborted && active.session.steer) {
     const running = active;
@@ -4344,6 +4344,8 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
     finishExternalTopicMessage(message, "no_reply", "");
     return;
   }
+  const persona = route.conversation ? captureConversationStyle(message.chat_id).effectiveInstructions : "";
+  const prompt = persona ? `${persona}\n\n当前飞书消息：\n${text}` : text;
   const controller = new AbortController();
   const progressId = crypto.randomUUID();
   const mcpServer = engine.supportsLarkMcp ? larkAgentToolsMcpServer() : undefined;
@@ -4384,7 +4386,7 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
     const closeAfterAbort = () => { closeTimer = setTimeout(() => session.close(), 5_000); };
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
-    try { result = await session.run(mcpToken ? `${text}\n\n${larkMcpToolsInstruction(mcpToken)}` : text, controller.signal); }
+    try { result = await session.run(mcpToken ? `${prompt}\n\n${larkMcpToolsInstruction(mcpToken)}` : prompt, controller.signal); }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
@@ -4428,9 +4430,9 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
       return;
     }
     const trustedSender = isTrustedSender(message.sender_id);
-    const external = topicExecutionForMessage(message);
+    const external = externalExecutionForMessage(message);
     if (external) {
-      try { await dispatchExternalTopicMessage(message, external, trustedSender); }
+      try { await dispatchExternalMessage(message, external, trustedSender); }
       catch { finishExternalTopicMessage(message, "failed", "外部引擎无法启动或未确认接收消息，没有自动切换或重跑。", "External engine dispatch not confirmed"); }
       return;
     }

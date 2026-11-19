@@ -14,7 +14,7 @@ import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerPersonaRoutes } from "./personaRoutes.js";
 import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
-import { configureTopicExecutionEngines, createClaudeExecutionEngine, topicExecutionPreviouslyDispatched, topicExecutionRoute, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { configureTopicExecutionEngines, createClaudeExecutionEngine, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
 import { replaceStickersFromBundle } from "./stickerBundleImport.js";
 import { createLarkAuthProbe, createLarkCliProbe } from "./health.js";
@@ -775,15 +775,19 @@ export function createRuntime(config: RuntimeConfig) {
   app.post("/v1/messages", async (request, reply) => {
     if (!request.body || typeof request.body !== "object") return reply.code(400).send({ error: "invalid Lark event" });
     const event = request.body as Record<string, unknown>;
-    if (typeof event.chat_id === "string" && typeof event.thread_id === "string" && topicExecutionRoute(event.chat_id, event.thread_id)
-      && (!config.runtimeToken || !authenticated(request))) return reply.code(401).send({ error: "Runtime authorization required for external engine topics" });
+    if ((!config.runtimeToken || !authenticated(request)) && typeof event.chat_id === "string"
+      && hasExternalExecutionRoute(event.chat_id, typeof event.thread_id === "string" ? event.thread_id : null)) {
+      return reply.code(401).send({ error: "Runtime authorization required for conversations with an external engine" });
+    }
     return ingestLarkEvent(event);
   });
   app.post("/v1/messages/:id/retry", async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
     const message = store.db.prepare("SELECT id, codex_status, chat_id, thread_id FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string; chat_id: string | null; thread_id: string | null } | undefined;
     if (!message) return reply.code(404).send({ error: "message not found" });
-    if (topicExecutionPreviouslyDispatched(id) || topicExecutionRoute(message.chat_id, message.thread_id)) return reply.code(409).send({ error: "External engine topics require a new message instead of replay" });
+    if (topicExecutionPreviouslyDispatched(id) || hasExternalExecutionRoute(message.chat_id, message.thread_id)) {
+      return reply.code(409).send({ error: "An external engine requires a new message instead of replay" });
+    }
     return enqueueLarkCodexReply(id) ? reply.code(202).send({ id, status: "queued" }) : reply.code(409).send({ error: `message status ${message.codex_status} cannot be retried` });
   });
   app.post("/v1/capabilities/register", async (request, reply) => {

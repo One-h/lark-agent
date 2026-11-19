@@ -6,7 +6,7 @@ import test from "node:test";
 import Fastify from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { enqueueLarkCodexReply, larkCodexSessionKeyForMessage, updateTopicExecutionSettings, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { enqueueLarkCodexReply, larkCodexSessionKeyForMessage, saveConversationPersona, updateConversationExecutionSettings, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { codexAppServer, larkAgentToolsMcpServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
 
@@ -159,11 +159,13 @@ test("an opted-in external engine gets the shared MCP catalog and loses access w
     const insert = app.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,thread_id,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
       VALUES(?,?,'oc_fixture','group','omt_fixture','ou_owner','user','text','Fixture request',1,'mention','skipped','skipped','{}',?,?)`);
     insert.run(1, "om_first", now, now);
-    assert.equal(updateTopicExecutionSettings("oc_fixture", "omt_fixture", { engineId: "fixture", model: null }), "ok");
+    assert.equal(updateConversationExecutionSettings("oc_fixture", { engineId: "fixture", model: null }), "ok");
+    saveConversationPersona("oc_fixture", { mode: "custom", name: "Fixture", instructions: "Use the configured fixture persona." });
     insert.run(2, "om_second", now, now);
     assert.equal(enqueueLarkCodexReply(2), true);
     const text = await waitFor(() => prompt);
     assert.equal(configName, "lark_tools");
+    assert.match(text, /Use the configured fixture persona/);
     const token = text.match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     const secret = larkAgentToolsMcpServer()?.env.find(e => e.name === "LARK_AGENT_MCP_TOKEN")?.value;
     assert(token && secret);
