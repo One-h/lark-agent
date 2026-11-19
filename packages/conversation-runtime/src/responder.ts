@@ -23,6 +23,8 @@ import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
+import type { ExecutionEngineSession, ExecutionTurnResult } from "./executionEngines.js";
+import { loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicExecutionForMessage, type StoredTopicExecutionRoute } from "./topicExecution.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
@@ -4138,6 +4140,131 @@ function skipDisabledTopicContinuation(message: LarkMessageRow): boolean {
   return true;
 }
 
+type ExternalTopicTurn = {
+  source: LarkMessageRow;
+  id: string;
+  session: ExecutionEngineSession;
+  controller: AbortController;
+  members: Map<number, LarkMessageRow>;
+  steering: Set<Promise<unknown>>;
+  accepting: boolean;
+  done: Promise<void>;
+};
+const externalTopicTurns = new Map<string, ExternalTopicTurn>();
+const externalTopicStarts = new Map<AbortController, LarkMessageRow>();
+
+export function cancelExternalTopicTurns(chatId: string, threadId: string): number {
+  const matches = (source: LarkMessageRow) => source.chat_id === chatId && source.thread_id === threadId;
+  const controllers = [...externalTopicTurns.values()].filter(turn => matches(turn.source) && turn.accepting).map(turn => turn.controller);
+  for (const [controller, source] of externalTopicStarts) if (matches(source)) controllers.push(controller);
+  for (const controller of controllers) controller.abort();
+  return controllers.length;
+}
+
+function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string): void {
+  updateCodexState(message.id, { status, reply: text || null, error, finishedAt: nowIso() });
+  if (!text) {
+    db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=?").run(message.id);
+    return;
+  }
+  queueLarkTextReply(message, formatLarkFinalReply(message, text), larkReplyIdempotencyKey("topicengine", String(message.id)));
+}
+
+async function dispatchExternalTopicMessage(message: LarkMessageRow, route: StoredTopicExecutionRoute, trusted: boolean): Promise<void> {
+  if (message.id <= route.afterMessageId) {
+    finishExternalTopicMessage(message, "no_reply", "");
+    return;
+  }
+  recordTopicExecution(message.id, route);
+  const text = message.message_type === "text" ? message.content?.trim() : "";
+  if (!text || text.length > 24_000) {
+    finishExternalTopicMessage(message, "failed", "外部引擎试点只处理不超过 24,000 字符的文本。");
+    return;
+  }
+  const engine = resolveTopicExecutionEngine(route);
+  if (!engine) throw new Error("Selected topic engine or model is unavailable");
+  const key = JSON.stringify([route.bindingId, trusted]);
+  const active = externalTopicTurns.get(key);
+  if (active?.accepting && !active.controller.signal.aborted && active.session.steer) {
+    const running = active;
+    const steer = active.session.steer(text, AbortSignal.any([running.controller.signal, AbortSignal.timeout(12_000)])).then(outcome => {
+      if (outcome === "injected") {
+        recordTopicExecution(message.id, route, running.session.id, running.id);
+        updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso() });
+        running.members.set(message.id, message);
+      }
+      return outcome;
+    });
+    running.steering.add(steer);
+    try { if (await steer === "injected") return; }
+    finally { running.steering.delete(steer); }
+  }
+  if (active) await active.done;
+  if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
+    finishExternalTopicMessage(message, "no_reply", "");
+    return;
+  }
+  const controller = new AbortController();
+  const progressId = crypto.randomUUID();
+  let session: ExecutionEngineSession | undefined;
+  externalTopicStarts.set(controller, message);
+  try {
+    session = await engine.open({ sessionId: loadTopicExecutionSession(route, trusted), model: route.model, signal: controller.signal });
+    controller.signal.throwIfAborted();
+    if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
+      session.close();
+      finishExternalTopicMessage(message, "no_reply", "");
+      return;
+    }
+    saveTopicExecutionSession(route, trusted, session.id);
+    recordTopicExecution(message.id, route, session.id, progressId);
+    updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso() });
+  } catch (error) {
+    session?.close();
+    if (controller.signal.aborted) {
+      finishExternalTopicMessage(message, "failed", "已取消，未向外部引擎提交本轮消息。", "External engine cancelled before prompt");
+      return;
+    }
+    throw error;
+  } finally { externalTopicStarts.delete(controller); }
+  const run: ExternalTopicTurn = { source: message, id: progressId, session, controller, members: new Map([[message.id, message]]), steering: new Set(),
+    accepting: true, done: Promise.resolve() };
+  externalTopicTurns.set(key, run);
+  const progress = setTimeout(() => {
+    if (run.accepting) queueLarkProgressUpdate({ progressId, turnId: progressId, threadId: session.id, source: message, eventId: "start",
+      text: `${engine.descriptor.label} 正在处理。` });
+  }, config.larkCodexInterimReplyDelayMs);
+  const limit = setTimeout(() => controller.abort(), 180_000);
+  run.done = (async () => {
+    let closeTimer: NodeJS.Timeout | undefined;
+    const closeAfterAbort = () => { closeTimer = setTimeout(() => session.close(), 5_000); };
+    controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
+    let result: ExecutionTurnResult | null = null;
+    try { result = await session.run(text, controller.signal); }
+    catch { /* A failed or disconnected turn is never rerun automatically. */ }
+    finally {
+      run.accepting = false;
+      clearTimeout(limit); clearTimeout(progress); clearTimeout(closeTimer);
+      controller.signal.removeEventListener("abort", closeAfterAbort);
+    }
+    await Promise.allSettled([...run.steering]);
+    session.close();
+    if (externalTopicTurns.get(key) !== run) return;
+    try {
+      const answer = result?.status === "completed" ? sanitizeLarkCodexReply(result.text, false) : "";
+      const cancelled = result?.status === "cancelled";
+      const status = result?.status === "completed" ? answer ? "answered" : "no_reply" : "failed";
+      const reply = result?.status === "completed" ? answer : cancelled
+        ? "外部引擎已确认取消当前任务。" : "外部引擎未返回可确认的结果，任务不会自动重跑。";
+      finishLarkProgressCard(progressId, cancelled ? "cancelled" : result ? "completed" : "failed");
+      for (const member of run.members.values()) {
+        finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown");
+      }
+    } finally { externalTopicTurns.delete(key); }
+  })();
+  void run.done.catch(() => console.warn("lark_external_topic_finish_failed"));
+}
+
 async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
   const dispatchId = crypto.randomUUID();
   let prepared: PreparedLarkCodexMessage | null = null;
@@ -4153,6 +4280,12 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
       return;
     }
     const trustedSender = isTrustedSender(message.sender_id);
+    const external = topicExecutionForMessage(message);
+    if (external) {
+      try { await dispatchExternalTopicMessage(message, external, trustedSender); }
+      catch { finishExternalTopicMessage(message, "failed", "外部引擎无法启动或未确认接收消息，没有自动切换或重跑。", "External engine dispatch not confirmed"); }
+      return;
+    }
     const sessionKey = preparedSessionKey(message, trustedSender);
     const activityVersion = (larkSessionActivityVersions.get(sessionKey) ?? 0) + 1;
     larkSessionActivityVersions.set(sessionKey, activityVersion);
@@ -4273,7 +4406,7 @@ export async function larkCodexNativeRuntime(refresh = false): Promise<LarkCodex
 export function larkCodexAppServerStatus(): { running: boolean; pid: number | null; lastError: string | null; activeTurns: number } {
   return {
     ...codexAppServer.status(),
-    activeTurns: activeLarkCodexRuns.size + preparingLarkMessages.size
+    activeTurns: activeLarkCodexRuns.size + preparingLarkMessages.size + externalTopicTurns.size
   };
 }
 
@@ -4330,7 +4463,7 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
   nextOrphanedLarkRunReconciliationMs = nowMs + 60_000;
   const cutoff = new Date(nowMs - config.larkCodexOrphanRecoveryMs).toISOString();
   const activeMessageIds = new Set(
-    [...activeLarkCodexRuns.values()].flatMap((run) => [...run.members.keys()])
+    [...activeLarkCodexRuns.values(), ...externalTopicTurns.values()].flatMap((run) => [...run.members.keys()])
   );
   const candidates = db.prepare(`
     SELECT id
@@ -4371,5 +4504,8 @@ export function stopLarkCodexResponder(): void {
   for (const run of [...activeLarkCodexRuns.values()]) {
     finishRun(run, "failed", run.finalAgentMessage ?? run.lastAgentMessage, "Codex responder stopped", false);
   }
+  for (const run of externalTopicTurns.values()) { run.controller.abort(); run.session.close(); }
+  externalTopicTurns.clear();
+  for (const controller of externalTopicStarts.keys()) controller.abort();
   codexAppServer.stop();
 }

@@ -57,10 +57,12 @@ async function deliver(database: Database.Database, id: string): Promise<void> {
   for (let pass = 0; pass < 3 && database.open && database === db; pass++) {
     const current = row(database, id);
     if (!current?.pending || current.attempts >= maxAttempts || Date.parse(current.next_attempt_at) > Date.now()) return;
-    const source = database.prepare("SELECT * FROM lark_messages WHERE id=?").get(current.lark_message_id) as LarkMessageRow | undefined;
+    const source = database.prepare(`SELECT m.*, COALESCE(e.turn_id,m.codex_turn_id) AS execution_turn_id
+      FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id WHERE m.id=?`)
+      .get(current.lark_message_id) as (LarkMessageRow & { execution_turn_id: string | null }) | undefined;
     if (!source || source.message_id !== current.message_id) return;
-    if (current.state === "running" && (source.codex_turn_id !== current.native_turn_id || !["queued", "running"].includes(source.codex_status))) {
-      const state = source.codex_turn_id === current.native_turn_id && ["answered", "no_reply"].includes(source.codex_status) ? "completed" : "interrupted";
+    if (current.state === "running" && (source.execution_turn_id !== current.native_turn_id || !["queued", "running"].includes(source.codex_status))) {
+      const state = source.execution_turn_id === current.native_turn_id && ["answered", "no_reply"].includes(source.codex_status) ? "completed" : "interrupted";
       database.prepare("UPDATE lark_progress_cards SET state=?,version=version+1,next_attempt_at=? WHERE progress_id=? AND state='running'").run(state, nowIso(), id);
       continue;
     }
@@ -129,7 +131,9 @@ export async function drainLarkProgressCards(): Promise<void> {
 }
 
 export function reconcileLarkProgressCards(): void {
-  const cards = db.prepare(`SELECT progress_id,CASE WHEN m.codex_turn_id=p.native_turn_id THEN m.codex_status ELSE NULL END AS codex_status FROM lark_progress_cards p LEFT JOIN lark_messages m ON m.id=p.lark_message_id
-    WHERE p.state='running' AND (m.id IS NULL OR m.codex_turn_id IS NOT p.native_turn_id OR m.codex_status NOT IN ('queued','running'))`).all() as Array<{ progress_id: string; codex_status?: string }>;
+  const cards = db.prepare(`SELECT progress_id,CASE WHEN COALESCE(e.turn_id,m.codex_turn_id)=p.native_turn_id THEN m.codex_status ELSE NULL END AS codex_status
+    FROM lark_progress_cards p LEFT JOIN lark_messages m ON m.id=p.lark_message_id
+    LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=p.lark_message_id
+    WHERE p.state='running' AND (m.id IS NULL OR COALESCE(e.turn_id,m.codex_turn_id) IS NOT p.native_turn_id OR m.codex_status NOT IN ('queued','running'))`).all() as Array<{ progress_id: string; codex_status?: string }>;
   for (const card of cards) finishLarkProgressCard(card.progress_id, card.codex_status === "answered" || card.codex_status === "no_reply" ? "completed" : "interrupted");
 }
