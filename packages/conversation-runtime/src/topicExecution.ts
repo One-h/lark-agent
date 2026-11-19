@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appSettingValue, config, conversationCodexModelSettings, db, setAppSettingValue, type LarkMessageRow } from "./context.js";
-import { ExecutionEngineRegistry, type ExecutionEngine, type ExecutionEngineRoute } from "./executionEngines.js";
+import { ExecutionEngineRegistry, type ExecutionEngine, type ExecutionEngineRoute, type LarkExecutionPolicy } from "./executionEngines.js";
 
 export type StoredTopicExecutionRoute = ExecutionEngineRoute & { bindingId: string; afterMessageId: number };
 type StoredRoute = StoredTopicExecutionRoute;
@@ -13,7 +13,8 @@ export function configureTopicExecutionEngines(engines: readonly ExecutionEngine
 }
 
 const routeKey = (chatId: string, threadId: string) => `topicExecution:${JSON.stringify([chatId, threadId])}`;
-const sessionKey = (route: StoredRoute, trusted: boolean) => `topicExecutionSession:${JSON.stringify([route.bindingId, trusted])}`;
+export const topicEngineSessionKey = (route: StoredRoute, policy: LarkExecutionPolicy) =>
+  `topicExecutionSession:${JSON.stringify([route.bindingId, policy.trustScope, policy.cwd])}`;
 
 export function topicExecutionRoute(chatId: string | null, threadId: string | null): StoredRoute | null {
   if (!chatId || !threadId) return null;
@@ -58,11 +59,11 @@ export function topicExecutionForMessage(message: LarkMessageRow): StoredRoute |
 }
 
 export function resolveTopicExecutionEngine(route: ExecutionEngineRoute): ExecutionEngine | undefined { return registry.resolve(route); }
-export function loadTopicExecutionSession(route: StoredRoute, trusted: boolean): string | null {
-  return appSettingValue(sessionKey(route, trusted)) || null;
+export function loadTopicExecutionSession(key: string): string | null {
+  return appSettingValue(key) || null;
 }
-export function saveTopicExecutionSession(route: StoredRoute, trusted: boolean, sessionId: string): void {
-  setAppSettingValue(sessionKey(route, trusted), sessionId);
+export function saveTopicExecutionSession(key: string, sessionId: string): void {
+  setAppSettingValue(key, sessionId);
 }
 export function topicExecutionPreviouslyDispatched(id: number): boolean {
   return Boolean(db.prepare("SELECT 1 FROM lark_topic_engine_runs WHERE lark_message_id=?").get(id));

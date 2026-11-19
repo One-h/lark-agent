@@ -857,14 +857,14 @@ export function createRuntime(config: RuntimeConfig) {
 if (process.argv[1]?.endsWith("index.ts")) {
   const port = Number(process.env.PORT ?? 4780);
   const executionEngines: ExecutionEngine[] = [];
-  const launcher = process.env.LARK_AGENT_CLAUDE_ACP_LAUNCHER;
-  const isolatedCwd = process.env.LARK_AGENT_CLAUDE_ACP_WORKSPACE;
-  if (launcher && isolatedCwd) {
+  // The old pilot launcher must never be promoted to native workspace access implicitly.
+  const launcher = process.env.LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER;
+  if (launcher) {
     try {
       const models = (process.env.LARK_AGENT_CLAUDE_ACP_MODELS ?? "").split(",").map(model => model.trim()).filter(Boolean);
-      executionEngines.push(createClaudeExecutionEngine({ launcher, cwd: isolatedCwd, models }));
+      executionEngines.push(createClaudeExecutionEngine({ launcher, models }));
     } catch {
-      console.warn("Claude topic engine is unavailable: check the isolated launcher and workspace settings");
+      console.warn("Claude topic engine is unavailable: check the native launcher");
     }
   }
   const runtime = createRuntime({ executionEngines, databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });

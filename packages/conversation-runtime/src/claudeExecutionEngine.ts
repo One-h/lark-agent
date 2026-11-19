@@ -3,7 +3,7 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, type LoadSessionResponse, type NewSessionResponse, type PromptResponse, type SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
-import type { ExecutionEngine, ExecutionEngineEvent } from "./executionEngines.js";
+import type { ExecutionEngine, ExecutionEngineEvent, LarkExecutionPolicy } from "./executionEngines.js";
 
 const promptText = (text: string) => [{ type: "text" as const, text }];
 
@@ -13,23 +13,37 @@ function supportsOwnedClaudeSteering(version: string | undefined): boolean {
   return Number(minor) > 81 || Number(minor) === 81 && Number(patch) >= 1;
 }
 
-export function createClaudeExecutionEngine(options: { launcher: string; cwd: string; models: string[] }): ExecutionEngine {
-  if (!path.isAbsolute(options.launcher) || !path.isAbsolute(options.cwd)) throw new Error("Claude launcher and workspace must be absolute paths");
+function supportsNativeClaudePolicy(policy: LarkExecutionPolicy): boolean {
+  // ACP tool permission callbacks do not enforce an OS read-only boundary.
+  return policy.trustScope === "trusted" && policy.sandbox === "danger-full-access" && policy.approvalPolicy === "never";
+}
+
+export function createClaudeExecutionEngine(options: { launcher: string; models: string[] }): ExecutionEngine {
+  if (!path.isAbsolute(options.launcher)) throw new Error("Claude launcher must be an absolute path");
   const launcher = realpathSync(options.launcher);
-  const cwd = realpathSync(options.cwd);
-  if (!statSync(launcher).isFile() || !statSync(cwd).isDirectory()) throw new Error("Invalid Claude launcher or workspace");
+  if (!statSync(launcher).isFile()) throw new Error("Invalid Claude launcher");
   accessSync(launcher, constants.X_OK);
   return {
     descriptor: { id: "claude", label: "Claude Code", models: [...new Set(options.models)] },
-    async open({ sessionId, model, signal }) {
+    supportsPolicy: supportsNativeClaudePolicy,
+    async open({ sessionId, model, policy, signal }) {
       signal.throwIfAborted();
-      // The operator-owned launcher supplies isolated storage, sandboxing, and Claude authentication.
-      const child = spawn(launcher, [], { cwd, env: { PATH: "/usr/bin:/bin" }, stdio: ["pipe", "pipe", "ignore"] });
+      if (!supportsNativeClaudePolicy(policy)) throw new Error("Claude cannot enforce this execution policy");
+      const { cwd } = policy;
+      if (!path.isAbsolute(cwd) || !statSync(cwd).isDirectory()) throw new Error("Invalid shared workspace");
+      const env = Object.fromEntries(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "CLAUDE_CONFIG_DIR"]
+        .flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
+      const child = spawn(launcher, [], { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
       let id = sessionId;
       let answer: string | null = null;
       let emit: ((event: ExecutionEngineEvent) => void) | undefined;
+      let turnPermissionSignal: AbortSignal | null = null;
       const connection = client()
-        .onRequest("session/request_permission", () => ({ outcome: { outcome: "cancelled" } }))
+        .onRequest("session/request_permission", ({ params, signal: requestSignal }) => {
+          const option = id && params.sessionId === id && turnPermissionSignal && !turnPermissionSignal.aborted && !requestSignal.aborted
+            ? params.options.find(candidate => candidate.kind === "allow_once") : undefined;
+          return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
+        })
         .onNotification("session/update", ({ params: { sessionId: updatedId, update } }) => {
           if (updatedId === id && answer !== null && update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
             answer = (answer + update.content.text).slice(0, 40_000);
@@ -40,6 +54,7 @@ export function createClaudeExecutionEngine(options: { launcher: string; cwd: st
           Readable.toWeb(child.stdout) as unknown as Parameters<typeof ndJsonStream>[1]));
       const peer = connection.agent;
       const close = () => {
+        turnPermissionSignal = null;
         connection.close();
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
       };
@@ -84,12 +99,13 @@ export function createClaudeExecutionEngine(options: { launcher: string; cwd: st
             turnSignal.addEventListener("abort", cancel, { once: true });
             answer = "";
             emit = onEvent;
+            turnPermissionSignal = turnSignal;
             try {
               const result = await peer.request<PromptResponse>("session/prompt", { sessionId: activeId, prompt: promptText(text) });
               if (result.stopReason === "cancelled") return { status: "cancelled" };
               if (result.stopReason !== "end_turn") throw new Error("Claude ACP turn did not finish normally");
               return { status: "completed", text: answer ?? "" };
-            } finally { turnSignal.removeEventListener("abort", cancel); answer = null; emit = undefined; }
+            } finally { turnPermissionSignal = null; turnSignal.removeEventListener("abort", cancel); answer = null; emit = undefined; }
           },
           ...(steering ? {
             async steer(text: string, steerSignal: AbortSignal) {

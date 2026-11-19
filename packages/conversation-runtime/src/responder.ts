@@ -23,8 +23,8 @@ import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { canReuseLarkTurnAutoApproval, finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled } from "./turnAutoApproval.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
-import type { ExecutionEngineSession, ExecutionTurnResult } from "./executionEngines.js";
-import { loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicExecutionForMessage, type StoredTopicExecutionRoute } from "./topicExecution.js";
+import { larkExecutionPolicy, type ExecutionEngineSession, type ExecutionTurnResult } from "./executionEngines.js";
+import { loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicEngineSessionKey, topicExecutionForMessage, type StoredTopicExecutionRoute } from "./topicExecution.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
@@ -805,12 +805,13 @@ ${latestMessage}`;
 }
 
 export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "new" | "resume" = "new", model = configuredLarkCodexModel()): Record<string, unknown> {
+  const { cwd, approvalPolicy, sandbox } = larkExecutionPolicy(config.workspaceRoot, trustedSender);
   return {
-    cwd: config.workspaceRoot,
+    cwd,
     model: model || null,
-    approvalPolicy: trustedSender ? "never" : "on-request",
+    approvalPolicy,
     approvalsReviewer: "user",
-    sandbox: trustedSender ? "danger-full-access" : "read-only",
+    sandbox,
     dynamicTools: larkHostDynamicTools(),
     config: {
       model_reasoning_effort: configuredLarkCodexReasoningEffort()
@@ -820,14 +821,15 @@ export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "n
 
 export function buildLarkCodexTurnParams(prepared: Pick<PreparedLarkCodexMessage, "input" | "messageId" | "trustedSender"> & Partial<Pick<PreparedLarkCodexMessage,"row">>, threadId: string, model = conversationCodexModelSettings(prepared.row?.chat_id).effectiveModel): Record<string, unknown> {
   const ownerAssist = prepared.row?.reply_trigger === "owner_mention";
+  const { cwd, approvalPolicy } = larkExecutionPolicy(config.workspaceRoot, prepared.trustedSender && !ownerAssist);
   return {
     threadId,
     input: prepared.input,
     clientUserMessageId: prepared.messageId,
-    cwd: config.workspaceRoot,
+    cwd,
     model: model || null,
     effort: configuredLarkCodexReasoningEffort(),
-    approvalPolicy: prepared.trustedSender && !ownerAssist ? "never" : "on-request",
+    approvalPolicy,
     ...(ownerAssist ? { sandboxPolicy: { type: "readOnly", networkAccess: false } } : {}),
     approvalsReviewer: "user"
   };
@@ -4186,7 +4188,12 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
   }
   const engine = resolveTopicExecutionEngine(route);
   if (!engine) throw new Error("Selected topic engine or model is unavailable");
-  const key = JSON.stringify([route.bindingId, trusted]);
+  const policy = larkExecutionPolicy(config.workspaceRoot, trusted);
+  if (!engine.supportsPolicy(policy)) {
+    finishExternalTopicMessage(message, "failed", "所选引擎目前不能执行你的权限规则，未启动任务。", "Selected engine cannot enforce the execution policy");
+    return;
+  }
+  const key = topicEngineSessionKey(route, policy);
   const active = externalTopicTurns.get(key);
   if (active?.accepting && !active.controller.signal.aborted && active.session.steer) {
     const running = active;
@@ -4212,14 +4219,14 @@ async function dispatchExternalTopicMessage(message: LarkMessageRow, route: Stor
   let session: ExecutionEngineSession | undefined;
   externalTopicStarts.set(controller, message);
   try {
-    session = await engine.open({ sessionId: loadTopicExecutionSession(route, trusted), model: route.model, signal: controller.signal });
+    session = await engine.open({ sessionId: loadTopicExecutionSession(key), model: route.model, policy, signal: controller.signal });
     controller.signal.throwIfAborted();
     if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
       session.close();
       finishExternalTopicMessage(message, "no_reply", "");
       return;
     }
-    saveTopicExecutionSession(route, trusted, session.id);
+    saveTopicExecutionSession(key, session.id);
     recordTopicExecution(message.id, route, session.id, progressId);
     updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso() });
   } catch (error) {

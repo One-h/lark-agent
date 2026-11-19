@@ -7,7 +7,7 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
-import { reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult } from "@lark-agent/conversation-runtime";
+import { larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
 async function until(check: () => boolean) {
   const deadline = performance.now() + 8000;
@@ -82,13 +82,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 const mention = [{ id: { open_id: "ou_bot" } }];
 
 test("topic engine routes are protected, isolated and persistent; live steering does not run a second prompt", async () => {
-  const opened: Array<{ sessionId: string | null; model: string | null }> = [];
+  const opened: Array<{ sessionId: string | null; model: string | null; policy: LarkExecutionPolicy }> = [];
   const prompts: string[] = [], steered: string[] = [];
   let complete: ((value: ExecutionTurnResult) => void) | undefined;
   const engine: ExecutionEngine = {
     descriptor: { id: "fixture", label: "Fixture", models: ["fixture-model", "fixture-next"] },
-    async open({ sessionId, model }) {
-      opened.push({ sessionId, model });
+    supportsPolicy: policy => policy.trustScope === "trusted",
+    async open({ sessionId, model, policy }) {
+      opened.push({ sessionId, model, policy });
       return {
         id: sessionId ?? `fixture-session-${opened.length}`,
         run(text, signal) {
@@ -106,10 +107,10 @@ test("topic engine routes are protected, isolated and persistent; live steering 
   const f = fixture([engine]);
   const progressDelay = config.larkCodexInterimReplyDelayMs;
   try {
-    const path = "/v1/chats/oc_fixture/topics/omt_fixture/execution";
+    const topicPath = "/v1/chats/oc_fixture/topics/omt_fixture/execution";
     const headers = { authorization: "Bearer fixture-token" };
-    const select = (model: string) => f.runtime().app.inject({ method: "PUT", url: path, headers, payload: { override: { engineId: "fixture", model } } });
-    assert.equal((await f.runtime().app.inject({ url: path })).statusCode, 401);
+    const select = (model: string) => f.runtime().app.inject({ method: "PUT", url: topicPath, headers, payload: { override: { engineId: "fixture", model } } });
+    assert.equal((await f.runtime().app.inject({ url: topicPath })).statusCode, 401);
     const before = await f.message({ content: "private history not sent to the new engine" });
     assert.equal((await select("not-registered")).statusCode, 409);
     assert.equal((await select("fixture-model")).statusCode, 200);
@@ -119,6 +120,10 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     await outside.started(); await f.complete(outside.id);
     assert.deepEqual(opened, []);
     await f.settings({ topicNativeModeEnabled: true }); await topicCommand(f, "join");
+    const untrusted = await f.message({ sender_id: "ou_member", content: "must not reach the provider" });
+    await until(() => untrusted.row().codex_status === "failed");
+    assert.match(untrusted.row().codex_reply, /未启动任务/);
+    assert.deepEqual(opened, []);
     config.larkCodexInterimReplyDelayMs = 0;
     await f.settings({ interimRepliesEnabled: true });
     const first = await f.message({ content: "start external turn" });
@@ -141,12 +146,21 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     assert.equal((await select("fixture-next")).statusCode, 200);
     const next = await f.message({ content: "continue after restart" });
     await until(() => prompts.length === 2);
-    assert.deepEqual(opened, [{ sessionId: null, model: "fixture-model" }, { sessionId: "fixture-session-1", model: "fixture-next" }]);
-    const cancellation = await f.runtime().app.inject({ method: "POST", url: `${path}/cancel`, headers });
+    const policy = larkExecutionPolicy(f.root, true);
+    assert.deepEqual(opened, [{ sessionId: null, model: "fixture-model", policy }, { sessionId: "fixture-session-1", model: "fixture-next", policy }]);
+    const cancellation = await f.runtime().app.inject({ method: "POST", url: `${topicPath}/cancel`, headers });
     assert.deepEqual(cancellation.json(), { requested: 1 });
     await until(() => next.row().codex_status === "failed");
     assert.match(next.row().codex_reply, /已确认取消/);
-    const cleared = await f.runtime().app.inject({ method: "PUT", url: path, headers, payload: { override: null } });
+    const moved = path.join(f.root, "new-workspace");
+    fs.mkdirSync(moved);
+    assert.equal((await f.settings({ workspaceRoot: moved })).statusCode, 200);
+    const afterMove = await f.message({ content: "continue in the newly configured directory" });
+    await until(() => prompts.length === 3);
+    assert.deepEqual(opened.at(-1), { sessionId: null, model: "fixture-next", policy: larkExecutionPolicy(moved, true) });
+    complete!({ status: "completed", text: "new workspace final" });
+    await until(() => afterMove.row().codex_status === "answered");
+    const cleared = await f.runtime().app.inject({ method: "PUT", url: topicPath, headers, payload: { override: null } });
     assert.equal(cleared.json().effective.engineId, "codex");
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${next.row().id}/retry`, headers })).statusCode, 409);
   } finally { config.larkCodexInterimReplyDelayMs = progressDelay; await f.close(); }

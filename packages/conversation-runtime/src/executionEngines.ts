@@ -1,5 +1,16 @@
 export type ExecutionEngineRoute = { engineId: string; model: string | null };
 
+export type LarkExecutionPolicy = { cwd: string } & (
+  | { trustScope: "trusted"; sandbox: "danger-full-access"; approvalPolicy: "never" }
+  | { trustScope: "untrusted"; sandbox: "read-only"; approvalPolicy: "on-request" }
+);
+
+export function larkExecutionPolicy(cwd: string, trustedSender: boolean): LarkExecutionPolicy {
+  return trustedSender
+    ? { cwd, trustScope: "trusted", sandbox: "danger-full-access", approvalPolicy: "never" }
+    : { cwd, trustScope: "untrusted", sandbox: "read-only", approvalPolicy: "on-request" };
+}
+
 export type ExecutionEngineDescriptor = {
   id: string;
   label: string;
@@ -21,7 +32,8 @@ export interface ExecutionEngineSession {
 
 export interface ExecutionEngine {
   readonly descriptor: ExecutionEngineDescriptor;
-  open(input: { sessionId: string | null; model: string | null; signal: AbortSignal }): Promise<ExecutionEngineSession>;
+  supportsPolicy(policy: LarkExecutionPolicy): boolean;
+  open(input: { sessionId: string | null; model: string | null; policy: LarkExecutionPolicy; signal: AbortSignal }): Promise<ExecutionEngineSession>;
 }
 
 export class ExecutionEngineRegistry {
