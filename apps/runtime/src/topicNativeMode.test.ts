@@ -9,6 +9,14 @@ import { codexAppServer } from "../../../packages/conversation-runtime/src/codex
 import { createRuntime, type RuntimeConfig } from "./index.js";
 import { configuredNativeAcpEngines, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
+const originalCodexExecutable = process.env.CODEX_EXECUTABLE;
+// Each fixture installs its own peer. No late callback should start the real CLI.
+test.before(() => { process.env.CODEX_EXECUTABLE = process.execPath; });
+test.after(() => {
+  if (originalCodexExecutable === undefined) delete process.env.CODEX_EXECUTABLE;
+  else process.env.CODEX_EXECUTABLE = originalCodexExecutable;
+});
+
 async function until(check: () => boolean, timeoutMs = 8000) {
   const deadline = performance.now() + timeoutMs;
   while (!check()) { assert(performance.now() < deadline, "topic fixture timed out"); await immediate(); }
