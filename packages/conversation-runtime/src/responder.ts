@@ -1111,6 +1111,11 @@ export function publishApprovedOwnerAssistDraft(source: LarkMessageRow, text: st
   queueLarkTextReply(source, formatLarkFinalReply(source, text), key);
 }
 
+export function replyToNativeTopicCommand(source: LarkMessageRow, text: string): void {
+  if (source.reply_trigger !== "topic_command" || !source.message_id) return;
+  queueLarkTextReply(source, text, larkReplyIdempotencyKey("topiccommand", source.message_id));
+}
+
 function queueLarkMediaFailureNotice(messageId: number, platformMessageId: string, turnId: string | undefined, seed: string): void {
   const now = nowIso();
   db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'media-notice',?,?,?,?)")
@@ -1807,7 +1812,7 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
         codex_started_at = NULL,
         codex_finished_at = NULL
     WHERE id = ?
-      AND ((mentioned = 1 AND reply_trigger NOT IN ('owner_mention','topic')) OR (reply_trigger='topic' AND ?=1) OR (reply_trigger='owner_mention' AND chat_type='group' AND ?=1) OR (
+      AND ((mentioned = 1 AND reply_trigger NOT IN ('owner_mention','topic','topic_command')) OR (reply_trigger='topic' AND ?=1) OR (reply_trigger='owner_mention' AND chat_type='group' AND ?=1) OR (
         reply_trigger = 'spontaneous'
         AND chat_type = 'group' AND sender_type = 'user' AND message_type = 'text'
         AND length(trim(content)) > 0

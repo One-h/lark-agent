@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
-import { config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
+import { claimLarkCodexReply, config, isNativeTopicConversation, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
 
@@ -78,22 +78,39 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 }
 const mention = [{ id: { open_id: "ou_bot" } }];
 
-test("default off retains mention-only topic behavior; enabling does not enroll historical threads", async () => {
+async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "leave", extra: Record<string, unknown> = {}) {
+  const m = await f.message({ mentions: mention, content: `@_user_1 /topic ${command}`, ...extra });
+  assert.equal(m.row().reply_trigger, "topic_command");
+  assert.equal(m.row().codex_status, "skipped");
+  assert.equal(m.row().reply_status, "sent");
+  assert.match(m.row().reply_delivery_text, command === "join" ? /已开启本话题续聊/ : /已退出本话题续聊/);
+  return m;
+}
+
+test("off retains ordinary mentions; turning on does not enroll historical or newly mentioned topics", async () => {
   const f = fixture(); try {
     assert.equal((await f.runtime().app.inject({ url: "/v1/settings" })).json().topicNativeModeEnabled, false);
+    const disabled = await f.message({ mentions: mention, content: "/topic join" });
+    assert.match(disabled.row().reply_delivery_text, /全局关闭/);
+    assert.equal(disabled.row().codex_status, "skipped");
     const skipped = await f.message(); assert.equal(skipped.row().codex_status, "skipped");
     const first = await f.message({ mentions: mention }); await first.started(); await f.complete(first.id);
     assert.equal((await f.message()).row().codex_status, "skipped");
     assert.equal((await f.settings({ topicNativeModeEnabled: true })).statusCode, 200);
     assert.equal((await f.message()).row().codex_status, "skipped");
-    assert.equal(f.calls().filter(c => c.method === "turn/start").length, 1);
+    const ordinary = await f.message({ mentions: mention }); await ordinary.started(); await f.complete(ordinary.id);
+    assert.equal(ordinary.row().reply_trigger, "mention");
+    assert.equal((await f.message()).row().codex_status, "skipped");
+    assert.equal(f.calls().filter(c => c.method === "turn/start").length, 2);
   } finally { await f.close(); }
 });
 
 test("enrolled topic resumes native thread with compact deltas, citations, attachments and no echoed native answers", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const first = await f.message({ mentions: mention, content: "investigate the fixture" }); await first.started(); await f.complete(first.id, "previous native answer");
+    await topicCommand(f, "join");
+    assert.equal(f.calls().length, 0);
+    const first = await f.message({ content: "investigate the fixture" }); await first.started(); await f.complete(first.id, "previous native answer");
     recordOutboundLarkMessage({ messageId: "om_delivery_notice", chatId: "oc_fixture", chatType: "group", recipientId: "ou_owner",
       content: "附件未能送达，请重试。", replyToMessageId: first.id, source: "reply" });
     const next = await f.message({ content: "what is the next step?", reply_to: first.id }); await next.started();
@@ -118,10 +135,11 @@ test("enrolled topic resumes native thread with compact deltas, citations, attac
   } finally { await f.close(); }
 });
 
-test("native topic enrollment survives restart but off/on requires a new mention and never replays old input", async () => {
+test("explicit enrollment survives restart but off/on requires a new join and never replays old input", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const first = await f.message({ mentions: mention }); await first.started(); await f.complete(first.id);
+    await topicCommand(f, "join");
+    const first = await f.message(); await first.started(); await f.complete(first.id);
     await f.restart(); assert(isNativeTopicConversation(first.row()));
     const next = await f.message(); await next.started(); await f.complete(next.id);
     await f.settings({ topicNativeModeEnabled: false });
@@ -131,7 +149,7 @@ test("native topic enrollment survives restart but off/on requires a new mention
     assert.equal((await f.message()).row().codex_status, "skipped");
     await f.settings({ topicNativeModeEnabled: true });
     assert.equal((await f.message()).row().codex_status, "skipped");
-    const rejoin = await f.message({ mentions: mention }); await rejoin.started(); await f.complete(rejoin.id);
+    await topicCommand(f, "join");
     const resumed = await f.message(); await resumed.started(); await f.complete(resumed.id);
     assert.equal(resumed.row().codex_session_id, first.row().codex_session_id);
   } finally { await f.close(); }
@@ -140,7 +158,8 @@ test("native topic enrollment survives restart but off/on requires a new mention
 test("compact topic turns refresh persona, approval and media guidance after changes and native compaction", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const first = await f.message({ mentions: mention, sender_id: "ou_member" }); await first.started(); await f.complete(first.id);
+    await topicCommand(f, "join", { sender_id: "ou_member" });
+    const first = await f.message({ sender_id: "ou_member" }); await first.started(); await f.complete(first.id);
     saveConversationPersona("oc_fixture", { mode: "custom", name: "Fixture", instructions: "Use the updated fixture persona." });
     await f.settings({ stickerUsageMode: "always" });
     const next = await f.message({ sender_id: "ou_member" }); await next.started();
@@ -156,37 +175,43 @@ test("compact topic turns refresh persona, approval and media guidance after cha
   } finally { await f.close(); }
 });
 
-test("root mention enrolls a later native topic; leave is local, idempotent and preserves history", async () => {
+test("legacy enrollment is ignored; commands are scoped and redelivery does not change state", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const root = await f.message({ root_id: null, thread_id: null, mentions: mention }); await root.started(); await f.complete(root.id);
-    const child = await f.message({ root_id: root.id }); await child.started(); await f.complete(child.id);
-    assert.notEqual(child.row().codex_session_id, root.row().codex_session_id);
-    const leave = await f.message({ root_id: root.id, mentions: mention, content: "@_user_1 /topic leave" });
-    assert.equal(leave.row().codex_status, "skipped");
-    assert.equal((await f.message({ root_id: root.id })).row().codex_status, "skipped");
-    await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: root.event });
-    assert.equal((await f.message({ root_id: root.id })).row().codex_status, "skipped");
-    assert.equal(root.row().codex_status, "answered"); assert.equal(child.row().codex_status, "answered");
-    const rejoin = await f.message({ root_id: root.id, mentions: mention }); await rejoin.started(); await f.complete(rejoin.id);
-    assert.equal(rejoin.row().codex_session_id, child.row().codex_session_id);
-    await f.message({ root_id: root.id, mentions: mention, content: "/topic leave" });
-    const rootRejoin = await f.message({ root_id: root.id, thread_id: null, mentions: mention }); await rootRejoin.started(); await f.complete(rootRejoin.id);
-    const afterLeave = await f.message({ root_id: root.id }); await afterLeave.started(); await f.complete(afterLeave.id);
-    await f.settings({ topicNativeModeEnabled: false }); await f.settings({ topicNativeModeEnabled: true });
-    const newRoot = await f.message({ root_id: root.id, thread_id: null, mentions: mention }); await newRoot.started(); await f.complete(newRoot.id);
-    const afterToggle = await f.message({ root_id: root.id }); await afterToggle.started(); await f.complete(afterToggle.id);
-    assert.equal(afterToggle.row().codex_session_id, child.row().codex_session_id);
+    const epoch = f.runtime().store.setting("topicNativeModeEpoch", "");
+    assert(epoch);
+    const legacy = JSON.stringify({ epoch, enabled: true, revision: 1 });
+    setAppSettingValue('topicNativeEnrollment:["oc_fixture","thread","omt_fixture"]', legacy);
+    setAppSettingValue('topicNativeEnrollment:["oc_fixture","root","om_root"]', legacy);
+    const outside = await f.message({ thread_id: null, root_id: null, mentions: mention, content: "/topic join" });
+    assert.match(outside.row().reply_delivery_text, /请在飞书话题内使用/);
+    assert.equal((await f.message()).row().codex_status, "skipped");
+    assert.equal((await f.message({ content: "/topic join" })).row().codex_status, "skipped");
+    const join = await topicCommand(f, "join");
+    assert.equal(claimLarkCodexReply(join.row().id), false);
+    assert.equal((await f.message({ thread_id: "omt_other" })).row().codex_status, "skipped");
+    const first = await f.message(); await first.started(); await f.complete(first.id);
+    const leave = await topicCommand(f, "leave");
+    await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: join.event });
+    assert.equal((await f.message()).row().codex_status, "skipped");
+    const ordinary = await f.message({ mentions: mention }); await ordinary.started(); await f.complete(ordinary.id);
+    assert.equal((await f.message()).row().codex_status, "skipped");
+    await topicCommand(f, "join", { content: '<at user_id="ou_bot">Bot</at> /topic join' });
+    await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: leave.event });
+    const resumed = await f.message(); await resumed.started(); await f.complete(resumed.id);
+    assert.equal(resumed.row().codex_session_id, first.row().codex_session_id);
+    assert.equal(f.runtime().store.db.prepare("SELECT COUNT(*) FROM lark_messages WHERE direction='outbound' AND reply_to_message_id=?").pluck().get(join.id), 1);
   } finally { await f.close(); }
 });
 
-test("disabling mode while native lookup is in flight skips an unaccepted automatic follow-up", async () => {
+test("leaving while native lookup is in flight skips an unaccepted automatic follow-up", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const first = await f.message({ mentions: mention }); await first.started(); await f.complete(first.id);
+    await topicCommand(f, "join");
+    const first = await f.message(); await first.started(); await f.complete(first.id);
     f.holdLookup(); const previous = f.calls().filter(c => c.method === "thread/loaded/list").length;
     const next = await f.message(); await until(() => f.calls().filter(c => c.method === "thread/loaded/list").length > previous);
-    await f.settings({ topicNativeModeEnabled: false }); await f.releaseLookup();
+    await topicCommand(f, "leave"); await f.releaseLookup();
     await until(() => next.row().codex_status === "skipped");
     assert.equal(next.row().reply_status, "skipped");
     assert.equal(f.calls().filter(c => c.method === "turn/start").length, 1);
@@ -196,7 +221,8 @@ test("disabling mode while native lookup is in flight skips an unaccepted automa
 test("topic continuation preserves trust separation, bot exclusion, unrelated topics, privacy and owner-assist routing", async () => {
   const f = fixture(); try {
     await f.settings({ topicNativeModeEnabled: true });
-    const first = await f.message({ mentions: mention }); await first.started(); await f.complete(first.id);
+    await topicCommand(f, "join");
+    const first = await f.message(); await first.started(); await f.complete(first.id);
     for (const extra of [{ thread_id: "omt_other", root_id: "om_other" }, { thread_id: null, root_id: null }, { chat_id: "oc_other" }, { sender_type: "bot", sender_id: "ou_bot" }]) {
       assert.equal((await f.message(extra)).row().codex_status, "skipped");
     }

@@ -2,11 +2,11 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { defaultLarkAcknowledgeReactionEmoji, isLarkReactionEmojiType, larkReactionEmojiTypes } from "@lark-agent/adapter-lark-cli";
 import { config, db, getAppSettings, larkReactionSender, nowIso, type LarkMessageRow } from "./context.js";
 import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
-import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply } from "./responder.js";
+import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply, replyToNativeTopicCommand } from "./responder.js";
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { imageKeysFromContent } from "./mediaImages.js";
-import { enrollNativeTopic, isNativeTopicConversation, isTopicLeaveCommand, topicNativeModeEnabled } from "./topicNativeMode.js";
+import { isNativeTopicConversation, parseNativeTopicCommand, setNativeTopicEnrollment, topicNativeModeEnabled } from "./topicNativeMode.js";
 
 const messageConsumeCommand = "tail -f /dev/null | lark-cli event consume im.message.receive_v1 --as bot";
 const approvalConsumeCommand = "tail -f /dev/null | lark-cli event consume card.action.trigger --as bot";
@@ -277,7 +277,8 @@ function resolveReplyContext(messageId: string | null, eventReplyToId: string | 
 function persistLarkEvent(event: LarkEvent): void {
   const eventId = stringValue(event.event_id);
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
-  if (messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger === "topic") return;
+  const existingTrigger = messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger;
+  if (existingTrigger === "topic" || existingTrigger === "topic_command") return;
   const fromBot = event.sender_type === "bot";
   const botOpenId = fromBot ? resolveCurrentBotOpenId() : undefined;
   const directlyMentioned = fromBot
@@ -290,16 +291,17 @@ function persistLarkEvent(event: LarkEvent): void {
   const ownerMentioned = isOwnerMentionAssistMessage(event);
   const topicMessage = { chat_id: chatId, chat_type: stringValue(event.chat_type), message_id: messageId,
     root_message_id: rootMessageId, thread_id: threadId, sender_type: stringValue(event.sender_type) };
-  const leaveTopic = topicNativeModeEnabled() && !config.groupPrivacyEnforced && directlyMentioned && !ownerMentioned && event.sender_type === "user"
-    && event.chat_type === "group" && Boolean(threadId) && isTopicLeaveCommand(event.content);
+  const topicCommand = !config.groupPrivacyEnforced && directlyMentioned && !ownerMentioned
+    && event.sender_type === "user" && event.chat_type === "group" && event.message_type === "text"
+    ? parseNativeTopicCommand(event.content) : null;
   const topicContinuation = !ownerMentioned && !directlyMentioned && isNativeTopicConversation(topicMessage);
   const spontaneous = !ownerMentioned && !topicContinuation && shouldStartSpontaneousLarkReply(event, directlyMentioned, hasRecentHandledLarkMessage(chatId));
   const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
     ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
     : resolveReplyContext(messageId, stringValue(event.reply_to));
   const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation }) ?? false;
-  const shouldRespond = !externallyRouted && !leaveTopic && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
-  const replyTrigger = leaveTopic ? "none" : ownerMentioned ? "owner_mention" : topicContinuation ? "topic" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
+  const shouldRespond = !externallyRouted && !topicCommand && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
+  const replyTrigger = topicCommand ? "topic_command" : ownerMentioned ? "owner_mention" : topicContinuation ? "topic" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));
   let replyStatus = shouldRespond ? "pending" : "skipped";
   let replyError: string | null = null;
@@ -404,8 +406,20 @@ function persistLarkEvent(event: LarkEvent): void {
   }
   if (insert.changes > 0 && messageId) {
     const persisted = db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(messageId) as LarkMessageRow;
-    if (!externallyRouted && config.runtimeMode === "active" && event.sender_type === "user" && getAppSettings().larkCodexRepliesEnabled && !ownerMentioned
-      && (directlyMentioned || topicContinuation)) enrollNativeTopic(persisted, leaveTopic);
+    if (topicCommand) {
+      if (!externallyRouted && config.runtimeMode === "active" && getAppSettings().larkCodexRepliesEnabled) {
+        if (!topicNativeModeEnabled()) {
+          replyToNativeTopicCommand(persisted, "话题原生会话模式已全局关闭。");
+        } else if (!setNativeTopicEnrollment(persisted, topicCommand)) {
+          replyToNativeTopicCommand(persisted, "请在飞书话题内使用 /topic join 或 /topic leave。");
+        } else {
+          replyToNativeTopicCommand(persisted, topicCommand === "join"
+            ? "已开启本话题续聊，后续消息无需再次 @ 我。退出请 @ 我并发送 /topic leave。"
+            : "已退出本话题续聊。需要我回答时，请再次 @ 我。");
+        }
+      }
+      return;
+    }
     if (shouldRespond && ownerMentioned) ensureOwnerMentionAssist(persisted);
     observeOwnerAssistContext(persisted);
     appendOwnerAssistContext(persisted);
