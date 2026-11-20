@@ -38,7 +38,7 @@ import { topicNativeModeEnabled, resetTopicNativeEnrollmentEpoch } from "@lark-a
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
 import { applyPlanAuthorization, approvalPlanSummary, currentApprovalPlan, currentApprovalPlanGrant,
   planCoversOperation, type ApprovalPlan, type TurnApprovalInput } from "@lark-agent/conversation-runtime";
-import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, waitForTurnAuthorization, wholeTaskApprovalCapabilityId } from "@lark-agent/conversation-runtime";
+import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, requiresManualTurnApproval, waitForTurnAuthorization, wholeTaskApprovalCapabilityId } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
@@ -46,6 +46,7 @@ type StoredCapability = { id: string; title: string; description: string; input_
 type PendingApproval = { resolve: (approved: boolean) => void; timer: NodeJS.Timeout; cleanup: () => void; stillCurrent?: () => boolean; wholeTask?: boolean;
   plan?: ApprovalPlan; requiresPlan: boolean; planInput: TurnApprovalInput; planApplied: (plan: ApprovalPlan, approver: string) => void };
 type MessageCursor = { messageAt: string; id: number };
+type WholeTaskDecision = { approved: false } | { approved: true; source: "manual" | "automatic"; reviewId?: number };
 
 const messageSelectColumns = `
   lark_messages.*, sender_contacts.name AS sender_name,
@@ -177,8 +178,8 @@ export function createRuntime(config: RuntimeConfig) {
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
-  const wholeTasks = new Map<string, { identity: string; allows: ReturnType<typeof wholeTurnScope>;
-    decision: Promise<{ approved: boolean; reviewId?: number }> }>();
+  const wholeTasks = new Map<string, { identity: string; readOnlyTask: boolean; allows: ReturnType<typeof wholeTurnScope>;
+    decision: Promise<WholeTaskDecision> }>();
   const authorizations = new Set<{ turnId: string; messageId: number; controller: AbortController; started: boolean }>();
   const removeOwnerContextListener = onOwnerAssistContextChanged(messageId => {
     cancelOwnerAssistPendingApprovals(messageId);
@@ -255,7 +256,9 @@ export function createRuntime(config: RuntimeConfig) {
       const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation),
         taskPlan: shownPlan ? approvalPlanSummary(shownPlan) : undefined, wholeTask: planInput.wholeTask,
         allowPlanApproval: planInput.wholeTask ? true : plan ? planCoversOperation(plan, planInput) : requiresPlan ? false : undefined,
-        reason: planInput.readOnlyWholeTask ? "仅授权本轮限定只读查询，不含写入或部署。" : "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
+        reason: planInput.readOnlyWholeTask ? "仅授权本轮限定只读查询，不含写入或部署。" :
+          planInput.wholeTask ? "人工允许后，当前轮不按原计划逐项复审；既有权限和安全限制仍有效。" :
+            "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
       if (card.ok && card.messageId) store.setApprovalCardMessage(approvalId, card.messageId);
       else settleApproval(approvalId, "failed", "once", "审批卡未取得发送回执，操作未执行。");
     } catch { settleApproval(approvalId, "failed", "once", "审批卡发送失败，操作未执行。"); }
@@ -272,41 +275,45 @@ export function createRuntime(config: RuntimeConfig) {
     if (!state) {
       const plan = currentApprovalPlan(store.db, input);
       const task = approvalTask(input.originalMessage, configuredTurnAutoApprovalDataSources(store.db));
-      const readOnlyTask = input.readOnlyWholeTask || task?.type === "deployment_query" || task?.type === "data_query";
+      const readOnlyTask = input.readOnlyWholeTask === true || task?.type === "deployment_query" || task?.type === "data_query";
       const allows = wholeTurnScope(input, plan, readOnlyTask);
       if (!allows(input)) throw new Error("操作超出本轮任务授权范围，请在新一轮说明变更。");
       const reviewed = { ...input, wholeTask: true };
       const stillCurrent = () => store.db.open && approverId === approver
         && store.setting("turnAutoApprovalEnabled", "false") === "true" && !options.signal.aborted && (options.stillCurrent?.() ?? true)
         && currentApprovalPlan(store.db, input) === plan;
-      const decision = Promise.resolve().then(async () => {
+      const decision = Promise.resolve().then(async (): Promise<WholeTaskDecision> => {
         if (!stillCurrent()) return { approved: false };
         if (options.allowModelReview) {
           const result = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(reviewed), options.signal);
           options.assertActive();
           if (!stillCurrent()) return { approved: false };
-          if (result.approved && result.scope === "turn") return { approved: true, reviewId: result.reviewId };
+          if (result.approved && result.scope === "turn") return { approved: true, source: "automatic", reviewId: result.reviewId };
         }
         const approved = await awaitApproval({ messageId: input.messageId, turnId: input.turnId, operation: options.display, capabilityId: wholeTaskApprovalCapabilityId },
           options.signal, reviewed, () => {}, stillCurrent);
-        return { approved };
+        return approved ? { approved: true, source: "manual" } : { approved: false };
       });
       // All callers share the first decision, including a rejection or expiry.
       void decision.catch(() => {});
-      state = { identity, allows, decision };
+      state = { identity, allows, decision, readOnlyTask };
       wholeTasks.set(input.turnId, state);
     }
-    if (state.identity !== identity || !state.allows(input)) throw new Error("操作超出本轮任务授权范围，请在新一轮说明变更。");
+    if (state.identity !== identity) throw new Error("本轮请求身份已变化，请在新一轮重新授权。");
     const result = await waitForTurnAuthorization(state.decision, options.signal);
     const validate = () => {
       options.assertActive();
       if (wholeTasks.get(input.turnId) !== state || approver !== approverId
         || store.setting("turnAutoApprovalEnabled", "false") !== "true" || !result.approved)
         throw new Error("本轮任务未获授权或授权已失效。");
+      const manual = result.source === "manual" && (!state.readOnlyTask || !requiresManualTurnApproval(input));
+      if (!state.allows(input, manual))
+        throw new Error("操作超出本轮任务授权范围，请在新一轮说明变更。");
     };
     validate();
-    return { reviewId: result.reviewId, validate, markApplied: () => {
-      if (result.reviewId !== undefined) markTurnAutoApprovalApplied(result.reviewId);
+    const reviewId = result.approved ? result.reviewId : undefined;
+    return { reviewId, validate, markApplied: () => {
+      if (reviewId !== undefined) markTurnAutoApprovalApplied(reviewId);
     } };
   };
   const removeWholeTurnHandler = config.wholeTaskAutoApproval === false ? () => {} : setWholeTurnNativeApprovalHandler(async (input, signal, stillCurrent) => {

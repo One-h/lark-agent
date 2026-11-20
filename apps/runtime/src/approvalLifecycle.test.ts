@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import Fastify from "fastify";
 import { createRuntime, capabilityApprovalAction, type RuntimeConfig } from "./index.js";
-import { config, enqueueLarkCodexReply, notifyLarkTurnEnded, postHostJson, decideLarkExecutionApprovalFromCard } from "@lark-agent/conversation-runtime";
+import { config, declareApprovalPlan, enqueueLarkCodexReply, notifyLarkTurnEnded, postHostJson, decideLarkExecutionApprovalFromCard } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { buildLarkExecutionApprovalCard, buildLarkExecutionApprovalResultCard, formatCapabilityApprovalOperation, type CapabilityApprovalCardInput } from "@lark-agent/adapter-lark-cli";
 
@@ -193,13 +193,14 @@ test("graceful shutdown waits for an already authorized operation instead of los
   } finally { release?.(); await f.close(); }
 });
 
-async function nativeFixture(order: "host-first" | "command-first") {
-  const f = await fixture(undefined, true);
+async function nativeFixture(order: "host-first" | "command-first" | "query", reviewer?: RuntimeConfig["turnApprovalReviewer"]) {
+  const f = await fixture(reviewer, true);
   const previousExecutable = process.env.CODEX_EXECUTABLE, previousPath = process.env.PATH;
   const executable = path.join(f.root, "codex.mjs");
+  const decisions = path.join(f.root, "query-decisions.jsonl");
   fs.writeFileSync(path.join(f.root, "lark-cli"), '#!/bin/sh\nprintf \'%s\\n\' \'{"data":{"message_id":"om_native"}}\'\n', { mode: 0o755 });
   fs.writeFileSync(executable, `#!${process.execPath}
-import readline from "node:readline";
+import readline from "node:readline"; import {appendFileSync} from "node:fs";
 const send=x=>process.stdout.write(JSON.stringify(x)+"\\n");
 let status="inProgress";
 const command=()=>send({id:"command-one",method:"item/commandExecution/requestApproval",params:{threadId:"thread-live",turnId:"turn-live",itemId:"cmd",command:"echo fixture",cwd:${JSON.stringify(f.root)}}});
@@ -207,21 +208,69 @@ const host=()=>send({id:"host-one",method:"item/tool/call",params:{threadId:"thr
 const finish=value=>{status=value;if(status==="completed")send({method:"item/completed",params:{threadId:"thread-live",turnId:"turn-live",item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture done"}}});send({method:"turn/completed",params:{threadId:"thread-live",turn:{id:"turn-live",status}}});};
 readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.parse(line);
 if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"thread-live"}}});
-else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"turn-live",status:"inProgress"}}});setTimeout(()=>${order === "host-first" ? "host" : "command"}(),20);}
+else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"turn-live",status:"inProgress"}}});${order === "query" ? "" : `setTimeout(${order === "host-first" ? "host" : "command"},20);`}}
 else if(m.method==="turn/steer")send({id:m.id,result:{turnId:"turn-live"}});
 else if(m.method==="fixture/end"){send({id:m.id,result:{}});finish(m.params.status);}
 else if(m.method==="fixture/state-only"){status=m.params.status;send({id:m.id,result:{}});}
+else if(m.method==="fixture/query"){send({id:m.id,result:{}});send({id:m.params.id,method:"item/commandExecution/requestApproval",params:{threadId:"thread-live",turnId:"turn-live",itemId:m.params.id,command:m.params.command,cwd:${JSON.stringify(f.root)}}});}
 else if(m.method==="thread/read")send({id:m.id,result:{thread:{id:"thread-live",status:{type:status==="inProgress"?"active":"idle"}}}});
 else if(m.method==="thread/turns/list")send({id:m.id,result:{data:[{id:"turn-live",status}]}});
 else if(m.method)send({id:m.id,result:{}});
+else if(String(m.id).startsWith("query-"))appendFileSync(${JSON.stringify(decisions)},JSON.stringify({id:m.id,decision:m.result?.decision})+"\\n");
 else if(status==="inProgress"&&(m.result?.success===false||m.result?.decision==="decline"))finish("failed");
 else if(m.id==="host-one"&&status==="inProgress"){${order === "host-first" ? "command();" : 'finish("completed");'}}
 else if(m.id==="command-one"&&status==="inProgress"){${order === "command-first" ? "host();" : 'finish("completed");'}}
 });`);
   fs.chmodSync(executable, 0o755); process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${f.root}:${previousPath ?? ""}`;
-  f.seed("failed", ""); assert.equal(enqueueLarkCodexReply(1), true);
-  return { ...f, async close() { await f.close(); if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; } };
+  f.seed("failed", "");
+  if (order === "query") f.runtime.store.db.prepare("UPDATE lark_messages SET content='查询 fixture-db 的示例数据' WHERE id=1").run();
+  assert.equal(enqueueLarkCodexReply(1), true);
+  return { ...f, decisions, async close() { await f.close(); if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; } };
 }
+
+test("manual whole-turn approval accepts revised queries while automatic approval stays scoped", async () => {
+  for (const manual of [true, false]) {
+    let reviews = 0;
+    const f = await nativeFixture("query", async () => {
+      reviews++;
+      return { decision: manual ? "manual" : "approve_turn", reason: "fixture" };
+    });
+    try {
+      const { store } = f.runtime;
+      store.setSetting("turnAutoApprovalEnabled", "true");
+      store.setSetting("turnAutoApprovalDataSources", '["fixture-db"]');
+      await until(() => f.row().codex_status === "running" && f.row().codex_turn_id === "turn-live");
+      const identity = { messageId: 1, senderId: "ou_requester", turnId: "turn-live" };
+      const first = "python3 query-fixture.py first";
+      const revised = "python3 query-fixture.py revised";
+      const plan = (operation: string) => ({ goal: "查询", impact: "只读",
+        steps: [{ intent: "查询统计", effect: "read" as const, kind: "command" as const, operation, cwd: f.root }] });
+      const send = (id: string, command: string) => codexAppServer.request("fixture/query", { id, command });
+      const decision = (id: string) => fs.existsSync(f.decisions) ? fs.readFileSync(f.decisions, "utf8").trim().split("\n")
+        .map(line => JSON.parse(line)).find(item => item.id === id)?.decision : undefined;
+      declareApprovalPlan(store.db, identity, plan(first));
+      await send("query-first", first);
+      if (manual) {
+        await until(() => f.cards.length === 1);
+        assert.equal(decision("query-first"), undefined);
+        assert.equal((await f.decide(f.cards[0].approvalId, "approve")).statusCode, 409);
+        assert.equal((await f.decide(f.cards[0].approvalId, "approve-turn")).statusCode, 200);
+      }
+      await until(() => decision("query-first") === "accept");
+      declareApprovalPlan(store.db, identity, plan(revised));
+      await send("query-revised", revised);
+      await until(() => decision("query-revised") === (manual ? "accept" : "decline"));
+      await send("query-write", "mysql -e 'DELETE FROM fixture_rows'");
+      await until(() => decision("query-write") === "decline");
+      assert.equal(f.cards.length, manual ? 1 : 0);
+      assert.equal(reviews, 1);
+      await codexAppServer.request("fixture/end", { status: "completed" });
+      await until(() => f.row().codex_status === "answered");
+      await send("query-late", revised);
+      await until(() => decision("query-late") === "decline");
+    } finally { await f.close(); }
+  }
+});
 
 test("native terminal notification invalidates an outstanding host approval before any host write", async () => {
   for (const status of ["completed", "failed", "interrupted"]) {

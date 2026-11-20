@@ -138,18 +138,19 @@ export function wholeTurnPlanCovers(plan: ApprovalPlan, input: TurnApprovalInput
 
 /** An intent is not a permission to run unrecognized shell commands. The
  * precise declared steps remain usable if no semantic matcher is available. */
-export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, readOnlyTask = false): (candidate: TurnApprovalInput) => boolean {
+export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, readOnlyTask = false) {
   if (first.readOnlyWholeTask) plan = boundedReadApprovalPlan(plan);
   const initial = { operation: first.operation, cwd: first.cwd, kind: first.operationKind };
   const reads = [initial, ...(plan?.steps.filter(step => step.effect === "read") ?? [])]
     .flatMap(step => step.kind === "command" ? [{ key: readScope(step.operation, step.cwd, first.readOnlyWholeTask), cwd: step.cwd }] : [])
     .filter(step => step.key !== undefined);
-  return candidate => {
+  return (candidate: TurnApprovalInput, manual = false): boolean => {
     if (candidate.messageId !== first.messageId || candidate.senderId !== first.senderId || candidate.turnId !== first.turnId
       || candidate.originalMessage !== first.originalMessage || !candidate.operationKind) return false;
     if (first.readOnlyWholeTask && (!candidate.readOnlyWholeTask || !hasWholeTurnReadScope(candidate))) return false;
     if (readOnlyTask && (/forge\.deploy\.production:|--execute|\bargocd\b.*\bapp\s+sync\b|\bkubectl\b.*\b(?:apply|patch|delete|edit|scale|rollout\s+restart)\b/i.test(candidate.operation)
       || plan?.steps.some(step => step.effect === "remote-write" && planCoversOperation({ ...plan, steps: [step] }, candidate)))) return false;
+    if (manual && !first.readOnlyWholeTask && !candidate.readOnlyWholeTask) return true;
     if (candidate.operationKind === initial.kind && candidate.operation === initial.operation && candidate.cwd === initial.cwd) return true;
     if (plan && planCoversOperation(plan, candidate)) return true;
     if (candidate.operationKind !== "command") return false;
