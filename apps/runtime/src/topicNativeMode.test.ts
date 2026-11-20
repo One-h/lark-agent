@@ -303,6 +303,7 @@ async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "le
 }
 
 for (const provider of ["dsh", "claude", "opencode", "agy"] as const) test(`restricted ACP uses scoped Lark approval for ${provider}`, async () => {
+  const wholeTask = provider === "dsh";
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lark-acp-approval-"));
   const launch = path.join(dir, "restricted.mjs"), trusted = path.join(dir, "trusted.mjs");
   const gate = path.join(dir, "allow-fixture"), log = path.join(dir, "outcomes.jsonl");
@@ -351,7 +352,8 @@ createInterface({input:process.stdin}).on("line",l=>{
 });`, { mode: 0o700 });
   const engine = createNativeAcpExecutionEngine(provider, { launcher: trusted, restrictedLauncher: launch, models: [] });
   const cards: Array<{ approvalId: number; originalMessage: string; taskPlan?: string }> = [];
-  const f = fixture([engine], { approvalCardSender: (_who, card) => {
+  let reviews = 0;
+  const f = fixture([engine], { turnApprovalReviewer: async () => { reviews++; return { decision: "manual", reason: "Fixture task requires review" }; }, approvalCardSender: (_who, card) => {
     cards.push({ approvalId: card.approvalId, originalMessage: card.originalMessage ?? "", taskPlan: card.taskPlan });
     return { ok: true, messageId: `om_card_${card.approvalId}` };
   }, approvalCardUpdater: () => {} });
@@ -360,6 +362,7 @@ createInterface({input:process.stdin}).on("line",l=>{
   const readDecisions = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(l => JSON.parse(l)) : [];
   try {
     assert.throws(() => createNativeAcpExecutionEngine(provider, { launcher: trusted, restrictedLauncher: trusted, models: [] }), /distinct/);
+    if (wholeTask) await f.settings({ turnAutoApprovalEnabled: true });
     assert.equal((await f.message({ content: "observe fixture topic before selecting an engine" })).row().codex_status, "skipped");
     assert.equal((await f.runtime().app.inject({ method: "PUT", url: topic, headers, payload: { override: { engineId: provider, model: null } } })).statusCode, 200);
     const message = await f.message({ sender_id: "ou_member", content: "Create two sample files", mentions: mention });
@@ -374,13 +377,17 @@ createInterface({input:process.stdin}).on("line",l=>{
     assert.equal(cards[0].originalMessage, "Create two sample files");
     assert.match(cards[0].taskPlan ?? "", /Write second.txt/);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 200);
-    await until(() => cards.length === 2);
-    assert.deepEqual(readDecisions(), [{ step: 0, option: null }, { step: 1, option: "once" }, { step: 2, option: "once" }, { step: 3, option: null }]);
-    assert.equal(f.runtime().store.approval(cards[1].approvalId)?.operation, expected("late.txt"));
+    await until(() => wholeTask ? readDecisions().length === 5 : cards.length === 2);
+    const decisions = [{ step: 0, option: null }, { step: 1, option: "once" }, { step: 2, option: "once" }, { step: 3, option: null }];
+    assert.deepEqual(readDecisions(), wholeTask ? [...decisions, { step: 4, option: null }] : decisions);
+    if (wholeTask) { assert.equal(cards.length, 1); assert.equal(reviews, 1); }
+    else assert.equal(f.runtime().store.approval(cards[1].approvalId)?.operation, expected("late.txt"));
     assert.deepEqual((await f.runtime().app.inject({ method: "POST", url: topic+"/cancel", headers })).json(), { requested: 1 });
     await until(() => message.row().codex_status === "failed");
-    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[1].approvalId}/approve`, headers })).statusCode, 409);
-    assert.equal(f.runtime().store.approval(cards[1].approvalId)?.status, "failed");
+    if (!wholeTask) {
+      assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[1].approvalId}/approve`, headers })).statusCode, 409);
+      assert.equal(f.runtime().store.approval(cards[1].approvalId)?.status, "failed");
+    }
   } finally { await f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

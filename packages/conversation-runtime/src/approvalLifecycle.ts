@@ -24,6 +24,8 @@ export function notifyLarkTurnEnded(database: Database.Database, turnId: string)
   }
 }
 
+export const wholeTaskApprovalCapabilityId = "lark.internal.scoped-turn";
+
 export function hasLarkManualTurnApproval(database: Database.Database, input: {
   turnId: string; senderId: string | null; approverId: string | null | undefined; threadId?: string | null;
 }): boolean {
@@ -36,6 +38,6 @@ export function hasLarkManualTurnApproval(database: Database.Database, input: {
   return Boolean(database.prepare(`SELECT 1 FROM lark_capability_approvals a JOIN lark_messages m ON m.id=a.lark_message_id
     WHERE a.turn_id=? AND a.requester_id=? AND m.sender_id=a.requester_id AND a.thread_id IS ? AND m.codex_session_id IS a.thread_id
       AND a.approver_id=? AND a.approval_scope='turn'
-      AND a.status='approved' AND a.card_message_id IS NOT NULL LIMIT 1`)
-    .get(input.turnId, input.senderId, input.threadId ?? null, input.approverId));
+      AND a.capability_id IS NOT ? AND a.status='approved' AND a.card_message_id IS NOT NULL LIMIT 1`)
+    .get(input.turnId, input.senderId, input.threadId ?? null, input.approverId, wholeTaskApprovalCapabilityId));
 }

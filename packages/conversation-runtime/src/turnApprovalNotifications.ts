@@ -18,7 +18,7 @@ export function queueTurnAutoApprovalNotification(reviewId: number): void {
     FROM lark_turn_auto_reviews r LEFT JOIN lark_messages m ON m.id=r.lark_message_id
     LEFT JOIN lark_contacts c ON c.open_id=r.requester_id WHERE r.id=? AND r.decision='approved'
     AND r.applied_at IS NOT NULL AND r.source IN ('history','model')`).get(reviewId) as {
-      id:number;lark_message_id:number;requester_id:string;approver_id:string;source:"history"|"model";
+      id:number;turn_id:string;lark_message_id:number;requester_id:string;approver_id:string;source:"history"|"model";
       request:string|null;requester:string|null;reason:string;model:string|null;matched_approval_id:number|null;applied_at:string;
       approval_scope:"once"|"plan"|"turn";plan_summary:string|null;operation_intent:string|null;
     } | undefined;
@@ -29,7 +29,8 @@ export function queueTurnAutoApprovalNotification(reviewId: number): void {
     scope:row.approval_scope,taskPlan:row.plan_summary,currentOperationIntent:row.operation_intent } };
   const now = nowIso();
   db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox (lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'auto-approval',?,?,?,?)")
-    .run(row.lark_message_id,JSON.stringify(payload),larkReplyIdempotencyKey("autoapproval",`${row.id}:${row.approver_id}`),now,now);
+    .run(row.lark_message_id,JSON.stringify(payload),larkReplyIdempotencyKey("autoapproval",
+      `${row.approval_scope === "turn" ? `turn:${row.turn_id}` : row.id}:${row.approver_id}`),now,now);
 }
 
 export async function retryPendingAutoApprovalNotifications(limit = 10): Promise<number> {

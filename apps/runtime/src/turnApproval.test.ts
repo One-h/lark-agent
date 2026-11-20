@@ -12,7 +12,7 @@ test("deployment host capability can use automatic turn approval while unrelated
   const host=Fastify();let deployments=0;let reviews=0;const notifications:string[]=[];const cards:number[]=[];
   host.post("/api/lark-agent/capabilities/forge.deploy.production",async()=>({deployments:++deployments}));
   await host.listen({host:"127.0.0.1",port:0});const address=host.server.address();assert(address&&typeof address!=="string");
-  const runtime=createRuntime({databasePath:path.join(root,"test.sqlite"),mode:"shadow",trustedSenderIds:[],approverId:"ou_owner",runtimeToken:"secret",hostBaseUrl:`http://127.0.0.1:${address.port}`,
+  const runtime=createRuntime({wholeTaskAutoApproval:false,databasePath:path.join(root,"test.sqlite"),mode:"shadow",trustedSenderIds:[],approverId:"ou_owner",runtimeToken:"secret",hostBaseUrl:`http://127.0.0.1:${address.port}`,
     turnApprovalReviewer:async()=>{reviews++;return {decision:"approve_turn",reason:"范围明确的部署"};},
     autoApprovalNotificationSender:async recipient=>{notifications.push(recipient);return {ok:true,messageId:"om_notice",chatId:null,messageAt:null,messageType:"interactive"};},
     turnActivityProbe:async()=>true, approvalCardUpdater:()=>{}, approvalCardSender:(_recipient,card)=>{cards.push(card.approvalId);return {ok:true,messageId:"om_card"};}});
@@ -121,7 +121,7 @@ test("unplanned host operations require individual reviews, and external writes 
   host.post("/api/lark-agent/capabilities/forge.deploy", async () => ({ call: ++calls }));
   await host.listen({ host: "127.0.0.1", port: 0 });
   const address = host.server.address(); assert(address && typeof address !== "string");
-  const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "shadow", workspaceRoot: root,
+  const runtime = createRuntime({ wholeTaskAutoApproval: false, databasePath: path.join(root, "test.sqlite"), mode: "shadow", workspaceRoot: root,
     trustedSenderIds: [], approverId: "ou_owner", runtimeToken: "secret", hostBaseUrl: `http://127.0.0.1:${address.port}`,
     turnApprovalReviewer: async () => { reviews++; return { decision: "approve_turn", reason: "PR review only" }; },
     turnActivityProbe:async()=>true, approvalCardUpdater:()=>{}, approvalCardSender: (_recipient, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_card" }; }
@@ -177,4 +177,52 @@ test("failed model review returns to the existing human card and cannot execute 
     const audit = (await runtime.app.inject({ method: "GET", url: "/v1/approvals" })).json().autoReviews[0];
     assert.equal(audit.decision, "manual"); assert.equal(audit.applied_at, null); assert.match(audit.reason, /timeout/);
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("whole task host approval shares one review and notification across concurrent planned operations", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-host-whole-task-"));
+  const host = Fastify();
+  const effects: number[] = [];
+  host.post("/api/lark-agent/capabilities/demo.update", async request => {
+    effects.push((request.body as { input: { target: number } }).input.target);
+    return { ok: true };
+  });
+  const hostUrl = await host.listen({ host: "127.0.0.1", port: 0 });
+  let reviews = 0, cards = 0, notices = 0;
+  const runtime = createRuntime({ databasePath: path.join(root, "fixture.sqlite"), mode: "shadow", trustedSenderIds: [],
+    approverId: "ou_owner", runtimeToken: "fixture-token", workspaceRoot: root, hostBaseUrl: hostUrl, turnActivityProbe: async () => true,
+    turnApprovalReviewer: async input => {
+      assert.equal(input.wholeTask, true);
+      assert.equal(input.approvalPlan?.steps.length, 2);
+      reviews++; return { decision: "approve_turn", reason: "Approve both fixture updates" };
+    },
+    approvalCardSender: () => { cards++; return { ok: false, error: "No manual card expected" }; },
+    autoApprovalNotificationSender: async () => {
+      notices++; return { ok: true, messageId: "om_notice_fixture", chatId: null, messageAt: null, messageType: "interactive" };
+    }
+  });
+  const headers = { authorization: "Bearer fixture-token" };
+  const identity = { messageId: 1, turnId: "fixture-turn", senderId: "ou_sender" };
+  try {
+    const now = new Date().toISOString(), db = runtime.store.db;
+    const goal = "Update two local fixture entries";
+    db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (1,'oc_fixture','ou_sender',?,?,'running','{}',?,?)").run(goal, identity.turnId, now, now);
+    await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true } });
+    runtime.store.registerCapabilities([{ id: "demo.update", title: "Update fixture", description: "Fixture-only update", inputSchema: {}, risk: "local-write" }]);
+    const plan = parseApprovalPlan({ goal, impact: "Temporary local fixture only",
+      steps: [1, 2].map(target => ({ intent: `Update fixture ${target}`, effect: "local-write", kind: "capability", cwd: null,
+        operation: `demo.update: ${JSON.stringify({ target })}` })) });
+    assert(plan);
+    declareApprovalPlan(db, identity, plan);
+    const invoke = (target: number) => runtime.app.inject({ method: "POST", url: "/v1/capabilities/demo.update/invoke", headers,
+      payload: { input: { target }, context: { larkMessageId: 1, chatId: "oc_fixture", trustScope: "untrusted", turnId: identity.turnId } } });
+    const approved = await Promise.all([invoke(1), invoke(2)]);
+    assert.deepEqual(approved.map(r => r.statusCode), [200, 200]);
+    assert.equal((await invoke(3)).statusCode, 409);
+    assert.deepEqual(effects.sort(), [1, 2]);
+    assert.equal(reviews, 1);
+    assert.equal(cards, 0);
+    await retryPendingAutoApprovalNotifications();
+    assert.equal(notices, 1);
+  } finally { await runtime.app.close(); runtime.stop(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });

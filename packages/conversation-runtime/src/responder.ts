@@ -3327,12 +3327,21 @@ export function matchesLarkExecutionApprovalTurn(method: string, details: { thre
   return details.threadId === run.threadId && (method === "execCommandApproval" || method === "applyPatchApproval" || details.turnId === run.turnId);
 }
 
+type WholeTurnNativeAuthorizer = (input: TurnApprovalInput, signal: AbortSignal, stillCurrent: () => boolean) =>
+  Promise<{ reviewId?: number; validate(): void; markApplied(): void }>;
+let wholeTurnNativeAuthorizer: WholeTurnNativeAuthorizer | undefined;
+
+export function setWholeTurnNativeApprovalHandler(handler: WholeTurnNativeAuthorizer): () => void {
+  wholeTurnNativeAuthorizer = handler;
+  return () => { if (wholeTurnNativeAuthorizer === handler) wholeTurnNativeAuthorizer = undefined; };
+}
+
 function autoApproveTurnExecution(
   run: ActiveLarkCodexRun,
   request: CodexAppServerRequest,
   details: ApprovalRequestDetails,
   target: PreparedLarkCodexMessage,
-  scoped?: { scope: "once" | "plan"; reviewId?: number }
+  scoped?: { scope: "once" | "plan" | "turn"; reviewId?: number }
 ): boolean {
   if (!ownerAssistMayExecute(target.row.id)) {
     if (scoped?.scope === "plan") clearApprovalPlan(db, run.turnId);
@@ -3362,7 +3371,7 @@ function autoApproveTurnExecution(
     details.operation,
     details.cwd,
     details.reason,
-    scoped ? "once" : "turn",
+    scoped && scoped.scope !== "turn" ? "once" : "turn",
     decidedAt,
     decidedAt,
     decidedAt
@@ -3370,7 +3379,8 @@ function autoApproveTurnExecution(
   try {
     auditApprovalRequest(run, target, request, details, { source: scoped?.reviewId !== undefined ? "auto_review" : "manual",
       outcome: "approved", reasonCode: scoped?.scope === "once" ? "current_operation" : scoped?.scope === "plan" ? "task_plan_grant" : "current_turn_grant",
-      reason: scoped ? "实际操作已单独审核或匹配当前已批准任务计划。" : "复用审批人明确授予的当前 turn 授权。",
+      reason: scoped?.scope === "turn" ? "实际操作处于本轮已批准的任务范围内。" :
+        scoped ? "实际操作已单独审核或匹配当前已批准任务计划。" : "复用审批人明确授予的当前 turn 授权。",
       approvalId: Number(inserted.lastInsertRowid), reviewId: scoped?.reviewId });
     codexAppServer.respondToRequest(request.id, details.approvedResponse);
   } catch (error) {
@@ -3639,6 +3649,24 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     operationIntent: details.reason, cwd: details.cwd ?? config.workspaceRoot
   });
   const currentInput = approvalInput(target);
+  const wholeTask = wholeTurnNativeAuthorizer;
+  if (wholeTask && turnAutoApprovalEnabled() && target.row.reply_trigger !== "owner_mention") {
+    const approver = config.larkExecutionApproverId, threadId = run.threadId, turnId = run.turnId, sender = target.row.sender_id;
+    const controller = new AbortController();
+    run.hostToolCalls.add(controller);
+    const stillCurrent = () => !controller.signal.aborted && !run.settled && !run.authRecovering && run.pendingSteers === 0
+      && activeLarkCodexRuns.get(run.sessionKey) === run && run.turnId === turnId && run.threadId === threadId
+      && approvalRunMember(run).row.id === target.row.id && approvalRunMember(run).row.sender_id === sender
+      && config.larkExecutionApproverId === approver && ownerAssistMayExecute(target.row.id);
+    void wholeTask(currentInput, controller.signal, stillCurrent).then(approval => {
+      approval.validate();
+      if (autoApproveTurnExecution(run, request, details, target, { scope: "turn", reviewId: approval.reviewId })) approval.markApplied();
+    }).catch(() => {
+      if (!run.settled && run.turnId === turnId) declineExecutionApproval(run, target, request, details,
+        "whole_task_not_authorized", "本轮任务未获批准、操作超出本轮范围或授权已失效。");
+    }).finally(() => run.hostToolCalls.delete(controller));
+    return true;
+  }
   const requiresScopedApproval = turnAutoApprovalEnabled() || Boolean(currentApprovalPlan(db, currentInput));
   if (!requiresScopedApproval && hasLarkManualTurnApproval(db, { turnId: run.turnId, threadId: run.threadId,
     senderId: target.row.sender_id, approverId: config.larkExecutionApproverId })) {

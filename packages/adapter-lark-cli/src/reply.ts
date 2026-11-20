@@ -217,6 +217,7 @@ export type LarkExecutionApprovalDetails = {
   taskContext?: string;
   taskPlan?: string;
   allowPlanApproval?: boolean;
+  wholeTask?: boolean;
 };
 export type LarkExecutionApprovalCardInput = LarkExecutionApprovalDetails & (
   { approvalToken: string; approvalId?: never } | { approvalId: number; approvalToken?: never }
@@ -268,16 +269,16 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
       {
         tag: "action",
         actions: [
-          {
+          ...(input.wholeTask ? [] : [{
             tag: "button",
             type: "primary",
             text: { tag: "plain_text", content: "允许本次" },
             value: { action: "approve", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
-          },
+          }]),
           ...(input.allowPlanApproval === false ? [] : [{
             tag: "button",
             type: "default",
-            text: { tag: "plain_text", content: input.taskPlan ? "允许列出的计划" : "允许当前任务" },
+            text: { tag: "plain_text", content: input.wholeTask ? "允许整轮任务" : input.taskPlan ? "允许列出的计划" : "允许当前任务" },
             value: { action: "approve-turn", ...(input.approvalId !== undefined ? { approval_id: String(input.approvalId) } : { approval_token: input.approvalToken }) }
           }]),
           {
@@ -292,7 +293,9 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
         tag: "note",
         elements: [{
           tag: "plain_text",
-          content: input.allowPlanApproval === false
+          content: input.wholeTask
+            ? "批准的是本轮任务，不代表已经执行。范围变化或会话结束后，原授权不能继续使用。"
+            : input.allowPlanApproval === false
             ? "没有可授权的匹配计划；仅能批准当前操作。审批 10 分钟后失效。"
             : input.taskPlan
             ? "“允许列出的计划”只授权上述计划中匹配的操作；参数或范围变化需重新审批。审批 10 分钟后失效。"
@@ -307,7 +310,9 @@ export function buildLarkExecutionApprovalCard(input: LarkExecutionApprovalCardI
 
 export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprovalResultCardInput): Record<string, unknown> {
   const status = input.status === "approved"
-    ? input.planApproved
+    ? input.wholeTask
+      ? { label: "已允许整轮任务", template: "green", note: "仅允许本轮任务范围内的操作；超出范围需开启新任务。授权不代表执行成功。" }
+      : input.planApproved
       ? { label: "已允许列出的计划", template: "green", note: "只允许已核对的计划操作，范围变化需重新审批。授权不代表执行成功。" }
       : input.approvalScope === "turn"
       ? { label: "已允许当前任务", template: "green", note: "当前 Codex turn 内的后续受限操作将自动放行；新 turn 会重新审批。授权不代表执行成功。" }

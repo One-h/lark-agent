@@ -43,7 +43,7 @@ test("automatic authorization notification is durable, once per review, and sent
     markTurnAutoApprovalApplied(1);assert.equal(await retryPendingAutoApprovalNotifications(),0);
     const card=buildLarkAutoApprovalCard({reviewId:1,messageId:1,requester:"<at user_id=\"all\">同事</at>",request:"部署 demo-api",source:"model",reason:"符合请求",model:"gpt-6.1-sol",matchedApprovalId:null,appliedAt:new Date().toISOString()});
     const serialized=JSON.stringify(card);
-    assert.match(serialized,/授权范围：当前 turn/);assert.match(serialized,/不代表任务或部署已完成/);assert.doesNotMatch(serialized,/"tag":"button"|approval_token|"tag":"lark_md"/);
+    assert.match(serialized,/授权范围：整轮任务/);assert.match(serialized,/不代表任务或部署已完成/);assert.doesNotMatch(serialized,/"tag":"button"|approval_token|"tag":"lark_md"/);
   } finally {f.close();}
 });
 

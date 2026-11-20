@@ -33,7 +33,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const previousExecutable = process.env.CODEX_EXECUTABLE, previousPath = process.env.PATH;
     process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${root}:${previousPath ?? ""}`;
     let reviews = 0;
-    const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
+    const runtime = createRuntime({ wholeTaskAutoApproval: false, databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
       turnApprovalReviewer: async input => {
         reviews++;
         assert.equal(input.operationIntent, "Read-only query requires network and system credentials");
@@ -121,7 +121,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   process.env.PATH = `${root}:${previousPath ?? ""}`;
   process.env.CODEX_EXECUTABLE = executable;
   let reviews = 0; let replies = 0;
-  const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
+  const runtime = createRuntime({ wholeTaskAutoApproval: false, databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [], approverId: "ou_owner",
     turnApprovalReviewer: async input => {
       reviews++;
       assert.equal(input.approvalPlan?.goal, "Review the requested PR");
@@ -200,7 +200,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const previousExecutable=process.env.CODEX_EXECUTABLE;const previousPath=process.env.PATH;
     process.env.CODEX_EXECUTABLE=executable;process.env.PATH=`${root}:${previousPath ?? ""}`;
     let reviews=0;let humanCards=0;
-    const runtime=createRuntime({databasePath:path.join(root,"test.sqlite"),mode:"active",workspaceRoot:root,trustedSenderIds:[],approverId:"ou_owner",
+    const runtime=createRuntime({wholeTaskAutoApproval:false,databasePath:path.join(root,"test.sqlite"),mode:"active",workspaceRoot:root,trustedSenderIds:[],approverId:"ou_owner",
       turnApprovalReviewer:async(input)=>{
         reviews++;
         if (input.operation.endsWith("--execute")) return scenario.manual
@@ -274,7 +274,7 @@ console.log(JSON.stringify({data:{message_id:"om_card"}}));`, { mode: 0o755 });
     const previousPath = process.env.PATH, previousExecutable = process.env.CODEX_EXECUTABLE;
     process.env.PATH = `${root}:${previousPath ?? ""}`; process.env.CODEX_EXECUTABLE = executable;
     const reviewed: string[] = [];
-    const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [],
+    const runtime = createRuntime({ wholeTaskAutoApproval: false, databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [],
       approverId: "ou_owner", turnApprovalReviewer: async input => {
         assert.equal(input.approvalPlan?.goal, plan.goal);
         assert.equal(input.approvalPlan?.impact, plan.impact);

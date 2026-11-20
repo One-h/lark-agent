@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { buildLarkExecutionApprovalCard, buildLarkExecutionApprovalResultCard } from "./reply.js";
 
 export type CapabilityApprovalCardInput = { approvalId: number; operation: string; originalMessage: string;
-  requester?: string; cwd?: string | null; reason?: string | null; taskContext?: string; taskPlan?: string; allowPlanApproval?: boolean };
+  requester?: string; cwd?: string | null; reason?: string | null; taskContext?: string; taskPlan?: string; allowPlanApproval?: boolean; wholeTask?: boolean };
 
 export function formatCapabilityApprovalOperation(operation: string): string {
   const boundary = operation.indexOf(": ");

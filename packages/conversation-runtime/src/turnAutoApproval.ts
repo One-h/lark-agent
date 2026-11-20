@@ -8,6 +8,7 @@ import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskCont
 import { approvalPlanSummary, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant, maxReviewedOperationChars,
   operationIsDeclaredRemoteWrite, planCoversOperation, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { redactReplyValues } from "./replySanitization.js";
+import { hasWholeTurnReadScope, wholeTurnPlanCovers } from "./wholeTurnScope.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -34,6 +35,7 @@ export type TurnApprovalInput = {
   approvalPlan?: ApprovalPlan;
   directQuote?: string;
   taskContext?: ApprovalTaskContext;
+  wholeTask?: boolean;
 };
 export type ApprovalPrecedent = {
   id: number; originalMessage: string; operation: string; cwd: string | null;
@@ -48,7 +50,7 @@ export type TurnApprovalReviewer = (input: TurnApprovalInput, history: ApprovalP
 export type TurnApprovalDecision = {
   approved: boolean; source: "history" | "model" | "manual" | "disabled";
   reason: string; matchedApprovalId?: number; reviewId?: number;
-  scope?: "once" | "plan";
+  scope?: "once" | "plan" | "turn";
   plan?: ApprovalPlan;
   reviewedPlan?: ApprovalPlan;
   recheckedInput?: { messageId: number; requestId: string | number };
@@ -222,7 +224,7 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   }
   const history = humanApprovalHistory(database, input.senderId, approverId);
   const match = matchHumanTurnApproval(input, history, dataSources);
-  if (match && (match.status !== "approved" || match.scope !== "turn" ||
+  if (!input.wholeTask && match && (match.status !== "approved" || match.scope !== "turn" ||
     (!input.approvalPlan && !requiresModelScopeReview(input.originalMessage) && match.operation === input.operation))) {
     return finish({ approved: match.status === "approved" && match.scope === "turn", source: "history",
     scope: "once", matchedApprovalId: match.id, reason: match.status === "rejected" ? "最近同类人工审批已拒绝" : match.scope !== "turn" ? "历史授权仅允许单次操作" : "匹配同一发送人、目标及工作目录的同一已批准操作" });
@@ -252,6 +254,17 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
     }
     if (options.signal?.aborted) return finish({ approved: false, source: "manual", reason: "自动审核已取消" });
     const plan = reviewedInput.approvalPlan;
+    if (reviewedInput.wholeTask) {
+      const currentInPlan = plan && wholeTurnPlanCovers(plan, reviewedInput);
+      const safePlan = currentInPlan && plan.steps.every(step => !outsideAutomaticOperationScope({ ...reviewedInput, operation: step.operation,
+        operationKind: step.kind, cwd: step.cwd }, reviewedTask));
+      const approveWhole = judged.decision === "approve_turn"
+        && (safePlan || !plan && (reviewedTask?.type === "deployment_query" || reviewedTask?.type === "data_query") && hasWholeTurnReadScope(reviewedInput));
+      const reason = approveWhole || judged.decision === "manual" ? judged.reason
+        : judged.decision === "approve_once" ? "审核未确认整轮任务，转人工决定，不单独放行当前操作。"
+        : "整轮计划或操作范围未能核对，转人工决定。";
+      return finish({ approved: Boolean(approveWhole), source: "model", scope: "turn", reason: reason.slice(0, 300) }, judged.usage);
+    }
     const approvePlan = judged.decision === "approve_turn" && plan && planCoversOperation(plan, reviewedInput)
       && judged.approvedSteps?.length === plan.steps.length && plan.steps.every((_, i) => judged.approvedSteps!.includes(i + 1))
       && plan.steps.every(step => !outsideAutomaticOperationScope({ ...reviewedInput, operation: step.operation,
@@ -275,7 +288,7 @@ export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInpu
   let current = reviews.get(db);
   if (!current) { current = new Map(); reviews.set(db, current); }
   const database = db;
-  const grant = currentApprovalPlanGrant(database, input, config.larkExecutionApproverId);
+  const grant = !input.wholeTask && currentApprovalPlanGrant(database, input, config.larkExecutionApproverId);
   if (grant && !requiresManualTurnApproval(input)) return Promise.resolve({ approved: true, scope: "plan", plan: grant.plan,
     reviewedPlan: grant.plan, source: "model", reviewId: grant.reviewId, reason: "当前操作在已确认的任务计划内" });
   const controller = new AbortController();
