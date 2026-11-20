@@ -17,7 +17,35 @@ function duration(value: string | undefined): boolean {
   return Boolean(value && /^\d{1,2}[smh]$/.test(value) && (!value.endsWith("h") || Number(value.slice(0, -1)) <= 24));
 }
 
-function observabilityScope(args: string[], cwd: string | null): string | undefined {
+function scopedPrometheusLabels(query: string): string | undefined {
+  if (query.length > 4_000) return;
+  const series = /^([^{}]*)\{([^{}]+)\}([^{}]*)$/.exec(query);
+  if (!series) return;
+  // Support one scoped series with common aggregators and a numeric comparison.
+  // A second series or a bare vector outside the selector must not inherit it.
+  const prefix = /^(?:\s*(?:(?:sum|count|avg|min|max|increase|rate|irate)(?:\s+by\s*\([A-Za-z_0-9,\s]+\))?\s*)?\()*(?:[A-Za-z_:][A-Za-z_0-9:]*)?\s*$/;
+  const suffix = /^\s*(?:\[(\d{1,2}[smh])\])?\s*(?:\)\s*)*(?:(?:>=|<=|>|<|==|!=|\/)\s*\d+(?:\.\d+)?)?\s*$/;
+  const rest = suffix.exec(series[3]);
+  if (!prefix.test(series[1]) || !rest || rest[1] && !duration(rest[1])) return;
+  const labels = new Map<string, { op: string; value: string }>();
+  for (const text of series[2].split(",")) {
+    const m = /^\s*([A-Za-z_]\w*)\s*(=~|!~|!=|=)\s*("(?:\\.|[^"\\])*")\s*$/.exec(text);
+    if (!m || labels.has(m[1])) return;
+    try { labels.set(m[1], { op: m[2], value: JSON.parse(m[3]) as string }); }
+    catch { return; }
+  }
+  const literal = (name: string) => {
+    const entry = labels.get(name);
+    return entry?.op === "=" && /^[A-Za-z0-9_.-]{1,120}$/.test(entry.value);
+  };
+  const pod = labels.get("pod");
+  if (!literal("namespace") || (!["app", "app_kubernetes_io_name", "service_name", "pod"].some(literal)
+    && !(pod?.op === "=~" && /^\^?[A-Za-z0-9_-]{1,114}-\.\*\$?$/.test(pod.value)))) return;
+  const filters = new Set(["status", "status_code", "method", "route", "__name__"]);
+  return JSON.stringify([...labels].filter(([name]) => !filters.has(name)).sort());
+}
+
+function observabilityScope(args: string[], cwd: string | null, botReadScope: boolean): string | undefined {
   if (!cwd || !path.isAbsolute(cwd) || args[0] !== "python3" || !args[1]) return;
   let managed: string;
   try {
@@ -38,6 +66,8 @@ function observabilityScope(args: string[], cwd: string | null): string | undefi
   if (!query) return;
   const source = ["managed-observability", managed, offset === 3, mode, flags.get("--uid") ?? null];
   if (mode === "prom") {
+    const labels = botReadScope ? scopedPrometheusLabels(query) : undefined;
+    if (labels) return JSON.stringify([...source, "service-labels", labels]);
     // Preserve all selectors and expressions, varying only ordinary time windows.
     return JSON.stringify([...source,
       query.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\[\d{1,2}[sm]\]/g, token => token.startsWith("[") ? "[range]" : token)]);
@@ -59,13 +89,13 @@ function observabilityScope(args: string[], cwd: string | null): string | undefi
   return JSON.stringify([...source, [...selectors].sort()]);
 }
 
-function readScope(command: string, cwd: string | null): string | undefined {
+function readScope(command: string, cwd: string | null, botReadScope = false): string | undefined {
   let args = argv(command);
   if (!args) return;
   if (args.length === 3 && /^\/(?:usr\/)?bin\/(?:ba|z|da)?sh$/.test(args[0]) && ["-c", "-lc"].includes(args[1]))
     args = argv(args[2]);
   if (!args) return;
-  if (args[0] === "python3") return observabilityScope(args, cwd);
+  if (args[0] === "python3") return observabilityScope(args, cwd, botReadScope);
   // Vary only bounded output controls; the executable, flags controlling the
   // destination, resource, namespace and selectors remain part of the key.
   const tool = args[0];
@@ -112,7 +142,7 @@ export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, re
   if (first.readOnlyWholeTask) plan = boundedReadApprovalPlan(plan);
   const initial = { operation: first.operation, cwd: first.cwd, kind: first.operationKind };
   const reads = [initial, ...(plan?.steps.filter(step => step.effect === "read") ?? [])]
-    .flatMap(step => step.kind === "command" ? [{ key: readScope(step.operation, step.cwd), cwd: step.cwd }] : [])
+    .flatMap(step => step.kind === "command" ? [{ key: readScope(step.operation, step.cwd, first.readOnlyWholeTask), cwd: step.cwd }] : [])
     .filter(step => step.key !== undefined);
   return candidate => {
     if (candidate.messageId !== first.messageId || candidate.senderId !== first.senderId || candidate.turnId !== first.turnId
@@ -123,7 +153,7 @@ export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, re
     if (candidate.operationKind === initial.kind && candidate.operation === initial.operation && candidate.cwd === initial.cwd) return true;
     if (plan && planCoversOperation(plan, candidate)) return true;
     if (candidate.operationKind !== "command") return false;
-    const key = readScope(candidate.operation, candidate.cwd);
+    const key = readScope(candidate.operation, candidate.cwd, first.readOnlyWholeTask);
     return key !== undefined && reads.some(step => step.key === key && step.cwd === candidate.cwd);
   };
 }

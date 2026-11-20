@@ -30,5 +30,17 @@ test("managed observability reuse keeps exact source, service, namespace and saf
     const metrics = wholeTurnScope({ ...base, operation: prom("demo[10m]", "2m") }, undefined, true);
     assert.equal(metrics({ ...base, operation: prom("demo[10m]", "3m") }), true);
     assert.equal(metrics({ ...base, operation: prom("demo[11m]", "3m") }), false);
+
+    const selector = '{namespace="prod",pod=~"demo-api-.*"}';
+    const observe = (query: string, uid = "metrics") => `python3 ${relative} prom --uid ${uid} --query '${query}'`;
+    const bot = { ...base, readOnlyWholeTask: true, operation: observe(`sum(increase(requests_total${selector}[2m]))`) };
+    const matchesBot = wholeTurnScope(bot);
+    assert(matchesBot({ ...bot, operation: observe('sum by (status) (increase(other_total{pod=~"demo-api-.*",namespace="prod",route="/fixture"}[5m])) > 0') }));
+    assert(!matchesBot({ ...bot, operation: observe(`sum(increase(other_total${selector}[3m]))`, "other-source") }));
+    assert(!matchesBot({ ...bot, operation: observe('sum(requests_total{namespace="prod",pod=~"other-api-.*"})') }));
+    assert(!matchesBot({ ...bot, operation: observe('sum(requests_total{namespace="staging",pod=~"demo-api-.*"})') }));
+    assert(!matchesBot({ ...bot, operation: observe(`sum(requests_total${selector}) + other_total`) }));
+    assert(!matchesBot({ ...bot, operation: observe(`sum(requests_total${selector}) + sum(other_total${selector})`) }));
+    assert(!matchesBot({ ...bot, operation: observe('sum(requests_total{namespace="prod",pod=~".*"})') }));
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
