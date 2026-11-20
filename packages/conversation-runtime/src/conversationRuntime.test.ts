@@ -134,7 +134,7 @@ test("conversation runtime responder preserves prompts, trust profiles and group
     config.larkAgentRuntimeUrl = "http://127.0.0.1:4780";
     assert.equal(buildLarkCodexThreadParams(true).dynamicTools, undefined);
     assert(listLarkMcpTools(true).some(tool => tool.name === "host__demo"));
-    assert.deepEqual(listLarkMcpTools(false).map(tool => tool.name), ["lark_approval_plan"]);
+    assert.deepEqual(listLarkMcpTools(false).map(tool => tool.name), ["lark_approval_plan", "lark_approval_status"]);
     assert.deepEqual(buildLarkCodexUserInput("prompt", ["/tmp/image.png"]).at(-1), { type: "localImage", path: "/tmp/image.png" });
     assert.equal(larkAtTag("ou_sender"), '<at user_id="ou_sender"></at>');
     assert.equal(formatLarkFinalReply({ chat_type: "group", sender_id: "ou_sender" }, "收到。"), '<at user_id="ou_sender"></at> 收到。');
