@@ -47,11 +47,13 @@ this runtime does not change a provider's managed settings or claim that its
 stock launcher enforces read-only operation.
 
 For an active turn, a request from that exact ACP session can grant the offered
-single-use option. A restricted request is approved through the same Feishu
-manual or automatic review and task-plan authorization as host tools. It
-must match an observed tool call and its original parameters. A task plan
-can cover multiple exact calls, but the engine receives only `allow_once`
-for each matched call. No grant survives cancellation or the end of the turn.
+single-use option. The first restricted native callback opens the shared Lark
+turn approval. With automatic review off it goes straight to a manual turn
+card, as with Codex. The task model does not need to register a plan or
+organize approval. Each callback must match an observed tool call and its
+original parameters; the engine receives only `allow_once`. No grant survives
+cancellation or the end of the turn. Trusted sessions keep their ordinary
+launcher and selected model, and do not open Lark execution approval cards.
 The operator launcher supplies
 authentication and persistent native sessions. A small environment
 allowlist retains the local profile and executable search paths without
@@ -59,7 +61,7 @@ forwarding Lark or Forge API tokens. The host does not expose filesystem,
 terminal or an unrestricted ACP tool relay. The trusted adapter passes the
 fixed [`lark_tools` stdio MCP](shared-tool-mcp.md) on session creation and resume.
 Only that subprocess receives the limited MCP transport credential. Its calls
-still need a live turn token and the normal Lark runtime approvals.
+still need a live turn token and the applicable runtime and host-service checks.
 
 DSH, OpenCode and AGY use the advertised `session/resume` and preserve their
 native conversation across processes. A failed resume never starts a new

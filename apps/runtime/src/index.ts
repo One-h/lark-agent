@@ -336,10 +336,11 @@ export function createRuntime(config: RuntimeConfig) {
   const authorizeTurnOperation = async (input: TurnApprovalInput, options: {
     required: boolean; allowModelReview: boolean; explicitlyApproved?: boolean; capabilityId?: string; display: string;
     signal: AbortSignal; assertActive: () => void; stillCurrent?: () => boolean; sessionId?: string | null; legacyOnly?: boolean;
+    nativePermission?: boolean;
   }) => {
     const { signal, assertActive } = options;
     if (config.wholeTaskAutoApproval !== false && options.required && !options.explicitlyApproved && !options.legacyOnly
-      && (wholeTasks.has(input.turnId) || store.setting("turnAutoApprovalEnabled", "false") === "true")) {
+      && (options.nativePermission || wholeTasks.has(input.turnId) || store.setting("turnAutoApprovalEnabled", "false") === "true")) {
       const whole = await authorizeWholeTask(input, options);
       return { legacyRevoked: () => false, validate() { whole.validate(); whole.markApplied(); } };
     }
@@ -402,7 +403,7 @@ export function createRuntime(config: RuntimeConfig) {
     assertActive();
     const input: TurnApprovalInput = { messageId, turnId, senderId: source.sender_id, originalMessage: source.content ?? "",
       operation: operation.text, operationKind: "capability", cwd: operation.cwd };
-    const approval = await authorizeTurnOperation(input, { required: true, allowModelReview: true,
+    const approval = await authorizeTurnOperation(input, { required: true, allowModelReview: true, nativePermission: true,
       display: operation.text, sessionId: source.codex_session_id, signal, assertActive, stillCurrent });
     assertActive();
     if (approval.legacyRevoked()) return false;

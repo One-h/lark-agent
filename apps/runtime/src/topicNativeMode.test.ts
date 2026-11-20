@@ -7,7 +7,7 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, larkCodexAppServerStatus, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime, type RuntimeConfig } from "./index.js";
-import { configuredNativeAcpEngines, createNativeAcpExecutionEngine, declareApprovalPlan, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
+import { configuredNativeAcpEngines, createNativeAcpExecutionEngine, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
 const originalCodexExecutable = process.env.CODEX_EXECUTABLE;
 // Each fixture installs its own peer. No late callback should start the real CLI.
@@ -302,14 +302,16 @@ async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "le
   return m;
 }
 
-for (const provider of ["dsh", "claude", "opencode", "agy"] as const) test(`restricted ACP uses scoped Lark approval for ${provider}`, async () => {
-  const wholeTask = provider === "dsh";
+const restrictedApprovalCases = [
+  ...(["dsh", "claude", "opencode", "agy"] as const).map(provider => ({ provider, automaticReview: false })),
+  { provider: "dsh" as const, automaticReview: true }
+];
+for (const { provider, automaticReview } of restrictedApprovalCases) test(`restricted ACP opens a turn approval without a plan for ${provider} (${automaticReview ? "review" : "manual"})`, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lark-acp-approval-"));
   const launch = path.join(dir, "restricted.mjs"), trusted = path.join(dir, "trusted.mjs");
   const gate = path.join(dir, "allow-fixture"), log = path.join(dir, "outcomes.jsonl");
   fs.writeFileSync(trusted, "#!/bin/sh\nexit 91\n", { mode: 0o700 });
   const toolName = { dsh: "write", claude: "Write", opencode: "edit", agy: "write_to_file" }[provider];
-  const expected = (file: string) => `acp.${provider}.${toolName}: ${JSON.stringify({ content: "fixture", file_path: file })}`;
   fs.writeFileSync(launch, `#!${process.execPath}
 import { appendFileSync, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -362,32 +364,26 @@ createInterface({input:process.stdin}).on("line",l=>{
   const readDecisions = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(l => JSON.parse(l)) : [];
   try {
     assert.throws(() => createNativeAcpExecutionEngine(provider, { launcher: trusted, restrictedLauncher: trusted, models: [] }), /distinct/);
-    if (wholeTask) await f.settings({ turnAutoApprovalEnabled: true });
+    await f.settings({ turnAutoApprovalEnabled: automaticReview });
     assert.equal((await f.message({ content: "observe fixture topic before selecting an engine" })).row().codex_status, "skipped");
     assert.equal((await f.runtime().app.inject({ method: "PUT", url: topic, headers, payload: { override: { engineId: provider, model: null } } })).statusCode, 200);
     const message = await f.message({ sender_id: "ou_member", content: "Create two sample files", mentions: mention });
     await until(() => message.row().codex_status === "running" && Boolean(message.row().codex_turn_id));
-    declareApprovalPlan(f.runtime().store.db, { messageId: message.row().id, turnId: message.row().codex_turn_id, senderId: "ou_member" }, {
-      goal: "Create two sample files", impact: "Temporary fixture only",
-      steps: ["first.txt", "second.txt"].map(file => ({ intent: `Write ${file}`, effect: "local-write", kind: "capability", cwd: null, operation: expected(file) }))
-    });
     fs.writeFileSync(gate, "");
     await until(() => cards.length === 1);
     assert.deepEqual(readDecisions(), [{ step: 0, option: null }]);
     assert.equal(cards[0].originalMessage, "Create two sample files");
-    assert.match(cards[0].taskPlan ?? "", /Write second.txt/);
+    assert.equal(cards[0].taskPlan, undefined);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve`, headers })).statusCode, 409);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 200);
-    await until(() => wholeTask ? readDecisions().length === 5 : cards.length === 2);
+    await until(() => readDecisions().length === 5);
     const decisions = [{ step: 0, option: null }, { step: 1, option: "once" }, { step: 2, option: "once" }, { step: 3, option: null }];
-    assert.deepEqual(readDecisions(), wholeTask ? [...decisions, { step: 4, option: "once" }] : decisions);
-    if (wholeTask) { assert.equal(cards.length, 1); assert.equal(reviews, 1); }
-    else assert.equal(f.runtime().store.approval(cards[1].approvalId)?.operation, expected("late.txt"));
+    assert.deepEqual(readDecisions(), [...decisions, { step: 4, option: "once" }]);
+    assert.equal(cards.length, 1);
+    assert.equal(reviews, automaticReview ? 1 : 0);
     assert.deepEqual((await f.runtime().app.inject({ method: "POST", url: topic+"/cancel", headers })).json(), { requested: 1 });
     await until(() => message.row().codex_status === "failed");
-    if (!wholeTask) {
-      assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[1].approvalId}/approve`, headers })).statusCode, 409);
-      assert.equal(f.runtime().store.approval(cards[1].approvalId)?.status, "failed");
-    }
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 409);
   } finally { await f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
