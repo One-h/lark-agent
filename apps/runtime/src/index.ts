@@ -27,7 +27,7 @@ import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-ru
 import { drainLarkProgressCards, retryPendingLarkProgressCards, type LarkProgressSender, type LarkProgressUpdater } from "@lark-agent/conversation-runtime";
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
 import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNativeTurn, getLarkMcpToolContext, larkMcpHostCapabilityId,
-  listLarkMcpTools, setExternalNativeApprovalHandler, setWholeTurnNativeApprovalHandler, submitLarkMcpApprovalPlan, wholeTurnScope } from "@lark-agent/conversation-runtime";
+  boundedReadApprovalPlan, listLarkMcpTools, setExternalNativeApprovalHandler, setWholeTurnNativeApprovalHandler, submitLarkMcpApprovalPlan, wholeTurnScope } from "@lark-agent/conversation-runtime";
 import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
@@ -229,8 +229,9 @@ export function createRuntime(config: RuntimeConfig) {
     if (planApproved && pending?.plan) pending.planApplied(pending.plan, row.approver_id);
     if (pending) { clearTimeout(pending.timer); pending.cleanup(); pendingApprovals.delete(id); pending.resolve(status === "approved"); }
     if (row.card_message_id) {
+      const shownPlan = pending?.planInput.readOnlyWholeTask ? boundedReadApprovalPlan(pending.plan) : pending?.plan;
       try { (config.approvalCardUpdater ?? updateApprovalCard)(row.card_message_id, { ...approvalDetails(row.lark_message_id, row.operation),
-        taskPlan: pending?.plan ? approvalPlanSummary(pending.plan) : undefined, wholeTask: pending?.wholeTask,
+        taskPlan: shownPlan ? approvalPlanSummary(shownPlan) : undefined, wholeTask: pending?.wholeTask,
         status, approvalScope: storedScope, planApproved, decidedAt: new Date().toISOString(), reason }); }
       catch { app.log.warn("capability_approval_card_update_failed"); }
     }
@@ -250,10 +251,11 @@ export function createRuntime(config: RuntimeConfig) {
         plan, requiresPlan, planInput, planApplied, stillCurrent, wholeTask: planInput.wholeTask });
     });
     try {
+      const shownPlan = planInput.readOnlyWholeTask ? boundedReadApprovalPlan(plan) : plan;
       const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation),
-        taskPlan: plan ? approvalPlanSummary(plan) : undefined, wholeTask: planInput.wholeTask,
+        taskPlan: shownPlan ? approvalPlanSummary(shownPlan) : undefined, wholeTask: planInput.wholeTask,
         allowPlanApproval: planInput.wholeTask ? true : plan ? planCoversOperation(plan, planInput) : requiresPlan ? false : undefined,
-        reason: "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
+        reason: planInput.readOnlyWholeTask ? "仅授权本轮限定只读查询，不含写入或部署。" : "仅在本 turn 仍有效时执行；批准不代表操作已完成。" });
       if (card.ok && card.messageId) store.setApprovalCardMessage(approvalId, card.messageId);
       else settleApproval(approvalId, "failed", "once", "审批卡未取得发送回执，操作未执行。");
     } catch { settleApproval(approvalId, "failed", "once", "审批卡发送失败，操作未执行。"); }
@@ -270,7 +272,7 @@ export function createRuntime(config: RuntimeConfig) {
     if (!state) {
       const plan = currentApprovalPlan(store.db, input);
       const task = approvalTask(input.originalMessage, configuredTurnAutoApprovalDataSources(store.db));
-      const readOnlyTask = task?.type === "deployment_query" || task?.type === "data_query";
+      const readOnlyTask = input.readOnlyWholeTask || task?.type === "deployment_query" || task?.type === "data_query";
       const allows = wholeTurnScope(input, plan, readOnlyTask);
       if (!allows(input)) throw new Error("操作超出本轮任务授权范围，请在新一轮说明变更。");
       const reviewed = { ...input, wholeTask: true };

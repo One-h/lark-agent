@@ -7,7 +7,7 @@ export * from "./mediaImages.js";
 export * from "./promptSettings.js";
 export * from "./persona.js";
 export * from "./responder.js";
-export { wholeTurnScope } from "./wholeTurnScope.js";
+export { boundedReadApprovalPlan, wholeTurnScope } from "./wholeTurnScope.js";
 export * from "./spontaneous.js";
 export * from "./stickers.js";
 export * from "./worker.js";

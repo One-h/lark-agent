@@ -8,7 +8,7 @@ import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskCont
 import { approvalPlanSummary, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant, maxReviewedOperationChars,
   operationIsDeclaredRemoteWrite, planCoversOperation, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { redactReplyValues } from "./replySanitization.js";
-import { hasWholeTurnReadScope, wholeTurnPlanCovers } from "./wholeTurnScope.js";
+import { boundedReadApprovalPlan, hasWholeTurnReadScope, wholeTurnPlanCovers } from "./wholeTurnScope.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -36,6 +36,7 @@ export type TurnApprovalInput = {
   directQuote?: string;
   taskContext?: ApprovalTaskContext;
   wholeTask?: boolean;
+  readOnlyWholeTask?: boolean;
 };
 export type ApprovalPrecedent = {
   id: number; originalMessage: string; operation: string; cwd: string | null;
@@ -258,8 +259,9 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
       const currentInPlan = plan && wholeTurnPlanCovers(plan, reviewedInput);
       const safePlan = currentInPlan && plan.steps.every(step => !outsideAutomaticOperationScope({ ...reviewedInput, operation: step.operation,
         operationKind: step.kind, cwd: step.cwd }, reviewedTask));
-      const approveWhole = judged.decision === "approve_turn"
-        && (safePlan || !plan && (reviewedTask?.type === "deployment_query" || reviewedTask?.type === "data_query") && hasWholeTurnReadScope(reviewedInput));
+      const approveWhole = judged.decision === "approve_turn" && (reviewedInput.readOnlyWholeTask
+        ? hasWholeTurnReadScope(reviewedInput)
+        : safePlan || !plan && (reviewedTask?.type === "deployment_query" || reviewedTask?.type === "data_query") && hasWholeTurnReadScope(reviewedInput));
       const reason = approveWhole || judged.decision === "manual" ? judged.reason
         : judged.decision === "approve_once" ? "审核未确认整轮任务，转人工决定，不单独放行当前操作。"
         : "整轮计划或操作范围未能核对，转人工决定。";
@@ -278,12 +280,16 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
 
 export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInput?: RefreshApprovalInput): Promise<TurnApprovalDecision> {
   if (!turnAutoApprovalEnabled()) return Promise.resolve({ approved: false, source: "disabled", reason: "自动审批未启用" });
-  const withContext = <T extends TurnApprovalInput>(candidate: T) => ({
-    ...candidate,
-    directQuote: loadApprovalDirectQuote(db, candidate.messageId, candidate.senderId),
-    taskContext: loadApprovalTaskContext(db, candidate.messageId, candidate.senderId),
-    approvalPlan: currentApprovalPlan(db, candidate)
-  });
+  const registeredPlan = currentApprovalPlan(db, input);
+  const withContext = <T extends TurnApprovalInput>(candidate: T) => {
+    const plan = currentApprovalPlan(db, candidate);
+    return {
+      ...candidate,
+      directQuote: loadApprovalDirectQuote(db, candidate.messageId, candidate.senderId),
+      taskContext: loadApprovalTaskContext(db, candidate.messageId, candidate.senderId),
+      approvalPlan: candidate.readOnlyWholeTask ? boundedReadApprovalPlan(plan) : plan
+    };
+  };
   input = withContext(input);
   let current = reviews.get(db);
   if (!current) { current = new Map(); reviews.set(db, current); }
@@ -302,7 +308,7 @@ export function reviewLarkTurnAutoApproval(input: TurnApprovalInput, refreshInpu
     }) });
   return result.then(decision => {
     const identity = { ...input, messageId: decision.recheckedInput?.messageId ?? input.messageId };
-    if (decision.approved && currentApprovalPlan(database, identity) !== decision.reviewedPlan) {
+    if (decision.approved && currentApprovalPlan(database, identity) !== (input.readOnlyWholeTask ? registeredPlan : decision.reviewedPlan)) {
       return { ...decision, approved: false, reason: "审核期间任务计划已变化，不能放行旧申请" };
     }
     return decision;

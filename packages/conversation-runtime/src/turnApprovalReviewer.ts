@@ -29,6 +29,7 @@ export function turnApprovalModelPrompt(input: TurnApprovalInput, history: Appro
     request: unicodeSafePrefix(input.originalMessage, 2400),
     directQuote: reviewContextText(input.directQuote, 1000),
     approvalPlan: input.approvalPlan,
+    ...(input.readOnlyWholeTask ? { requestedScope: "仅审核本轮限定只读排查，不批准写入、部署或额外权限。" } : {}),
     operationIntent: reviewContextText(input.operationIntent, 500),
     currentOperationIntent: reviewContextText(input.operationIntent, 500),
     firstOperation: unicodeSafePrefix(input.operation, maxReviewedOperationChars),

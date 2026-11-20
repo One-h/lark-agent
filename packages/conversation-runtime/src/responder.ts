@@ -21,6 +21,7 @@ export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./m
 import { createHistoryImageBudget, createHistoryImageState, historyImagesAllowed, openLarkHistoryImage, searchLarkHistoryImages, type HistoryImageBudget, type HistoryImageState } from "./historyImages.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { finishLarkTurnAutoApproval, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, stopLarkTurnAutoApprovalReviews, turnAutoApprovalEnabled, type TurnApprovalInput } from "./turnAutoApproval.js";
+import { hasWholeTurnReadScope } from "./wholeTurnScope.js";
 import { applyPlanAuthorization, approvalPlanSummary, approvalPlanTool, approvalPlanToolName, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant,
   declareApprovalPlan, parseApprovalPlan, planCoversOperation, preparePlanAuthorization, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
@@ -3650,7 +3651,11 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
   });
   const currentInput = approvalInput(target);
   const wholeTask = wholeTurnNativeAuthorizer;
-  if (wholeTask && turnAutoApprovalEnabled() && target.row.reply_trigger !== "owner_mention") {
+  const isOwnerAssist = target.row.reply_trigger === "owner_mention";
+  const botReadOnly = isOwnerAssist && target.row.sender_type === "bot"
+    && ownerAssistSourceAllowed(target.row.sender_type, target.row.sender_id, target.row.chat_id)
+    && hasWholeTurnReadScope(currentInput);
+  if (wholeTask && turnAutoApprovalEnabled() && (!isOwnerAssist || botReadOnly)) {
     const approver = config.larkExecutionApproverId, threadId = run.threadId, turnId = run.turnId, sender = target.row.sender_id;
     const controller = new AbortController();
     run.hostToolCalls.add(controller);
@@ -3658,7 +3663,7 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
       && activeLarkCodexRuns.get(run.sessionKey) === run && run.turnId === turnId && run.threadId === threadId
       && approvalRunMember(run).row.id === target.row.id && approvalRunMember(run).row.sender_id === sender
       && config.larkExecutionApproverId === approver && ownerAssistMayExecute(target.row.id);
-    void wholeTask(currentInput, controller.signal, stillCurrent).then(approval => {
+    void wholeTask(botReadOnly ? { ...currentInput, readOnlyWholeTask: true } : currentInput, controller.signal, stillCurrent).then(approval => {
       approval.validate();
       if (autoApproveTurnExecution(run, request, details, target, { scope: "turn", reviewId: approval.reviewId })) approval.markApplied();
     }).catch(() => {

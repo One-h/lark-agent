@@ -4,18 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
-import { createRuntime } from "./index.js";
+import { createRuntime, type RuntimeConfig } from "./index.js";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { ingestLarkEvent, enqueueLarkCodexReply, isOwnerMentionAssistMessage, ownerAssistMayExecute, ownerAssistPublicAllowed, ownerAssistRow, retryOwnerAssistNotifications,
   retryPendingLarkTextReplies, retryPendingLarkExecutionReceipts, setAppSettingValue, decideLarkExecutionApprovalFromCard, reconcileOwnerMentionAssists,
-  activeOwnerAssistRequests, drainOwnerAssistNotifications } from "@lark-agent/conversation-runtime";
+  activeOwnerAssistRequests, declareApprovalPlan, drainOwnerAssistNotifications, retryPendingAutoApprovalNotifications } from "@lark-agent/conversation-runtime";
 
 async function until(check: () => boolean) {
   const end = performance.now() + 5000;
   while (!check()) { assert(performance.now() < end, "owner assistance fixture timed out"); await immediate(); }
 }
 
-function fixture(trustedMember = false) {
+function fixture(trustedMember = false, overrides: Partial<RuntimeConfig> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-owner-assist-"));
   const executable = path.join(root, "codex.mjs"), log = path.join(root, "rpc.jsonl");
   fs.writeFileSync(executable, `#!${process.execPath}
@@ -45,7 +45,8 @@ else if(m.method)send({id:m.id,result:{}});
     runtimeToken: "fixture-token", trustedSenderIds: trustedMember ? ["ou_owner","ou_member"] : ["ou_owner"], approverId: "ou_owner", ownerMentionAssistDelayMs: 0,
     ownerMentionAssistMembershipProbe: async () => { if(membershipGate)await membershipGate; return membership; },
     proactiveMessageSender: (recipient, text, key) => { notices.push({recipient,text,key}); return failNotice ? {ok:false,error:"fixture notice failed"} : {ok:true,messageId:missingNoticeReceipt?null:"om_notice",chatId:"oc_private",messageAt:null,messageType:"text"}; },
-    reactionSender: () => ({ok:true}), textReplySender: (_id, text) => { if (failText) return {ok:false,error:"fixture delivery failed"}; sent.push(text); return {ok:true,messageId:`om_sent${sent.length}`,chatId:"oc_group",messageAt:null,messageType:"text"}; }
+    reactionSender: () => ({ok:true}), textReplySender: (_id, text) => { if (failText) return {ok:false,error:"fixture delivery failed"}; sent.push(text); return {ok:true,messageId:`om_sent${sent.length}`,chatId:"oc_group",messageAt:null,messageType:"text"}; },
+    ...overrides
   });
   for (const [key,value] of Object.entries({ownerMentionAssistEnabled:"true",stickerUsageMode:"off",interimRepliesEnabled:"false",executionReceiptsEnabled:"false",trustedExecutionEnabled:"true"})) setAppSettingValue(key,value);
   const headers = { authorization: "Bearer fixture-token" };
@@ -151,6 +152,88 @@ test("bot owner mentions require an authenticated allowlist, real mentions and e
     setAppSettingValue("ownerMentionAssistBotIds","malformed");
     assert.deepEqual((await f.runtime.app.inject({url})).json().ownerMentionAssistBotIds,[]);
   }finally{await f.close();}
+});
+
+for (const manual of [false, true]) test(`allowlisted bot read-only assistance has one turn approval (${manual ? "manual" : "automatic"})`, async () => {
+  let reviews = 0, notices = 0;
+  const cards: Array<{ approvalId: number; wholeTask?: boolean; taskPlan?: string; reason?: string | null }> = [];
+  const f = fixture(false, {
+    turnApprovalReviewer: async input => {
+      reviews++;
+      assert.equal(input.wholeTask, true);
+      assert.equal(input.readOnlyWholeTask, true);
+      assert.deepEqual(input.approvalPlan?.steps.map(step => step.intent), ["读取指定服务日志"]);
+      return { decision: manual ? "approve_once" : "approve_turn", reason: "确认告警的有界只读排查" };
+    },
+    approvalCardSender: (_owner, card) => { cards.push(card); return { ok: true, messageId: "om_turn_card" }; },
+    approvalCardUpdater: () => {},
+    autoApprovalNotificationSender: async () => {
+      notices++;
+      return { ok: true, messageId: "om_readonly_notice", chatId: null, messageAt: null, messageType: "interactive" };
+    }
+  });
+  try {
+    setAppSettingValue("turnAutoApprovalEnabled", "true");
+    setAppSettingValue("ownerMentionAssistBotIds", '["ou_alert"]');
+    const message = "om_alert_readonly";
+    const source = await f.start(message, { sender_type: "bot", sender_id: "ou_alert", content: "检查生产 demo-api 服务日志" });
+    const db = f.runtime.store.db;
+    assert.equal(source.reply_trigger, "owner_mention");
+    const logs = (service: string, tail: number) => `kubectl logs deploy/${service} --namespace=production --tail=${tail}`;
+    const apply = "kubectl apply -f fixture.yaml";
+    const params = { threadId: source.codex_session_id, turnId: source.codex_turn_id };
+    const request = (id: string, command: string) => codexAppServer.request("fixture/approval", { request: {
+      id, method: "item/commandExecution/requestApproval", params: { ...params, itemId: id, command, cwd: f.root }
+    } });
+    const response = (id: string) => f.records().find(row => row.id === id && row.result)?.result;
+    await request("before-handle", logs("demo-api", 30));
+    await until(() => response("before-handle")?.decision === "decline");
+    assert.equal(reviews, 0);
+    await f.decision(message, "handle");
+    declareApprovalPlan(db, { messageId: source.id, senderId: source.sender_id, turnId: source.codex_turn_id }, {
+      goal: "检查状态", impact: "测试计划含其他步骤",
+      steps: [
+        { intent: "读取指定服务日志", kind: "command", cwd: f.root, effect: "read", operation: logs("demo-api", 30) },
+        { intent: "生产变更不应出现在只读卡片", kind: "command", cwd: f.root, effect: "remote-write", operation: apply },
+        { intent: "未识别的读写也不能借用只读授权", kind: "command", cwd: f.root, effect: "read", operation: "touch fixture.txt" }
+      ]
+    });
+    await request("bounded-first", logs("demo-api", 30));
+    await request("bounded-second", logs("demo-api", 50));
+    if (manual) {
+      await until(() => cards.length === 1);
+      assert.equal(cards[0].wholeTask, true);
+      assert.match(cards[0].reason ?? "", /限定只读/);
+      assert.match(cards[0].taskPlan ?? "", /读取指定服务日志/);
+      assert.doesNotMatch(cards[0].taskPlan ?? "", /生产变更不应|未识别的读写/);
+      assert.equal(response("bounded-first"), undefined);
+      assert.equal((await f.runtime.app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers: f.headers })).statusCode, 200);
+    }
+    await until(() => Boolean(response("bounded-first") && response("bounded-second")));
+    assert.equal(response("bounded-first").decision, "accept");
+    assert.equal(response("bounded-second").decision, "accept");
+    await request("different-service", logs("other-api", 30));
+    await until(() => response("different-service")?.decision === "decline");
+    await codexAppServer.request("fixture/approval", { request: { id: "permission-bundle", method: "item/permissions/requestApproval",
+      params: { ...params, itemId: "network", permissions: { network: { enabled: true } } } } });
+    await until(() => Boolean(response("permission-bundle")));
+    assert.deepEqual(response("permission-bundle").permissions, {});
+    await request("write-needs-own-approval", apply);
+    await until(() => Boolean(db.prepare("SELECT 1 FROM lark_execution_approvals WHERE item_id='write-needs-own-approval' AND status='pending'").get()));
+    assert.equal(response("write-needs-own-approval"), undefined);
+    const write = db.prepare("SELECT token,card_message_id FROM lark_execution_approvals WHERE item_id='write-needs-own-approval'").get() as { token: string; card_message_id: string };
+    assert.equal(decideLarkExecutionApprovalFromCard({ token: write.token, messageId: write.card_message_id, decision: "reject", operatorId: "ou_owner" }).ok, true);
+    await until(() => response("write-needs-own-approval")?.decision === "decline");
+    await retryPendingAutoApprovalNotifications();
+    assert.equal(reviews, 1);
+    assert.equal(cards.length, manual ? 1 : 0);
+    assert.equal(notices, manual ? 0 : 1);
+    assert.equal((db.prepare("SELECT approval_scope FROM lark_turn_auto_reviews WHERE applied_at IS NOT NULL").get() as {approval_scope: string} | undefined)?.approval_scope, manual ? undefined : "turn");
+    await f.runtime.app.inject({ method: "PATCH", url: "/v1/settings", headers: f.headers, payload: { ownerMentionAssistBotIds: [] } });
+    await request("after-disable", logs("demo-api", 50));
+    await until(() => response("after-disable")?.decision === "decline");
+    await f.complete(message, "<lark-no-reply/>");
+  } finally { await f.close(); }
 });
 
 test("external bots directly mentioning the agent bypass only owner-assist policy, not execution approvals",async()=>{
