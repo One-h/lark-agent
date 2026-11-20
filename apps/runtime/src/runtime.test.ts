@@ -373,10 +373,8 @@ test("proactive sends are persisted once and exposed through message DTOs", asyn
     const inbound = (await runtime.app.inject({ method: "POST", url: "/v1/messages", payload: { event_id: "evt-proactive", chat_id: "oc_owner", chat_type: "p2p", sender_id: "ou_owner", sender_type: "user", message_type: "text", content: "send" } })).json() as { id: number };
     runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='turn-proactive' WHERE id=?").run(inbound.id);
     const pending = runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: "/v1/internal/capabilities/lark.message.send/execute", payload: { input: { recipient: "Alice", text: "hello" }, context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: "trusted", turnId: "turn-proactive" } } });
-    for (let index = 0; approvalIds.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(approvalIds.length, 1);
-    await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
     assert.equal((await pending).statusCode, 200);
+    assert.equal(approvalIds.length, 0);
 
     recordOutboundLarkMessage({ messageId: "om_proactive", chatId: "oc_contact", chatType: "p2p", recipientId: "ou_contact", content: "hello", replyToMessageId: null, messageAt: "2026-09-03T04:05:06.000Z", messageType: "text", source: "proactive" });
     assert.equal((runtime.store.db.prepare("SELECT count(*) AS count FROM lark_messages WHERE message_id='om_proactive'").get() as { count: number }).count, 1);
@@ -419,11 +417,10 @@ test("proactive delivery remains successful when outbound recording fails", asyn
     runtime.store.db.prepare("UPDATE lark_messages SET codex_status='running',codex_turn_id='turn-proactive-record-failure' WHERE id=?").run(inbound.id);
     runtime.store.db.exec("CREATE TRIGGER reject_outbound_record BEFORE INSERT ON lark_messages WHEN NEW.direction='outbound' BEGIN SELECT RAISE(FAIL, 'simulated outbound record failure'); END");
     const pending = runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: "/v1/internal/capabilities/lark.message.send/execute", payload: { input: { recipient: "Alice", text: "hello" }, context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: "trusted", turnId: "turn-proactive-record-failure" } } });
-    for (let index = 0; approvalIds.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${approvalIds[0]}/approve` });
     const response = await pending;
 
     assert.equal(response.statusCode, 200);
+    assert.equal(approvalIds.length, 0);
     assert.equal(response.json().sent, true);
     assert.equal(sends, 1);
     assert.equal((runtime.store.db.prepare("SELECT count(*) AS count FROM lark_messages WHERE direction='outbound'").get() as { count: number }).count, 0);
@@ -700,7 +697,7 @@ test("contact message timeline uses stable descending cursors and validates cont
   } finally { await runtime.app.close(); runtime.stop(); }
 });
 
-test("Lark messages invoke host capabilities with verified trust and approval", async () => {
+test("verified trusted Lark messages invoke host capabilities without an approval card", async () => {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "lark-agent-")), "agent.sqlite");
   const host = Fastify({ logger: false });
   let calls = 0;
@@ -730,11 +727,8 @@ test("Lark messages invoke host capabilities with verified trust and approval", 
     const inserted = runtime.store.db.prepare("INSERT INTO lark_messages (event_id,message_id,chat_id,chat_type,sender_id,message_type,content,mentioned,codex_status,codex_turn_id,raw_json,received_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run("evt-migrated", "om_migrated", "oc_migrated", "p2p", "ou_owner", "text", "部署", 1, "running", "turn-migrated", "{}", now, now);
     const larkMessageId = Number(inserted.lastInsertRowid);
     const pending = runtime.app.inject({ method: "POST", url: "/v1/internal/capabilities/host.deploy/execute", headers: { authorization: "Bearer test-token" }, payload: { input: { app: "demo" }, context: { larkMessageId, chatId: "oc_migrated", trustScope: "trusted" } } });
-    for (let index = 0; cards.length === 0 && index < 20; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(cards.length, 1);
-    assert.equal(runtime.store.approval(cards[0])?.lark_message_id, larkMessageId);
-    assert.deepEqual((await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: `/v1/approvals/${cards[0]}/approve` })).json(), { ok: true });
     assert.equal((await pending).statusCode, 200);
+    assert.equal(cards.length, 0);
     assert.equal(calls, 1);
     assert.deepEqual(hostPayload, {
       input: { app: "demo" },

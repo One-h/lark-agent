@@ -251,14 +251,14 @@ test("external bots directly mentioning the agent bypass only owner-assist polic
     assert.equal(thread.sandbox,"read-only");assert.equal(thread.approvalPolicy,"on-request");
     await codexAppServer.request("fixture/approval",{request:{id:"bot-direct-command",method:"item/commandExecution/requestApproval",params:{
       threadId:source.codex_session_id,turnId:source.codex_turn_id,itemId:"direct-command",command:"echo check",cwd:f.root}}});
-    const pending=()=>f.runtime.store.db.prepare("SELECT * FROM lark_execution_approvals WHERE lark_message_id=? AND status='pending' AND card_message_id IS NOT NULL").get(source.id) as any;
+    const pending=()=>f.runtime.store.db.prepare("SELECT * FROM lark_capability_approvals WHERE lark_message_id=? AND status='pending' AND card_message_id IS NOT NULL").get(source.id) as any;
     await until(()=>Boolean(pending()));
     const approval=pending();assert.equal(approval.requester_id,"ou_external");assert.equal(approval.approver_id,"ou_owner");
     assert(!f.records().some(r=>r.id==="bot-direct-command"&&r.result?.decision==="accept"));
-    assert.equal(decideLarkExecutionApprovalFromCard({token:approval.token,decision:"reject",operatorId:"ou_owner",messageId:approval.card_message_id}).ok,true);
+    assert.equal((await f.runtime.app.inject({method:"POST",url:`/v1/approvals/${approval.id}/reject`,headers:f.headers})).statusCode,200);
     await until(()=>f.records().some(r=>r.id==="bot-direct-command"&&r.result?.decision==="decline"));
     await f.complete("om_bot_direct","该操作未执行。");
-    assert(f.sent.length>0);assert(f.sent.every(text=>!text.includes("<at ")));
+    assert.deepEqual(f.sent,['<at user_id="ou_external"></at> 该操作未执行。']);
     assert.equal(f.records().filter(r=>r.method==="turn/start").length,1);
   }finally{await f.close();}
 });
@@ -556,8 +556,8 @@ test("a prior human rejection or expiry does not prevent a new alert from reques
       const second=await f.start("om_new_alert",{content:"新的告警时间窗口，请核查当前错误"});await f.decision("om_new_alert","handle");
       assert.equal(second.codex_session_id,first.codex_session_id);
       const prompt=fs.readFileSync(path.join(second.codex_task_dir,"prompt.md"),"utf8");
-      assert.match(prompt,/新告警、新任务或新时间窗口按当前范围申请所需授权/);
-      assert.match(prompt,/当前范围内的明确拒绝应停止/);
+      assert.match(prompt,/历史拒绝只约束当时请求及明确拒绝的范围/);
+      assert.doesNotMatch(prompt,/lark_approval_plan|先登记审批/);
       await ask(second,"second-request");await until(()=>pending()?.lark_message_id===second.id);
       const next=pending();
       assert.equal(decideLarkExecutionApprovalFromCard({token:next.token,decision:"approve-turn",operatorId:"ou_owner",messageId:next.card_message_id}).ok,true);

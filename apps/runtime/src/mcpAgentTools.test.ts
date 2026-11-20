@@ -197,7 +197,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   }
 });
 
-test("an opted-in external engine gets the shared MCP catalog and loses access when its turn ends", async () => {
+test("an opted-in restricted engine gets the shared MCP catalog and loses access when its turn ends", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-shared-external-"));
   let configName: string | undefined, prompt: string | undefined, steered: string | undefined, finish!: () => void;
   const host = Fastify();
@@ -207,7 +207,7 @@ test("an opted-in external engine gets the shared MCP catalog and loses access w
   const cards: number[] = [];
   const hold = new Promise<void>(resolve => { finish = resolve; });
   const engine: ExecutionEngine = { descriptor: { id: "fixture", label: "Fixture", models: [] }, supportsLarkMcp: true,
-    supportsPolicy: policy => policy.trustScope === "trusted", async open({ mcpServers }) {
+    supportsPolicy: policy => policy.trustScope === "untrusted", async open({ mcpServers }) {
       configName = mcpServers?.[0]?.name;
       return { id: "fixture-session", close() {},
         async run(text, signal) {
@@ -227,7 +227,6 @@ test("an opted-in external engine gets the shared MCP catalog and loses access w
     textReplySender: () => ({ ok: true, messageId: "om_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" }) });
   try {
     const now = new Date().toISOString();
-    app.store.setSetting("trustedExecutionEnabled", "true");
     assert.equal((await app.app.inject({ method: "POST", url: "/v1/capabilities/register", headers: auth,
       payload: { capabilities: [catalog[1]] } })).statusCode, 200);
     const insert = app.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,thread_id,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
