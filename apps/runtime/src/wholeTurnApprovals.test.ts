@@ -87,7 +87,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const row = () => db.prepare("SELECT codex_status FROM lark_messages WHERE id=1").pluck().get();
     await until(() => row() === "answered");
     assert.deepEqual(JSON.parse(fs.readFileSync(outcomes, "utf8")), {
-      "approval-0": "accept", "approval-1": "accept", "approval-2": "decline", "approval-3": "decline", "approval-4": "decline"
+      "approval-0": "accept", "approval-1": "accept", "approval-2": manual ? "accept" : "decline",
+      "approval-3": manual ? "accept" : "decline", "approval-4": "decline"
     });
     assert.equal(reviews, 1);
     assert.equal(cards.length, manual ? 1 : 0);

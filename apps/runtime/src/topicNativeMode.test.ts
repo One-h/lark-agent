@@ -379,7 +379,7 @@ createInterface({input:process.stdin}).on("line",l=>{
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 200);
     await until(() => wholeTask ? readDecisions().length === 5 : cards.length === 2);
     const decisions = [{ step: 0, option: null }, { step: 1, option: "once" }, { step: 2, option: "once" }, { step: 3, option: null }];
-    assert.deepEqual(readDecisions(), wholeTask ? [...decisions, { step: 4, option: null }] : decisions);
+    assert.deepEqual(readDecisions(), wholeTask ? [...decisions, { step: 4, option: "once" }] : decisions);
     if (wholeTask) { assert.equal(cards.length, 1); assert.equal(reviews, 1); }
     else assert.equal(f.runtime().store.approval(cards[1].approvalId)?.operation, expected("late.txt"));
     assert.deepEqual((await f.runtime().app.inject({ method: "POST", url: topic+"/cancel", headers })).json(), { requested: 1 });

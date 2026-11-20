@@ -178,7 +178,7 @@ export function createRuntime(config: RuntimeConfig) {
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
-  const wholeTasks = new Map<string, { identity: string; readOnlyTask: boolean; allows: ReturnType<typeof wholeTurnScope>;
+  const wholeTasks = new Map<string, { identity: string; allows: ReturnType<typeof wholeTurnScope>;
     decision: Promise<WholeTaskDecision> }>();
   const authorizations = new Set<{ turnId: string; messageId: number; controller: AbortController; started: boolean }>();
   const removeOwnerContextListener = onOwnerAssistContextChanged(messageId => {
@@ -296,7 +296,7 @@ export function createRuntime(config: RuntimeConfig) {
       });
       // All callers share the first decision, including a rejection or expiry.
       void decision.catch(() => {});
-      state = { identity, allows, decision, readOnlyTask };
+      state = { identity, allows, decision };
       wholeTasks.set(input.turnId, state);
     }
     if (state.identity !== identity) throw new Error("本轮请求身份已变化，请在新一轮重新授权。");
@@ -306,7 +306,7 @@ export function createRuntime(config: RuntimeConfig) {
       if (wholeTasks.get(input.turnId) !== state || approver !== approverId
         || store.setting("turnAutoApprovalEnabled", "false") !== "true" || !result.approved)
         throw new Error("本轮任务未获授权或授权已失效。");
-      const manual = result.source === "manual" && (!state.readOnlyTask || !requiresManualTurnApproval(input));
+      const manual = result.source === "manual" && !requiresManualTurnApproval(input);
       if (!state.allows(input, manual))
         throw new Error("操作超出本轮任务授权范围，请在新一轮说明变更。");
     };

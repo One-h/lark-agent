@@ -148,9 +148,10 @@ export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, re
     if (candidate.messageId !== first.messageId || candidate.senderId !== first.senderId || candidate.turnId !== first.turnId
       || candidate.originalMessage !== first.originalMessage || !candidate.operationKind) return false;
     if (first.readOnlyWholeTask && (!candidate.readOnlyWholeTask || !hasWholeTurnReadScope(candidate))) return false;
-    if (readOnlyTask && (/forge\.deploy\.production:|--execute|\bargocd\b.*\bapp\s+sync\b|\bkubectl\b.*\b(?:apply|patch|delete|edit|scale|rollout\s+restart)\b/i.test(candidate.operation)
-      || plan?.steps.some(step => step.effect === "remote-write" && planCoversOperation({ ...plan, steps: [step] }, candidate)))) return false;
-    if (manual && !first.readOnlyWholeTask && !candidate.readOnlyWholeTask) return true;
+    const remoteWrite = /forge\.deploy\.production:|--execute|\bargocd\b.*\bapp\s+sync\b|\bkubectl\b.*\b(?:apply|patch|delete|edit|scale|rollout\s+restart)\b/i.test(candidate.operation);
+    if (readOnlyTask && (remoteWrite || plan?.steps.some(step => step.effect === "remote-write"
+      && planCoversOperation({ ...plan, steps: [step] }, candidate)))) return false;
+    if (manual && !remoteWrite && !first.readOnlyWholeTask && !candidate.readOnlyWholeTask) return true;
     if (candidate.operationKind === initial.kind && candidate.operation === initial.operation && candidate.cwd === initial.cwd) return true;
     if (plan && planCoversOperation(plan, candidate)) return true;
     if (candidate.operationKind !== "command") return false;
