@@ -1026,13 +1026,14 @@ export function createRuntime(config: RuntimeConfig) {
     return reply.code(result.success ? 200 : 409).send(result);
   });
   app.post("/v1/internal/stickers/:tool", async (request, reply) => {
-    if (!authenticated(request)) return reply.code(401).send({ error: "unauthorized" });
+    const external = authenticatedMcp(request);
+    if (!external && !authenticated(request)) return reply.code(401).send({ error: "unauthorized" });
     const tool = (request.params as { tool?: unknown }).tool;
     const payload = request.body as { contextToken?: unknown; input?: unknown };
     if ((tool !== "search" && tool !== "select") || typeof payload?.contextToken !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(payload.contextToken) || !payload.input || typeof payload.input !== "object" || Array.isArray(payload.input)) {
       return reply.code(400).send({ error: "invalid sticker MCP request" });
     }
-    const result = runLarkStickerMcpTool(payload.contextToken, tool, payload.input as Record<string, unknown>);
+    const result = runLarkStickerMcpTool(payload.contextToken, tool, payload.input as Record<string, unknown>, external);
     return reply.code(result.success ? 200 : 409).send(result);
   });
   app.post("/v1/internal/history-images/:tool", async (request, reply) => {

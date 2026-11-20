@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { larkStickerImage, listLarkStickers, searchLarkStickers } from "./stickers.js";
+import { larkStickerImage, listLarkStickers, searchLarkStickers, stripLarkStickerSelection } from "./stickers.js";
 
 export type StickerToolState = { threadId: string; turnId: string; messageId: number; candidateIds: string[]; selectedId: string | null };
 type ContentItem = { type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string };
@@ -54,6 +54,6 @@ export function runStickerTool(name: string, args: unknown, context: StickerTool
 export function applySelectedSticker(answer: string | null, state: StickerToolState | undefined, context: Omit<StickerToolContext, "taskDir">): string | null {
   if (!answer || /^<(?:lark|forge)-no-reply\s*\/>$/i.test(answer.trim())) return answer;
   if (!state || state.threadId !== context.threadId || state.turnId !== context.turnId || state.messageId !== context.messageId) return answer;
-  const text = answer.replace(/<(?:lark|forge)-sticker>[\s\S]*?<\/(?:lark|forge)-sticker>/gi, "").trim();
+  const text = stripLarkStickerSelection(answer);
   return state.selectedId ? `${text}\n<lark-sticker>${JSON.stringify({ id: state.selectedId })}</lark-sticker>` : text;
 }

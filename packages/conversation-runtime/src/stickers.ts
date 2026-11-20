@@ -259,6 +259,10 @@ export function selectLarkStickerId(chatId: string | null, query = ""): string |
   return resolveLarkStickerQuery(chatId, query)?.id ?? null;
 }
 
+export function stripLarkStickerSelection(answer: string): string {
+  return answer.replace(/<(?:lark|forge)-sticker>[\s\S]*?<\/(?:lark|forge)-sticker>/gi, "").trim();
+}
+
 export function ensureLarkStickerSelection(answer: string, chatId: string | null, query = ""): string {
   const blocks = [...answer.matchAll(/<(?:lark|forge)-sticker>([\s\S]*?)<\/(?:lark|forge)-sticker>/gi)];
   if (blocks.length === 1) {
@@ -273,8 +277,7 @@ export function ensureLarkStickerSelection(answer: string, chatId: string | null
       // Replace malformed or stale selections with a valid fallback below.
     }
   }
-  const text = answer.replace(/<(?:lark|forge)-sticker>[\s\S]*?<\/(?:lark|forge)-sticker>/gi, "").trim();
-  return text;
+  return stripLarkStickerSelection(answer);
 }
 
 export function larkStickerAcquisitionPrompt(): string {
@@ -308,7 +311,7 @@ export function larkStickerPrompt(contextToken?: string, options: { chatId?: str
 
 export function stageLarkStickerSelection(answer: string, taskDir: string, chatId: string | null = null): { text: string; media: StagedLarkSticker[]; errors: string[]; stickerIds: string[] } {
   const blocks = [...answer.matchAll(/<(?:lark|forge)-sticker>([\s\S]*?)<\/(?:lark|forge)-sticker>/g)];
-  let text = answer.replace(/<(?:lark|forge)-sticker>[\s\S]*?<\/(?:lark|forge)-sticker>/g, "").trim();
+  const text = stripLarkStickerSelection(answer);
   const errors: string[] = [];
   const media: StagedLarkSticker[] = [];
   const stickerIds: string[] = [];

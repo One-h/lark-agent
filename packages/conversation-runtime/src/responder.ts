@@ -5,9 +5,9 @@ import path from "node:path";
 import { unicodeSafePrefix, type CodexAppServerNotification, type CodexAppServerRequest } from "@lark-agent/adapter-codex-app-server";
 import { larkAtTag, larkReplyIdempotencyKey, sendLarkExecutionApprovalCard, sendLarkExecutionReceiptCard, sendLarkImagePostReply, sendLarkMediaReply, updateLarkExecutionApprovalCard, updatePendingLarkExecutionApprovalCard, type LarkExecutionReceiptEntry } from "@lark-agent/adapter-lark-cli";
 import { renderLarkReply, parseLarkReplyPresentation, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
-import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
-import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
-import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection } from "./stickers.js";
+import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, larkExternalStickerMcpServer, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
+import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, configuredLarkStickerUsageMode, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
+import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection, stripLarkStickerSelection } from "./stickers.js";
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
 import { PromptInstructionCache, type PromptInstructionSnapshot } from "./promptInstructionCache.js";
 import { sanitizeLarkReply } from "./replySanitization.js";
@@ -2129,7 +2129,7 @@ export function suppressPendingLarkExecutionReceipts(): number {
   return db.prepare("UPDATE lark_execution_receipts SET delivery_status='suppressed', delivery_error=NULL, updated_at=? WHERE delivery_status='pending'").run(nowIso()).changes;
 }
 
-function queuePreparedReplyMedia(target: PreparedLarkCodexMessage, turnId: string,
+function queuePreparedReplyMedia(target: Pick<PreparedLarkCodexMessage, "row" | "messageId" | "taskDir">, turnId: string,
   mediaResult: ReturnType<typeof extractLarkReplyMedia>, afterTextKey?: string, afterTextMessageId = target.row.id): number[] {
   const ids: number[] = [];
   let sentCount = 0;
@@ -2189,7 +2189,8 @@ function finishRun(
     run.memberReplies.delete(target.row.id);
   }
   const answerWithSticker = finalAnswer && sendReply && !noReplyDecision && status !== "failed"
-    ? ensureLarkStickerSelection(finalAnswer, target.row.chat_id, target.row.content ?? "")
+    ? configuredLarkStickerUsageMode(target.row.chat_id) === "off" ? stripLarkStickerSelection(finalAnswer)
+      : ensureLarkStickerSelection(finalAnswer, target.row.chat_id, target.row.content ?? "")
     : noReplyDecision ? null : finalAnswer;
   const canDeliverAttachments = sendReply && !noReplyDecision && status !== "failed" && !approvalOutcome;
   const attachmentContext = { threadId: run.threadId, turnId: run.turnId, messageId: target.row.id };
@@ -3513,14 +3514,32 @@ export function runLarkAttachmentMcpTool(contextToken: string, args: Record<stri
   return result;
 }
 
-export function runLarkStickerMcpTool(contextToken: string, tool: "search" | "select", args: Record<string, unknown>): { success: boolean; contentItems: Array<{ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }> } {
+export function runLarkStickerMcpTool(contextToken: string, tool: "search" | "select", args: Record<string, unknown>, external = false): ReturnType<typeof runStickerTool>["result"] {
+  const toolName = tool === "search" ? "lark_stickers_search" : "lark_stickers_select";
+  const unavailable = (text: string): ReturnType<typeof runStickerTool>["result"] =>
+    ({ success: false, contentItems: [{ type: "inputText", text }] });
+  const expired = "Sticker context expired or does not belong to the active Lark message";
+  const disabled = "Stickers are disabled for this conversation";
+  if (external) {
+    const run = [...externalTopicTurns.values()].find(candidate =>
+      candidate.mcp?.token === contextToken && isExternalMcpTurnActive(candidate, candidate.mcp.source.id));
+    const mcp = run?.mcp;
+    if (!run || !mcp || groupPrivacyBlocks(mcp.source.id)) return unavailable(expired);
+    if (configuredLarkStickerUsageMode(mcp.source.chat_id) === "off") return unavailable(disabled);
+    const { taskDir } = larkCodexTaskPaths(mcp.source, mcp.trusted);
+    const { state, result } = runStickerTool(toolName, args, {
+      threadId: run.session.id, turnId: run.id, messageId: mcp.source.id, taskDir
+    }, mcp.stickers);
+    if (result.success) mcp.stickers = state;
+    return result;
+  }
   const run = [...activeLarkCodexRuns.values()].find((candidate) => {
     if (candidate.settled) return false;
     return responseRunMember(candidate).stickerContextToken === contextToken;
   });
-  if (!run) return { success: false, contentItems: [{ type: "inputText", text: "Sticker context expired or does not belong to the active Lark message" }] };
+  if (!run) return unavailable(expired);
   const target = responseRunMember(run);
-  const toolName = tool === "search" ? "lark_stickers_search" : "lark_stickers_select";
+  if (configuredLarkStickerUsageMode(target.row.chat_id) === "off") return unavailable(disabled);
   appendPreparedLog(target, { method: "mcp/tool/call", params: { server: "lark_stickers", tool, messageId: target.row.id } });
   const { state, result } = runStickerTool(toolName, args, { threadId: run.threadId, turnId: run.turnId, messageId: target.row.id, taskDir: target.taskDir }, target.stickerTools);
   if (result.success) target.stickerTools = state;
@@ -4336,7 +4355,7 @@ type ExternalTopicTurn = {
   steering: Set<Promise<unknown>>;
   accepting: boolean;
   nativeApproval: boolean;
-  mcp?: { token: string; source: LarkMessageRow; trusted: boolean };
+  mcp?: { token: string; source: LarkMessageRow; trusted: boolean; stickers?: StickerToolState };
   done: Promise<void>;
 };
 const externalTopicTurns = new Map<string, ExternalTopicTurn>();
@@ -4379,14 +4398,27 @@ export function cancelExternalTopicTurns(chatId: string, threadId: string): numb
 }
 
 function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string,
-  final?: { turnId: string; trusted: boolean }): void {
+  final?: { turnId: string; trusted: boolean; selectedSticker?: string }): void {
   updateCodexState(message.id, { status, reply: text || null, error, finishedAt: nowIso() });
   if (!text) {
     db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=?").run(message.id);
     return;
   }
-  queueLarkTextReply(message, formatLarkFinalReply(message, text), larkReplyIdempotencyKey("topicengine", String(message.id)),
-    final && { taskDir: larkCodexTaskPaths(message, final.trusted).taskDir, turnId: final.turnId, markdown: text });
+  const textKey = larkReplyIdempotencyKey("topicengine", String(message.id));
+  const taskDir = final && larkCodexTaskPaths(message, final.trusted).taskDir;
+  queueLarkTextReply(message, formatLarkFinalReply(message, text), textKey,
+    final && taskDir ? { taskDir, turnId: final.turnId, markdown: text } : undefined);
+  if (!final?.selectedSticker || !taskDir || !message.message_id) return;
+  try {
+    const media = stageLarkStickerSelection(final.selectedSticker, taskDir, message.chat_id);
+    queuePreparedReplyMedia({ row: message, messageId: message.message_id, taskDir }, final.turnId, media, textKey);
+  } catch {
+    console.warn("lark_external_sticker_staging_failed", { messageId: message.id });
+  }
+}
+
+function externalLarkMcpInstructions(message: LarkMessageRow, token: string): string {
+  return `${larkMcpToolsInstruction(token)}\n\n${larkStickerPrompt(token, { chatId: message.chat_id })}`;
 }
 
 async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalExecutionRoute, trusted: boolean): Promise<void> {
@@ -4413,7 +4445,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   if (active?.accepting && !active.controller.signal.aborted && active.session.steer) {
     const running = active;
     const nextToken = running.mcp ? crypto.randomBytes(24).toString("base64url") : undefined;
-    const input = nextToken ? `${text}\n\n${larkMcpToolsInstruction(nextToken)}` : text;
+    const input = nextToken ? `${text}\n\n${externalLarkMcpInstructions(message, nextToken)}` : text;
     const sendSteer = active.session.steer.bind(active.session);
     const steer = Promise.resolve().then(() => sendSteer(input, AbortSignal.any([running.controller.signal, AbortSignal.timeout(12_000)]))).then(outcome => {
       if (outcome === "injected") {
@@ -4449,7 +4481,9 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const controller = new AbortController();
   const progressId = crypto.randomUUID();
   const mcpServer = engine.supportsLarkMcp ? larkAgentToolsMcpServer() : undefined;
-  const mcpToken = mcpServer ? crypto.randomBytes(24).toString("base64url") : undefined;
+  const stickerServer = mcpServer && larkExternalStickerMcpServer();
+  const mcpServers = [mcpServer, stickerServer].filter(server => server !== undefined);
+  const mcpToken = mcpServers.length ? crypto.randomBytes(24).toString("base64url") : undefined;
   const authorizeNative: ExecutionNativeApproval | undefined = nativeApprover && ((operation, signal, current) => {
     if (operation.engineId !== route.engineId) return Promise.resolve(false);
     const stillCurrent = () => db.open && externalNativeApprovalHandler === nativeApprover
@@ -4462,7 +4496,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   externalTopicStarts.set(controller, message);
   try {
     session = await engine.open({ sessionId: loadTopicExecutionSession(key), model: route.model, policy, signal: controller.signal,
-      ...(mcpServer ? { mcpServers: [mcpServer] } : {}), authorizeNative });
+      ...(mcpServers.length ? { mcpServers } : {}), authorizeNative });
     controller.signal.throwIfAborted();
     if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
       await session.close();
@@ -4509,7 +4543,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
     const nativePolicy = authorizeNative ? `\n\n默认保持只读。需要受限操作时通过引擎的权限请求申请，范围以飞书审批为准。登记任务计划时，ACP 原生工具的步骤使用 kind=capability、cwd=null；operation 为 acp.${route.engineId}.<实际工具名>: <完整参数 JSON>。` : "";
-    try { result = await session.run(`${prompt}${mcpToken ? `\n\n${larkMcpToolsInstruction(mcpToken)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent); }
+    try { result = await session.run(`${prompt}${mcpToken ? `\n\n${externalLarkMcpInstructions(message, mcpToken)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent); }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
@@ -4524,15 +4558,21 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     await session.close();
     if (externalTopicTurns.get(key) !== run) return;
     try {
-      const answer = result?.status === "completed" && !isLarkNoReplyDecision(result.text) ? sanitizeLarkCodexReply(result.text, false) : "";
+      const text = result?.status === "completed" ? stripLarkStickerSelection(result.text) : "";
+      const answer = text && !isLarkNoReplyDecision(text) ? sanitizeLarkCodexReply(text, false) : "";
       const cancelled = result?.status === "cancelled";
       const status = result?.status === "completed" ? answer ? "answered" : "no_reply" : "failed";
       const reply = result?.status === "completed" ? answer : cancelled
         ? "外部引擎已确认取消当前任务。" : "外部引擎未返回可确认的结果，任务不会自动重跑。";
+      const mcp = run.mcp;
+      const selectedSticker = answer && mcp?.stickers && !controller.signal.aborted
+        && !groupPrivacyBlocks(mcp.source.id) && configuredLarkStickerUsageMode(message.chat_id) !== "off"
+        ? applySelectedSticker(answer, mcp.stickers, { threadId: session.id, turnId: progressId, messageId: mcp.source.id }) ?? undefined
+        : undefined;
       finishLarkProgressCard(progressId, cancelled ? "cancelled" : result ? "completed" : "failed");
       for (const member of run.members.values()) {
         finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
-          status === "answered" ? { turnId: progressId, trusted } : undefined);
+          status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined);
       }
     } finally { externalTopicTurns.delete(key); }
   })();

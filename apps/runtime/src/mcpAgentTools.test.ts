@@ -6,7 +6,7 @@ import test from "node:test";
 import Fastify from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { config, enqueueLarkCodexReply, larkCodexSessionKeyForMessage, saveConversationPersona, updateConversationExecutionSettings, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { config, enqueueLarkCodexReply, larkCodexSessionKeyForMessage, retryPendingLarkMediaReplies, retryPendingLarkTextReplies, saveConversationPersona, updateConversationExecutionSettings, uploadLarkStickers, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { codexAppServer, larkAgentToolsMcpServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
 
@@ -270,4 +270,124 @@ test("an opted-in external engine gets the shared MCP catalog and loses access w
     assert.equal(writes, 1);
     assert.equal((await submit(nextToken)).statusCode, 409);
   } finally { finish(); await app.app.close(); app.stop(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("external sticker MCP delivers only the current selection after final text", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-external-stickers-"));
+  const mediaLog = path.join(root, "media.log");
+  fs.writeFileSync(path.join(root, "lark-cli"), `#!${process.execPath}
+const fs=require("node:fs");
+if(process.argv.includes("--image"))fs.appendFileSync(${JSON.stringify(mediaLog)},process.argv[process.argv.indexOf("--message-id")+1]+"\\n");
+`, { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${root}:${oldPath ?? ""}`;
+  type OpenOptions = Parameters<ExecutionEngine["open"]>[0];
+  type Outcome = Awaited<ReturnType<Awaited<ReturnType<ExecutionEngine["open"]>>["run"]>>;
+  let servers: OpenOptions["mcpServers"], prompt = "", steered = "", finish: ((outcome: Outcome) => void) | undefined;
+  const engine: ExecutionEngine = {
+    descriptor: { id: "fixture", label: "Fixture", models: [] }, supportsLarkMcp: true, supportsPolicy: () => true,
+    async open(options) {
+      servers = options.mcpServers;
+      return { id: "fixture-session", close() {}, async run(text) {
+        prompt = text;
+        return new Promise<Outcome>(resolve => { finish = resolve; });
+      }, async steer(text) { steered = text; return "injected"; } };
+    }
+  };
+  let failText = true;
+  const app = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [],
+    runtimeToken: "fixture-host-token", executionEngines: [engine],
+    textReplySender: () => failText ? { ok: false, error: "fixture text failure" }
+      : { ok: true, messageId: "om_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" } });
+  const client = new Client({ name: "fixture-stickers", version: "1" });
+  try {
+    config.larkAgentRuntimeUrl = await app.app.listen({ host: "127.0.0.1", port: 0 });
+    const [sticker] = uploadLarkStickers([{ name: "得意", tags: ["得意"], fileName: "image.png", mimeType: "image/png",
+      dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL4WQAAAABJRU5ErkJggg==" }]);
+    const now = new Date().toISOString();
+    const insert = app.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
+      VALUES(?,?,'oc_fixture','p2p','ou_sender','user','text','Fixture request',1,'p2p','skipped','skipped','{}',?,?)`);
+    const add = (id: number) => insert.run(id, `om_source${id}`, now, now);
+    const row = (id: number) => app.store.db.prepare("SELECT codex_status, codex_reply, codex_turn_id FROM lark_messages WHERE id=?").get(id) as
+      { codex_status: string; codex_reply: string | null; codex_turn_id: string | null };
+    const sent = () => app.store.db.prepare("SELECT lark_message_id FROM sticker_sends").pluck().all();
+    const tokenIn = (text: string) => text.match(/context_token=([A-Za-z0-9_-]{32})/)![1];
+    add(1);
+    assert.equal(updateConversationExecutionSettings("oc_fixture", { engineId: "fixture", model: null }), "ok");
+    const start = async (id: number) => {
+      finish = undefined;
+      add(id);
+      assert.equal(enqueueLarkCodexReply(id), true);
+      await waitFor(() => finish);
+      return tokenIn(prompt);
+    };
+    app.store.setSetting("conversation.stickerUsageMode:oc_fixture", "always");
+    const first = await start(2);
+    assert.match(prompt, /表情包（每次回复）/);
+    const descriptor = servers?.find(server => server.name === "lark_stickers");
+    assert(descriptor);
+    assert(!descriptor.env.some(item => item.name === "LARK_AGENT_RUNTIME_TOKEN"));
+    await client.connect(new StdioClientTransport({ command: descriptor.command, args: descriptor.args,
+      env: Object.fromEntries(descriptor.env.map(item => [item.name, item.value])) }));
+    assert.deepEqual((await client.listTools()).tools.map(tool => tool.name).sort(), ["search", "select"]);
+    const search = (token: string) => client.callTool({ name: "search", arguments: { context_token: token, query: "得意" } });
+    const select = (token: string) => client.callTool({ name: "select", arguments: { context_token: token, sticker_id: sticker.id } });
+    assert.equal((await select(first)).isError, true);
+    assert.notEqual((await search(first)).isError, true);
+    assert.notEqual((await select(first)).isError, true);
+    assert.deepEqual(sent(), []);
+    finish!({ status: "completed", text: "**Final**" });
+    await waitFor(() => row(2).codex_status === "answered");
+    assert.equal(row(2).codex_reply, "**Final**");
+    assert.deepEqual(sent(), []);
+    assert.equal(app.store.db.prepare("SELECT status FROM lark_delivery_outbox WHERE lark_message_id=2 AND kind='media'").pluck().get(), "pending");
+    assert.equal((await search(first)).isError, true);
+    failText = false;
+    app.store.db.prepare("UPDATE lark_messages SET reply_next_attempt_at='1970-01-01' WHERE id=2").run();
+    retryPendingLarkTextReplies();
+    app.store.db.prepare("UPDATE lark_delivery_outbox SET next_attempt_at='1970-01-01' WHERE lark_message_id=2").run();
+    retryPendingLarkMediaReplies();
+    retryPendingLarkMediaReplies();
+    assert.deepEqual(sent(), [2]);
+    assert.equal(fs.readFileSync(mediaLog, "utf8"), "om_source2\n");
+
+    const directive = `<lark-sticker>{"id":"${sticker.id}"}</lark-sticker>`;
+    const next = await start(10);
+    await search(next); await select(next);
+    add(20);
+    assert.equal(enqueueLarkCodexReply(20), true);
+    await waitFor(() => row(20).codex_turn_id || undefined);
+    assert.notEqual(tokenIn(steered), next);
+    assert.equal((await select(next)).isError, true);
+    assert.equal((await select(tokenIn(steered))).isError, true);
+    finish!({ status: "completed", text: `Follow-up ${directive}` });
+    await waitFor(() => row(10).codex_status === "answered");
+    assert.equal(row(10).codex_reply, "Follow-up");
+
+    for (const [id, result, expected] of [
+      [30, { status: "completed", text: "<lark-no-reply/>" }, "no_reply"],
+      [40, { status: "cancelled" }, "failed"]
+    ] as const) {
+      const token = await start(id);
+      assert.notEqual((await search(token)).isError, true);
+      assert.notEqual((await select(token)).isError, true);
+      finish!(result);
+      await waitFor(() => row(id).codex_status === expected);
+    }
+    const disabled = await start(50);
+    assert.notEqual((await search(disabled)).isError, true);
+    assert.notEqual((await select(disabled)).isError, true);
+    app.store.setSetting("conversation.stickerUsageMode:oc_fixture", "off");
+    assert.equal((await search(disabled)).isError, true);
+    finish!({ status: "completed", text: `Off ${directive}` });
+    await waitFor(() => row(50).codex_status === "answered");
+    assert.equal(row(50).codex_reply, "Off");
+    assert.deepEqual(sent(), [2]);
+  } finally {
+    finish?.({ status: "cancelled" });
+    await client.close();
+    await app.app.close(); app.stop();
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

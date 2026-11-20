@@ -17,8 +17,14 @@ host runtime credential still expose plan registration, not host calls.
 | `forge.todo.create` | `forge__todo__create` | Task creation with existing write policy |
 | `lark.message.send` | `lark__message__send` | Bot sends to a resolved contact; existing approval or owner fast path |
 
-The separate `lark_stickers` server still provides stickers, attachments,
-history images and owner assistance. These tool names and behavior are unchanged.
+The separate `lark_stickers` server provides stickers, attachments, history
+images and owner assistance for Codex. External engines get a search/select-only
+instance authenticated by the process-local MCP credential, not the runtime
+credential. Both paths share the conversation's sticker mode, selection logic,
+library and delivery queue. A selection belongs to the live message and turn;
+it is queued after a successful final response and sent only after the final
+text is delivered. Cancelling, declining to reply or disabling stickers
+discards the selection.
 
 ## Engine adapters
 
@@ -28,8 +34,8 @@ parallel dynamic tools. Previously stored dynamic calls can still be handled
 for compatibility, through the same approval plan and capability services.
 
 Local external adapters may opt in with `supportsLarkMcp` and mount the supplied
-stdio descriptor on session creation and resume. Native Claude, DSH, OpenCode
-and AGY opt in only under the existing trusted policy. Engine deadlines and
+stdio descriptors on session creation and resume. Native Claude, DSH, OpenCode
+and AGY use this path under their existing execution policies. Engine deadlines and
 capabilities are unchanged;
 for example an engine can end its turn before the human approval deadline.
 

@@ -391,7 +391,7 @@ createInterface({input:process.stdin}).on("line",l=>{
   } finally { await f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("DSH, OpenCode and AGY share the Lark workflow over ACP stdio", async () => {
+test("Claude, DSH, OpenCode and AGY share the Lark workflow over ACP stdio", async () => {
   const launcherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "lark-native-acp-"));
   const launcher = path.join(launcherRoot, "peer.mjs"), log = path.join(launcherRoot, "methods.jsonl");
   fs.writeFileSync(launcher, `#!${process.execPath}
@@ -400,7 +400,7 @@ import { createInterface } from 'node:readline';
 const args=process.argv.slice(2);
 const engine=JSON.stringify(args)===JSON.stringify(['--profile','acp'])?'dsh':
   JSON.stringify(args)===JSON.stringify(['acp','--disable-telemetry'])?'agy':
-  JSON.stringify(args)===JSON.stringify(['acp'])?'opencode':null;
+  JSON.stringify(args)===JSON.stringify(['acp'])?'opencode':args.length===0?'claude':null;
 if(!engine || process.env.LARK_AGENT_RUNTIME_TOKEN || process.env.LARK_AGENT_MCP_TOKEN) throw Error('Invalid launcher environment');
 const id='session-'+engine;
 const send=body=>console.log(JSON.stringify({jsonrpc:'2.0',...body}));
@@ -415,11 +415,12 @@ createInterface({input:process.stdin}).on('line',line=>{
  if(method==='initialize'){
   if(!params.clientCapabilities.session.notices)throw Error('Notices would leak into transcript');
   respond(rpc,{protocolVersion:1,agentInfo:{name:engine,version:'0.108.1'},agentCapabilities:{
-   ...(engine==='dsh'?{}:{loadSession:true}),sessionCapabilities:{resume:{},close:{}}},_meta:{steering:{supported:true}}});
- }else if(method==='session/new'||method==='session/resume'){
-  if(realpathSync(params.cwd)!==process.cwd()||params.mcpServers.length!==1||params.mcpServers[0].name!=='lark_tools')throw Error('Shared workspace or MCP missing');
-  if(method==='session/resume'&&params.sessionId!==id)throw Error('Wrong saved conversation');
-  if(method==='session/resume')chunk('Old transcript', 'replay');
+   ...(engine==='dsh'?{}:{loadSession:true}),sessionCapabilities:{resume:{},close:{}}},_meta:{steering:{supported:engine!=='claude'}}});
+ }else if(method==='session/new'||method==='session/resume'||method==='session/load'){
+  if(realpathSync(params.cwd)!==process.cwd()||params.mcpServers.map(server=>server.name).join(',')!=='lark_tools,lark_stickers'
+    ||params.mcpServers.some(server=>server.env.some(item=>item.name==='LARK_AGENT_RUNTIME_TOKEN')))throw Error('Shared workspace or MCP missing');
+  if(method!=='session/new'&&params.sessionId!==id)throw Error('Wrong saved conversation');
+  if(method!=='session/new')chunk('Old transcript', 'replay');
   respond(rpc,{...(method==='session/new'?{sessionId:id}:{}),configOptions:config('default')});
  }else if(method==='session/set_config_option'){
   if(params.sessionId!==id||params.configId!=='provider-model')throw Error('Wrong model selector');
@@ -459,15 +460,16 @@ createInterface({input:process.stdin}).on('line',line=>{
   throw Error('Unexpected ACP method '+method);
  }
 });`, { mode: 0o700 });
-  const ids = ["dsh", "opencode", "agy"];
+  const ids = ["claude", "dsh", "opencode", "agy"];
   const env = Object.fromEntries(ids.flatMap(id => [
     [`LARK_AGENT_${id.toUpperCase()}_ACP_NATIVE_LAUNCHER`, launcher],
     [`LARK_AGENT_${id.toUpperCase()}_ACP_MODELS`, " fixture-model,fixture-model "]
   ]));
   const failures: string[] = [];
-  const engines = configuredNativeAcpEngines({ ...env, LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER: "invalid-relative-launcher" }, id => failures.push(id));
+  configuredNativeAcpEngines({ ...env, LARK_AGENT_CLAUDE_ACP_NATIVE_LAUNCHER: "invalid-relative-launcher" }, id => failures.push(id));
   assert.deepEqual(configuredNativeAcpEngines({}, () => assert.fail("unexpected enabled engine")), []);
   assert.deepEqual(failures, ["claude"]);
+  const engines = configuredNativeAcpEngines(env, id => assert.fail(`unexpected invalid launcher for ${id}`));
   assert.deepEqual(engines.map(e => [e.descriptor.id, e.descriptor.models]), ids.map(id => [id, ["fixture-model"]]));
   const f = fixture(engines);
   const delay = config.larkCodexInterimReplyDelayMs;
@@ -511,10 +513,11 @@ createInterface({input:process.stdin}).on('line',line=>{
       assert.match(cancelled.row().codex_reply, /已确认取消/);
       const events = methods(id);
       assert.equal(events.filter(row => row.method === "session/new").length, 1);
-      assert.equal(events.filter(row => row.method === "session/resume").length, 2);
-      assert.equal(events.filter(row => row.method === "session/close").length, 3);
+      assert.equal(events.filter(row => row.method === "session/resume").length, id === "claude" ? 0 : 2);
+      assert.equal(events.filter(row => row.method === "session/load").length, id === "claude" ? 2 : 0);
+      assert.equal(events.filter(row => row.method === "session/close").length, id === "claude" ? 0 : 3);
       assert.equal(events.filter(row => row.model === "fixture-model").length, 3);
-      assert(!events.some(row => row.method === "session/load" || row.method === "_session/steering"));
+      assert(!events.some(row => row.method === "_session/steering"));
     }
   } finally {
     config.larkCodexInterimReplyDelayMs = delay;

@@ -9,7 +9,9 @@ const runtimeUrl = new URL(process.env.LARK_AGENT_RUNTIME_URL ?? "http://127.0.0
 if (!["127.0.0.1", "localhost", "::1"].includes(runtimeUrl.hostname) || runtimeUrl.protocol !== "http:") {
   throw new Error("Lark sticker MCP requires a loopback HTTP runtime URL");
 }
-const runtimeToken = process.env.LARK_AGENT_RUNTIME_TOKEN?.trim() ?? "";
+const stickersOnly = process.argv.includes("--stickers-only");
+const runtimeToken = (stickersOnly ? process.env.LARK_AGENT_MCP_TOKEN : process.env.LARK_AGENT_RUNTIME_TOKEN)?.trim() ?? "";
+if (stickersOnly && !runtimeToken) throw new Error("External sticker MCP requires a local MCP token");
 
 function mcpContent(items: RuntimeContentItem[]): CallToolResult["content"] {
   const content: CallToolResult["content"] = [];
@@ -41,7 +43,7 @@ async function callRuntime(route: string, contextToken: string, input: Record<st
 }
 
 const server = new McpServer({ name: "lark-stickers", version: "0.1.0" });
-server.registerTool("owner_assist_decision", {
+if (!stickersOnly) server.registerTool("owner_assist_decision", {
   title: "判断群内协同回复及核对本人新增发言",
   description: "仅用于真正 @ 指定对象的当前群消息。先提交 handle/owner_required/ignore；最终草稿准备好后再次提交 handle 和 reply。若返回 owner_context_updated，保留草稿并结合本人发言重新判断，不能直接取消。ready 才能公开；owner_required 仅私下草稿，不批准执行。",
   inputSchema: z.object({ context_token: z.string().regex(/^[A-Za-z0-9_-]{32}$/),
@@ -49,7 +51,7 @@ server.registerTool("owner_assist_decision", {
     reply: z.string().max(6000).optional(), question: z.string().max(500).optional(), owner_context_cursor: z.number().int().positive().optional() }).strict(),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
 }, async ({ context_token, ...input }) => callRuntime("/v1/internal/owner-assist/decision", context_token, input, 40_000));
-server.registerTool("attach_files", {
+if (!stickersOnly) server.registerTool("attach_files", {
   title: "为本轮回复添加图片或文件",
   description: "登记当前消息 output 目录中已生成的图片和文档，不立即发送。追加最多八个附件；重复路径更新登记，files=[] 清空。正常结束本轮后由队列投递，最终文字无需媒体标签。",
   inputSchema: z.object({
@@ -78,7 +80,7 @@ server.registerTool("select", {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
 }, async ({ context_token, sticker_id }) => callRuntime("/v1/internal/stickers/select", context_token, { sticker_id }));
 
-server.registerTool("history_images_search", {
+if (!stickersOnly) server.registerTool("history_images_search", {
   title: "查找历史聊天图片",
   description: "列出当前私聊/群聊或原生话题此前的图片元数据，不读取像素。找最近图片时省略 query；关键词只匹配消息文字，不搜索图中文字。可用 before_local_id 翻页；先搜索再打开。context_token 必须来自当前提示词。",
   inputSchema: {
@@ -91,7 +93,7 @@ server.registerTool("history_images_search", {
 }, async ({ context_token, query, limit, before_local_id }) => callRuntime("/v1/internal/history-images/search", context_token,
   { query, limit, before_local_id }));
 
-server.registerTool("history_images_open", {
+if (!stickersOnly) server.registerTool("history_images_open", {
   title: "查看一张历史聊天图片",
   description: "读取当前会话最近一次 history_images_search 返回的指定图片。local_id 和 image_index 必须来自搜索结果；每轮最多查看四张。",
   inputSchema: {
