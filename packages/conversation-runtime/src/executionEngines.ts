@@ -25,6 +25,8 @@ export type ExecutionEngineEvent =
   | { type: "text-delta"; text: string }
   | { type: "work"; stage: ExecutionWorkStage };
 export type ExecutionEngineMcpServer = { name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> };
+export type ExecutionNativeApproval = (operation: { engineId: string; text: string; cwd: string },
+  signal: AbortSignal, stillCurrent: () => boolean) => Promise<boolean>;
 
 export interface ExecutionEngineSession {
   readonly id: string;
@@ -38,9 +40,10 @@ export interface ExecutionEngine {
   readonly descriptor: ExecutionEngineDescriptor;
   // Local engine adapters opt in to mounting the trusted stdio gateway.
   readonly supportsLarkMcp?: boolean;
+  readonly supportsNativeApproval?: boolean;
   supportsPolicy(policy: LarkExecutionPolicy): boolean;
   open(input: { sessionId: string | null; model: string | null; policy: LarkExecutionPolicy; signal: AbortSignal;
-    mcpServers?: ExecutionEngineMcpServer[] }): Promise<ExecutionEngineSession>;
+    mcpServers?: ExecutionEngineMcpServer[]; authorizeNative?: ExecutionNativeApproval }): Promise<ExecutionEngineSession>;
 }
 
 export class ExecutionEngineRegistry {

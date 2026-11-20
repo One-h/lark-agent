@@ -26,8 +26,8 @@ import { configuredLarkStickerUsageMode, groupMessageReactionChatIds, groupSpont
 import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-runtime";
 import { drainLarkProgressCards, retryPendingLarkProgressCards, type LarkProgressSender, type LarkProgressUpdater } from "@lark-agent/conversation-runtime";
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
-import { approvalPlanToolName, confirmExternalLarkMcpTurn, getLarkMcpToolContext, larkMcpHostCapabilityId,
-  listLarkMcpTools, submitLarkMcpApprovalPlan } from "@lark-agent/conversation-runtime";
+import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNativeTurn, getLarkMcpToolContext, larkMcpHostCapabilityId,
+  listLarkMcpTools, setExternalNativeApprovalHandler, submitLarkMcpApprovalPlan } from "@lark-agent/conversation-runtime";
 import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
@@ -193,7 +193,7 @@ export function createRuntime(config: RuntimeConfig) {
   };
   const confirmTurn = async (messageId: number, turnId: string) => {
     if (!liveTurn(messageId, turnId)) return false;
-    if (confirmExternalLarkMcpTurn(messageId, turnId)) return true;
+    if (confirmExternalLarkMcpTurn(messageId, turnId) || confirmExternalLarkNativeTurn(messageId, turnId)) return true;
     const row = store.db.prepare("SELECT codex_session_id FROM lark_messages WHERE id=?").get(messageId) as { codex_session_id: string | null };
     // Native-backed calls must also survive an independent native status read.
     const active = config.turnActivityProbe ? await config.turnActivityProbe(messageId, turnId)
@@ -255,6 +255,76 @@ export function createRuntime(config: RuntimeConfig) {
     } catch { settleApproval(approvalId, "failed", "once", "审批卡发送失败，操作未执行。"); }
     return result;
   };
+  const authorizeTurnOperation = async (input: TurnApprovalInput, options: {
+    required: boolean; allowModelReview: boolean; explicitlyApproved?: boolean; capabilityId?: string; display: string;
+    signal: AbortSignal; assertActive: () => void; stillCurrent?: () => boolean; sessionId?: string | null;
+  }) => {
+    const { signal, assertActive } = options;
+    const hasLegacyGrant = () => store.setting("turnAutoApprovalEnabled", "false") !== "true"
+      && !currentApprovalPlan(store.db, input) && hasLarkManualTurnApproval(store.db,
+        { turnId: input.turnId, threadId: options.sessionId, senderId: input.senderId, approverId });
+    const legacyManualApproved = !options.explicitlyApproved && hasLegacyGrant();
+    let approved = options.explicitlyApproved || legacyManualApproved;
+    let authorization: { plan: ApprovalPlan | undefined; approver: string; automatic: boolean } | undefined;
+    let reviewId: number | undefined;
+    const recordGrant = (plan: ApprovalPlan | undefined, approver: string, automatic = false) => { authorization = { plan, approver, automatic }; };
+    if (options.required && !approved && approverId) {
+      const grant = currentApprovalPlanGrant(store.db, input, approverId);
+      if (grant && grant.reviewId === undefined) {
+        approved = applyPlanAuthorization(store.db, input, grant.plan, approverId, [input]);
+        if (approved) recordGrant(grant.plan, approverId);
+      }
+    }
+    if (options.required && !approved && options.allowModelReview && store.setting("turnAutoApprovalEnabled", "false") === "true") {
+      const reviewerApprover = approverId;
+      const decision = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(input), signal);
+      assertActive();
+      if (!await confirmTurn(input.messageId, input.turnId)) throw new Error("自动审核返回时原生会话已失效，操作未执行。");
+      assertActive();
+      // A recheck applies to its matching pending command, not an unrelated operation sharing the turn.
+      approved = decision.approved && !decision.recheckedInput
+        && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover
+        && decision.reviewedPlan === currentApprovalPlan(store.db, input)
+        && (!decision.plan || !!reviewerApprover && applyPlanAuthorization(store.db, input, decision.plan, reviewerApprover, [input], decision.reviewId));
+      if (approved && reviewerApprover) recordGrant(decision.reviewedPlan, reviewerApprover, true);
+      if (approved) reviewId = decision.reviewId;
+    }
+    if (options.required && !approved && !await awaitApproval({ messageId: input.messageId, turnId: input.turnId,
+      capabilityId: options.capabilityId, operation: options.display }, signal, input, recordGrant, options.stillCurrent)) {
+      throw new Error("Operation was not approved or its turn ended");
+    }
+    return {
+      legacyRevoked: () => legacyManualApproved && !hasLegacyGrant(),
+      validate() {
+        if (authorization && (authorization.approver !== approverId || authorization.plan !== currentApprovalPlan(store.db, input)
+          || authorization.automatic && store.setting("turnAutoApprovalEnabled", "false") !== "true"))
+          throw new Error("任务计划或审批身份已变化，操作未执行。");
+        if (reviewId !== undefined) markTurnAutoApprovalApplied(reviewId);
+      }
+    };
+  };
+  const removeExternalNativeApprovalHandler = setExternalNativeApprovalHandler(async (messageId, turnId, operation, signal, stillCurrent) => {
+    const source = store.db.prepare("SELECT sender_id, content, codex_session_id FROM lark_messages WHERE id=?").get(messageId) as
+      { sender_id: string | null; content: string; codex_session_id: string | null } | undefined;
+    if (!source?.sender_id || !approverId || isTrustedLarkSender(source.sender_id)) return false;
+    const initialApprover = approverId;
+    const assertActive = () => {
+      if (!store.db.open || signal.aborted || !stillCurrent() || !confirmExternalLarkNativeTurn(messageId, turnId)
+        || !liveTurn(messageId, turnId) || approverId !== initialApprover || isTrustedLarkSender(source.sender_id))
+        throw new Error("ACP 审批上下文已失效。");
+      const current = store.db.prepare("SELECT sender_id FROM lark_messages WHERE id=?").get(messageId) as { sender_id?: string } | undefined;
+      if (current?.sender_id !== source.sender_id) throw new Error("ACP 审批发送人已变化。");
+    };
+    assertActive();
+    const input: TurnApprovalInput = { messageId, turnId, senderId: source.sender_id, originalMessage: source.content ?? "",
+      operation: operation.text, operationKind: "capability", cwd: operation.cwd };
+    const approval = await authorizeTurnOperation(input, { required: true, allowModelReview: true,
+      display: operation.text, sessionId: source.codex_session_id, signal, assertActive, stillCurrent });
+    assertActive();
+    if (approval.legacyRevoked()) return false;
+    approval.validate();
+    return true;
+  });
   const expirePendingApprovals = () => {
     const rows = store.db.prepare("SELECT * FROM lark_capability_approvals WHERE status='pending'").all() as ReturnType<typeof store.approval>[];
     for (const row of rows) {
@@ -292,6 +362,7 @@ export function createRuntime(config: RuntimeConfig) {
   });
   app.addHook("preClose", async () => {
     stopListener();
+    removeExternalNativeApprovalHandler();
     for (const call of authorizations) if (!call.started) call.controller.abort();
     for (const id of [...pendingApprovals.keys()]) settleApproval(id, "failed", "once", "服务已关闭，操作未执行。");
     while (activeCapabilityCalls > 0) await new Promise(resolve => setTimeout(resolve, 20));
@@ -421,40 +492,11 @@ export function createRuntime(config: RuntimeConfig) {
       const ownerMessageApproved = isOwnerMessageExempt();
       const approvalInput: TurnApprovalInput = { messageId: larkMessageId, turnId, senderId: message.sender_id ?? null,
         originalMessage: message.content ?? "", operation: `${capability.id}: ${encodedInput}`, operationKind: "capability", cwd: workspaceRoot };
-      const hasLegacyManualGrant = () => store.setting("turnAutoApprovalEnabled", "false") !== "true"
-        && !currentApprovalPlan(store.db, approvalInput) && hasLarkManualTurnApproval(store.db,
-          { turnId, threadId: message.codex_session_id, senderId: message.sender_id ?? null, approverId });
-      const legacyManualApproved = !ownerMessageApproved && hasLegacyManualGrant();
-      let automaticallyApproved = ownerMessageApproved || legacyManualApproved;
-      let authorizedPlan: { plan: ApprovalPlan | undefined; approver: string; automatic: boolean } | undefined;
-      let appliedReviewId: number | undefined;
-      const planApplied = (plan: ApprovalPlan | undefined, approver: string, automatic = false) => { authorizedPlan = { plan, approver, automatic }; };
-      if (approvalRequired && !automaticallyApproved && approverId) {
-        const grant = currentApprovalPlanGrant(store.db, approvalInput, approverId);
-        if (grant && grant.reviewId === undefined) {
-          automaticallyApproved = applyPlanAuthorization(store.db, approvalInput, grant.plan, approverId, [approvalInput]);
-          if (automaticallyApproved) planApplied(grant.plan, approverId);
-        }
-      }
       const deploymentInScope=deploymentOperationMatchesTask(approvalTask(message.content ?? ""),approvalInput.operation);
-      if (approvalRequired && !automaticallyApproved && (capability.risk === "local-write" || (id === "forge.deploy.production" && deploymentInScope)) && store.setting("turnAutoApprovalEnabled", "false") === "true") {
-        const reviewerApprover = approverId;
-        const decision = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(approvalInput), signal);
-        assertActive();
-        if (!await confirmTurn(larkMessageId, turnId)) throw new Error("自动审核返回时原生会话已失效，操作未执行。");
-        assertActive();
-        // A recheck covers the pending native command, not another host operation sharing the turn.
-        automaticallyApproved = decision.approved && !decision.recheckedInput
-          && store.setting("turnAutoApprovalEnabled", "false") === "true" && approverId === reviewerApprover
-          && decision.reviewedPlan === currentApprovalPlan(store.db, approvalInput)
-          && (!decision.plan || !!reviewerApprover && applyPlanAuthorization(store.db, approvalInput, decision.plan, reviewerApprover, [approvalInput], decision.reviewId));
-        if (automaticallyApproved && reviewerApprover) planApplied(decision.reviewedPlan, reviewerApprover, true);
-        if (automaticallyApproved) appliedReviewId = decision.reviewId;
-      }
-      if (approvalRequired && !automaticallyApproved && !await awaitApproval({ messageId: larkMessageId, turnId, capabilityId: id,
-        operation: `${capability.title}: ${textResult(input)}` }, signal, approvalInput, planApplied, contextStillCurrent)) {
-        throw new Error("Operation was not approved or its turn ended");
-      }
+      const approval = await authorizeTurnOperation(approvalInput, { required: approvalRequired, explicitlyApproved: ownerMessageApproved,
+        allowModelReview: capability.risk === "local-write" || id === "forge.deploy.production" && deploymentInScope,
+        capabilityId: id, display: `${capability.title}: ${textResult(input)}`, signal, assertActive,
+        sessionId: message.codex_session_id, stillCurrent: contextStillCurrent });
       assertActive();
       if (!await confirmTurn(larkMessageId, turnId)) throw new Error("无法确认原生 turn 仍有效，未执行操作。");
       assertActive();
@@ -468,12 +510,10 @@ export function createRuntime(config: RuntimeConfig) {
         if (reviewApprover !== approverId || plan !== currentApprovalPlan(store.db, approvalInput)) {
           throw new Error("MCP 审批身份或任务计划已变化，未执行操作。");
         }
-        if (approvalRequired && (ownerMessageApproved && !isOwnerMessageExempt() || legacyManualApproved && !hasLegacyManualGrant()))
+        if (approvalRequired && (ownerMessageApproved && !isOwnerMessageExempt() || approval.legacyRevoked()))
           throw new Error("MCP 授权条件已变化，未执行操作。");
       }
-      if (authorizedPlan && (authorizedPlan.approver !== approverId || authorizedPlan.plan !== currentApprovalPlan(store.db, approvalInput)
-        || authorizedPlan.automatic && store.setting("turnAutoApprovalEnabled", "false") !== "true")) throw new Error("任务计划或审批身份已变化，操作未执行。");
-      if (appliedReviewId !== undefined) markTurnAutoApprovalApplied(appliedReviewId);
+      approval.validate();
       call.started = true;
       const hostResult = await invokeHost(capability, input, {
         ...context,
@@ -1002,7 +1042,7 @@ export function createRuntime(config: RuntimeConfig) {
     }
     return allSettings();
   });
-  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); stopLarkCodexResponder(); removeTurnListener(); store.close(); } };
+  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); stopLarkCodexResponder(); removeTurnListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {

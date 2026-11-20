@@ -7,7 +7,7 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, larkCodexAppServerStatus, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime, type RuntimeConfig } from "./index.js";
-import { configuredNativeAcpEngines, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
+import { configuredNativeAcpEngines, createNativeAcpExecutionEngine, declareApprovalPlan, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
 const originalCodexExecutable = process.env.CODEX_EXECUTABLE;
 // Each fixture installs its own peer. No late callback should start the real CLI.
@@ -22,7 +22,7 @@ async function until(check: () => boolean, timeoutMs = 8000) {
   while (!check()) { assert(performance.now() < deadline, "topic fixture timed out"); await immediate(); }
 }
 
-function fixture(executionEngines: ExecutionEngine[] = []) {
+function fixture(executionEngines: ExecutionEngine[] = [], overrides: Partial<RuntimeConfig> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-native-topic-"));
   const log = path.join(root, "rpc.jsonl"), executable = path.join(root, "codex.mjs"), lookupGate = path.join(root, "hold-lookup");
   fs.writeFileSync(executable, `#!${process.execPath}
@@ -54,7 +54,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     progressSender: async () => ({ ok: true as const, messageId: "om_fixture_progress", chatId: "oc_fixture", messageAt: null, messageType: "interactive" }),
     progressUpdater: async () => ({ ok: true as const }),
     reactionSender: () => ({ ok: true as const }), textReplySender: (_id, _text, _key, presentation) =>
-      ({ ok: true, messageId: "om_out_" + (++out), chatId: "oc_fixture", messageAt: null, messageType: presentation?.msgType ?? "text" }) };
+      ({ ok: true, messageId: "om_out_" + (++out), chatId: "oc_fixture", messageAt: null, messageType: presentation?.msgType ?? "text" }), ...overrides };
   let out = 0, sequence = 0, runtime = createRuntime(options);
   for (const [key, value] of Object.entries({ stickerUsageMode: "off", interimRepliesEnabled: "false", executionReceiptsEnabled: "false", trustedExecutionEnabled: "true" })) setAppSettingValue(key, value);
   const row = (id: string) => runtime.store.db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(id) as any;
@@ -301,6 +301,88 @@ async function topicCommand(f: ReturnType<typeof fixture>, command: "join" | "le
   assert.match(m.row().reply_delivery_text, command === "join" ? /已开启本话题续聊/ : /已退出本话题续聊/);
   return m;
 }
+
+for (const provider of ["dsh", "claude", "opencode", "agy"] as const) test(`restricted ACP uses scoped Lark approval for ${provider}`, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lark-acp-approval-"));
+  const launch = path.join(dir, "restricted.mjs"), trusted = path.join(dir, "trusted.mjs");
+  const gate = path.join(dir, "allow-fixture"), log = path.join(dir, "outcomes.jsonl");
+  fs.writeFileSync(trusted, "#!/bin/sh\nexit 91\n", { mode: 0o700 });
+  const toolName = { dsh: "write", claude: "Write", opencode: "edit", agy: "write_to_file" }[provider];
+  const expected = (file: string) => `acp.${provider}.${toolName}: ${JSON.stringify({ content: "fixture", file_path: file })}`;
+  fs.writeFileSync(launch, `#!${process.execPath}
+import { appendFileSync, existsSync } from "node:fs";
+import { createInterface } from "node:readline";
+const provider=${JSON.stringify(provider)},toolName=${JSON.stringify(toolName)};
+if((provider==="dsh"&&process.env.DSH_PERMISSION_MODE!=="read-only")||process.env.LARK_AGENT_RUNTIME_TOKEN)throw Error("incorrect launch policy");
+const sessionId="fixture-restricted";
+const send=x=>console.log(JSON.stringify({jsonrpc:"2.0",...x}));
+const reply=(id,result)=>send({id,result});
+const update=update=>send({method:"session/update",params:{sessionId,update}});
+const decisions=new Map();
+let prompt,timer,step=0;
+const request=(id,callId,rawInput)=>send({id,method:"session/request_permission",params:{sessionId,toolCall:{toolCallId:callId,...(rawInput?{title:toolName,rawInput}:{})},
+ options:[{optionId:"once",name:"Once",kind:"allow_once"},{optionId:"always",name:"Always",kind:"allow_always"}]}});
+const next=()=>{
+ if(step===5){update({sessionUpdate:"agent_message_chunk",content:{type:"text",text:"Fixture finished."}});reply(prompt,{stopReason:"end_turn"});return;}
+ const callId=step===3?"call-1":"call-"+step;
+ const file=step===1?"first.txt":step===2?"second.txt":step===4?"late.txt":"ignored.txt";
+ const id=1000+step;
+ if(step!==3)update({sessionUpdate:"tool_call",toolCallId:callId,
+  title:provider==="dsh"?toolName:"Write a fixture file",
+  ...(provider==="claude"?{_meta:{claudeCode:{toolName}}}:provider!=="dsh"?{name:toolName}:{}),
+  kind:"edit",status:"in_progress",rawInput:{file_path:file,content:"fixture"}});
+ decisions.set(id,step);
+ request(id,callId,step===0?{file_path:"changed",content:"fixture"}:provider==="dsh"?undefined:{file_path:file,content:"fixture"});
+};
+createInterface({input:process.stdin}).on("line",l=>{
+ const m=JSON.parse(l);
+ if(m.method==="initialize")reply(m.id,{protocolVersion:1,agentInfo:{name:provider,version:"0.0.1"},agentCapabilities:{sessionCapabilities:{close:{},resume:{}}}});
+ else if(m.method==="session/new")reply(m.id,{sessionId});
+ else if(m.method==="session/prompt"){
+  prompt=m.id;timer=setInterval(()=>{if(existsSync(${JSON.stringify(gate)})){clearInterval(timer);next()}},15);
+ }else if(m.method==="session/cancel"){
+  clearInterval(timer);reply(prompt,{stopReason:"cancelled"});
+ }else if(m.method==="session/close")reply(m.id,{});
+ else if(decisions.has(m.id)){
+  appendFileSync(${JSON.stringify(log)},JSON.stringify({step:decisions.get(m.id),option:m.result?.outcome?.optionId??null})+"\\n");
+  decisions.delete(m.id);
+  if(step<4){step++;next();}
+ }
+});`, { mode: 0o700 });
+  const engine = createNativeAcpExecutionEngine(provider, { launcher: trusted, restrictedLauncher: launch, models: [] });
+  const cards: Array<{ approvalId: number; originalMessage: string; taskPlan?: string }> = [];
+  const f = fixture([engine], { approvalCardSender: (_who, card) => {
+    cards.push({ approvalId: card.approvalId, originalMessage: card.originalMessage ?? "", taskPlan: card.taskPlan });
+    return { ok: true, messageId: `om_card_${card.approvalId}` };
+  }, approvalCardUpdater: () => {} });
+  const headers = { authorization: "Bearer fixture-token" };
+  const topic = "/v1/chats/oc_fixture/topics/omt_fixture/execution";
+  const readDecisions = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(l => JSON.parse(l)) : [];
+  try {
+    assert.throws(() => createNativeAcpExecutionEngine(provider, { launcher: trusted, restrictedLauncher: trusted, models: [] }), /distinct/);
+    assert.equal((await f.message({ content: "observe fixture topic before selecting an engine" })).row().codex_status, "skipped");
+    assert.equal((await f.runtime().app.inject({ method: "PUT", url: topic, headers, payload: { override: { engineId: provider, model: null } } })).statusCode, 200);
+    const message = await f.message({ sender_id: "ou_member", content: "Create two sample files", mentions: mention });
+    await until(() => message.row().codex_status === "running" && Boolean(message.row().codex_turn_id));
+    declareApprovalPlan(f.runtime().store.db, { messageId: message.row().id, turnId: message.row().codex_turn_id, senderId: "ou_member" }, {
+      goal: "Create two sample files", impact: "Temporary fixture only",
+      steps: ["first.txt", "second.txt"].map(file => ({ intent: `Write ${file}`, effect: "local-write", kind: "capability", cwd: null, operation: expected(file) }))
+    });
+    fs.writeFileSync(gate, "");
+    await until(() => cards.length === 1);
+    assert.deepEqual(readDecisions(), [{ step: 0, option: null }]);
+    assert.equal(cards[0].originalMessage, "Create two sample files");
+    assert.match(cards[0].taskPlan ?? "", /Write second.txt/);
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 200);
+    await until(() => cards.length === 2);
+    assert.deepEqual(readDecisions(), [{ step: 0, option: null }, { step: 1, option: "once" }, { step: 2, option: "once" }, { step: 3, option: null }]);
+    assert.equal(f.runtime().store.approval(cards[1].approvalId)?.operation, expected("late.txt"));
+    assert.deepEqual((await f.runtime().app.inject({ method: "POST", url: topic+"/cancel", headers })).json(), { requested: 1 });
+    await until(() => message.row().codex_status === "failed");
+    assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[1].approvalId}/approve`, headers })).statusCode, 409);
+    assert.equal(f.runtime().store.approval(cards[1].approvalId)?.status, "failed");
+  } finally { await f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("DSH, OpenCode and AGY share the Lark workflow over ACP stdio", async () => {
   const launcherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "lark-native-acp-"));

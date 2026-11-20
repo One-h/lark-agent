@@ -28,15 +28,31 @@ launcher leaves only that engine unavailable. Each optional
 engine model IDs. Omit it to offer the engine's configured default only.
 
 The configured Codex workspace and sender trust settings also govern these engines.
-Native ACP is supported only for senders authorized for
-Codex full access without additional approval. For an ordinary read-only
-request it refuses before the launcher starts: ACP requests alone cannot enforce
-the Codex sandbox or the existing turn-scoped Feishu approval process.
-There is no silent fallback to Codex and no new trusted-sender list.
+The ordinary launcher is used only for trusted senders. To admit other senders,
+set `LARK_AGENT_<ENGINE>_ACP_RESTRICTED_LAUNCHER` to a **different** absolute
+executable that the operator has configured and validated for the workspace's
+read, credential, network and write policy. This is an operator trust boundary:
+ACP permission callbacks do not sandbox a process, and copying the ordinary
+launcher to a different path does not make it restricted. Use separate provider
+state and do not import trusted sessions or stored grants. Missing or invalid
+restricted launchers leave that engine unavailable to non-trusted senders;
+there is no silent fallback to an unrestricted launcher or to Codex.
 
-For a trusted active turn, a request from that exact ACP session can grant
-the offered single-use option. There are no persistent grants, or grants before
-the turn, after it ends, or after cancellation. The operator launcher supplies
+DSH receives `DSH_PERMISSION_MODE=read-only` on the restricted path. Use a
+controlled profile that retains its shell and file sandbox backends and does
+not override that setting. This setting alone is a write policy, not a
+read/network or credential isolation mechanism. For Claude, OpenCode and AGY
+the restricted executable must set the corresponding provider policy itself;
+this runtime does not change a provider's managed settings or claim that its
+stock launcher enforces read-only operation.
+
+For an active turn, a request from that exact ACP session can grant the offered
+single-use option. A restricted request is approved through the same Feishu
+manual or automatic review and task-plan authorization as host tools. It
+must match an observed tool call and its original parameters. A task plan
+can cover multiple exact calls, but the engine receives only `allow_once`
+for each matched call. No grant survives cancellation or the end of the turn.
+The operator launcher supplies
 authentication and persistent native sessions. A small environment
 allowlist retains the local profile and executable search paths without
 forwarding Lark or Forge API tokens. The host does not expose filesystem,

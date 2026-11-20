@@ -25,7 +25,7 @@ import { applyPlanAuthorization, approvalPlanSummary, approvalPlanTool, approval
   declareApprovalPlan, parseApprovalPlan, planCoversOperation, preparePlanAuthorization, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { larkPromptTime, shortLarkTime } from "./promptTime.js";
 import { isNativeTopicConversation } from "./topicNativeMode.js";
-import { larkExecutionPolicy, type ExecutionEngineEvent, type ExecutionEngineSession, type ExecutionTurnResult, type ExecutionWorkStage } from "./executionEngines.js";
+import { larkExecutionPolicy, type ExecutionEngineEvent, type ExecutionEngineSession, type ExecutionNativeApproval, type ExecutionTurnResult, type ExecutionWorkStage } from "./executionEngines.js";
 import { externalExecutionForMessage, loadTopicExecutionSession, recordTopicExecution, resolveTopicExecutionEngine, saveTopicExecutionSession, topicEngineSessionKey, type ExternalExecutionRoute } from "./topicExecution.js";
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
@@ -4302,11 +4302,19 @@ type ExternalTopicTurn = {
   members: Map<number, LarkMessageRow>;
   steering: Set<Promise<unknown>>;
   accepting: boolean;
+  nativeApproval: boolean;
   mcp?: { token: string; source: LarkMessageRow; trusted: boolean };
   done: Promise<void>;
 };
 const externalTopicTurns = new Map<string, ExternalTopicTurn>();
 const externalTopicStarts = new Map<AbortController, LarkMessageRow>();
+type ExternalNativeApprovalHandler = (messageId: number, turnId: string, ...args: Parameters<ExecutionNativeApproval>) => Promise<boolean>;
+let externalNativeApprovalHandler: ExternalNativeApprovalHandler | undefined;
+
+export function setExternalNativeApprovalHandler(handler: ExternalNativeApprovalHandler): () => void {
+  externalNativeApprovalHandler = handler;
+  return () => { if (externalNativeApprovalHandler === handler) externalNativeApprovalHandler = undefined; };
+}
 const externalWorkProgressDelayMs = 8_000;
 const externalWorkProgressText = {
   read: "正在读取资料。",
@@ -4322,6 +4330,11 @@ function isExternalMcpTurnActive(run: ExternalTopicTurn, messageId: number) {
 
 export function confirmExternalLarkMcpTurn(messageId: number, turnId: string): boolean {
   return [...externalTopicTurns.values()].some(run => run.id === turnId && isExternalMcpTurnActive(run, messageId));
+}
+
+export function confirmExternalLarkNativeTurn(messageId: number, turnId: string): boolean {
+  return [...externalTopicTurns.values()].some(run => run.id === turnId && run.source.id === messageId
+    && run.nativeApproval && run.accepting && !run.controller.signal.aborted && run.steering.size === 0);
 }
 
 export function cancelExternalTopicTurns(chatId: string, threadId: string): number {
@@ -4357,7 +4370,8 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const engine = resolveTopicExecutionEngine(route);
   if (!engine) throw new Error("Selected engine or model is unavailable");
   const policy = larkExecutionPolicy(config.workspaceRoot, trusted);
-  if (!engine.supportsPolicy(policy)) {
+  const nativeApprover = !trusted && engine.supportsNativeApproval ? externalNativeApprovalHandler : undefined;
+  if (!engine.supportsPolicy(policy) || !trusted && engine.supportsNativeApproval && !nativeApprover) {
     finishExternalTopicMessage(message, "failed", "所选引擎目前不能执行你的权限规则，未启动任务。", "Selected engine cannot enforce the execution policy");
     return;
   }
@@ -4403,11 +4417,19 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const progressId = crypto.randomUUID();
   const mcpServer = engine.supportsLarkMcp ? larkAgentToolsMcpServer() : undefined;
   const mcpToken = mcpServer ? crypto.randomBytes(24).toString("base64url") : undefined;
+  const authorizeNative: ExecutionNativeApproval | undefined = nativeApprover && ((operation, signal, current) => {
+    if (operation.engineId !== route.engineId) return Promise.resolve(false);
+    const stillCurrent = () => db.open && externalNativeApprovalHandler === nativeApprover
+      && current() && !signal.aborted && !controller.signal.aborted
+      && confirmExternalLarkNativeTurn(message.id, progressId) && !groupPrivacyBlocks(message.id);
+    if (!stillCurrent()) return Promise.resolve(false);
+    return nativeApprover(message.id, progressId, operation, AbortSignal.any([signal, controller.signal]), stillCurrent);
+  });
   let session: ExecutionEngineSession | undefined;
   externalTopicStarts.set(controller, message);
   try {
     session = await engine.open({ sessionId: loadTopicExecutionSession(key), model: route.model, policy, signal: controller.signal,
-      ...(mcpServer ? { mcpServers: [mcpServer] } : {}) });
+      ...(mcpServer ? { mcpServers: [mcpServer] } : {}), authorizeNative });
     controller.signal.throwIfAborted();
     if (skipDisabledTopicContinuation(message) || groupPrivacyBlocks(message.id)) {
       await session.close();
@@ -4417,7 +4439,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     saveTopicExecutionSession(key, session.id);
     recordTopicExecution(message.id, route, session.id, progressId);
     updateCodexState(message.id, { status: "running", startedAt: nowIso(), heartbeatAt: nowIso(),
-      turnId: mcpToken ? progressId : undefined });
+      turnId: mcpToken || authorizeNative ? progressId : undefined });
   } catch (error) {
     await session?.close();
     if (controller.signal.aborted) {
@@ -4427,7 +4449,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     throw error;
   } finally { externalTopicStarts.delete(controller); }
   const run: ExternalTopicTurn = { source: message, id: progressId, session, controller, members: new Map([[message.id, message]]), steering: new Set(),
-    accepting: true, ...(mcpToken ? { mcp: { token: mcpToken, source: message, trusted } } : {}), done: Promise.resolve() };
+    accepting: true, nativeApproval: Boolean(authorizeNative), ...(mcpToken ? { mcp: { token: mcpToken, source: message, trusted } } : {}), done: Promise.resolve() };
   externalTopicTurns.set(key, run);
   const showProgress = (eventId: string, text: string) => {
     if (run.accepting && !controller.signal.aborted)
@@ -4447,17 +4469,18 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     if (stage) showWork();
     else showProgress("start", `${engine.descriptor.label} 正在处理。`);
   }, config.larkCodexInterimReplyDelayMs);
-  const limit = setTimeout(() => controller.abort(), 180_000);
+  const limit = setTimeout(() => controller.abort(), authorizeNative ? 600_000 : 180_000);
   run.done = (async () => {
     let closeTimer: NodeJS.Timeout | undefined;
     const closeAfterAbort = () => { closeTimer = setTimeout(() => { void session.close(); }, 5_000); };
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
-    try { result = await session.run(mcpToken ? `${prompt}\n\n${larkMcpToolsInstruction(mcpToken)}` : prompt, controller.signal, onEngineEvent); }
+    const nativePolicy = authorizeNative ? `\n\n默认保持只读。需要受限操作时通过引擎的权限请求申请，范围以飞书审批为准。登记任务计划时，ACP 原生工具的步骤使用 kind=capability、cwd=null；operation 为 acp.${route.engineId}.<实际工具名>: <完整参数 JSON>。` : "";
+    try { result = await session.run(`${prompt}${mcpToken ? `\n\n${larkMcpToolsInstruction(mcpToken)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent); }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
-      if (run.mcp) {
+      if (run.mcp || run.nativeApproval) {
         finishLarkTurnAutoApproval(progressId);
         notifyLarkTurnEnded(db, progressId);
       }

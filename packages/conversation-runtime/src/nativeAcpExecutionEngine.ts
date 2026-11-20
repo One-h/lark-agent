@@ -3,6 +3,7 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, type LoadSessionResponse, type NewSessionResponse, type PromptResponse, type ResumeSessionResponse, type SetSessionConfigOptionResponse, type ToolKind } from "@agentclientprotocol/sdk";
+import { maxReviewedOperationChars } from "./approvalPlan.js";
 import type { ExecutionEngine, ExecutionEngineEvent, ExecutionWorkStage, LarkExecutionPolicy } from "./executionEngines.js";
 
 const promptText = (text: string) => [{ type: "text" as const, text }];
@@ -28,45 +29,106 @@ function supportsOwnedClaudeSteering(version: string | undefined): boolean {
 }
 
 function supportsNativeAcpPolicy(policy: LarkExecutionPolicy): boolean {
-  // ACP tool permission callbacks do not enforce an OS read-only boundary.
   return policy.trustScope === "trusted" && policy.sandbox === "danger-full-access" && policy.approvalPolicy === "never";
 }
 
-export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, options: { launcher: string; models: string[] }): ExecutionEngine {
-  const profile = profiles[engineId];
-  if (!path.isAbsolute(options.launcher)) throw new Error("ACP launcher must be an absolute path");
-  const launcher = realpathSync(options.launcher);
+function executable(value: string): string {
+  if (!path.isAbsolute(value)) throw new Error("ACP launcher must be an absolute path");
+  const launcher = realpathSync(value);
   if (!statSync(launcher).isFile()) throw new Error("Invalid ACP launcher");
   accessSync(launcher, constants.X_OK);
+  return launcher;
+}
+
+type PermissionTool = { name?: string | null; title?: string | null; rawInput?: unknown; _meta?: Record<string, unknown> | null };
+
+function orderedJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(orderedJson);
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, child]) => [key, orderedJson(child)]));
+  return value;
+}
+
+function permissionOperation(engineId: NativeAcpEngineId, tool: PermissionTool): string | undefined {
+  const meta = tool._meta?.claudeCode as { toolName?: unknown } | undefined;
+  const name = tool.name ?? (engineId === "claude" && typeof meta?.toolName === "string" ? meta.toolName : tool.title);
+  if (!name || !/^[A-Za-z][A-Za-z0-9_.-]{0,99}$/.test(name) || !tool.rawInput
+    || typeof tool.rawInput !== "object" || Array.isArray(tool.rawInput)) return;
+  try {
+    const text = `acp.${engineId}.${name}: ${JSON.stringify(orderedJson(tool.rawInput))}`;
+    return text.length <= maxReviewedOperationChars ? text : undefined;
+  } catch { return; }
+}
+
+export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, options: { launcher: string; models: string[]; restrictedLauncher?: string }): ExecutionEngine {
+  const profile = profiles[engineId];
+  const launcher = executable(options.launcher);
+  const restrictedLauncher = options.restrictedLauncher ? executable(options.restrictedLauncher) : undefined;
+  if (restrictedLauncher === launcher) throw new Error("Restricted ACP requires a distinct operator-managed executable");
+  const supportsPolicy = (policy: LarkExecutionPolicy) => supportsNativeAcpPolicy(policy)
+    || Boolean(restrictedLauncher && policy.trustScope === "untrusted" && policy.sandbox === "read-only" && policy.approvalPolicy === "on-request");
   return {
     descriptor: { id: engineId, label: profile.label, models: [...new Set(options.models)] },
     supportsLarkMcp: true,
-    supportsPolicy: supportsNativeAcpPolicy,
-    async open({ sessionId, model, policy, signal, mcpServers }) {
+    supportsNativeApproval: Boolean(restrictedLauncher),
+    supportsPolicy,
+    async open({ sessionId, model, policy, signal, mcpServers, authorizeNative }) {
       signal.throwIfAborted();
-      if (!supportsNativeAcpPolicy(policy)) throw new Error(`${profile.label} cannot enforce this execution policy`);
+      const restricted = policy.trustScope === "untrusted";
+      if (!supportsPolicy(policy) || restricted && !authorizeNative) throw new Error(`${profile.label} cannot enforce this execution policy`);
       const { cwd } = policy;
       if (!path.isAbsolute(cwd) || !statSync(cwd).isDirectory()) throw new Error("Invalid shared workspace");
       const env = Object.fromEntries(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", ...profile.env]
         .flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-      const child = spawn(launcher, profile.args, { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
+      if (restricted && engineId === "dsh") env.DSH_PERMISSION_MODE = "read-only";
+      const child = spawn(restricted ? restrictedLauncher! : launcher, profile.args, { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
       let id = sessionId;
       let output: { text: string; messageId?: string; retiredMessages: Set<string>; tools: Set<string>;
+        permissionTools: Map<string, { operation: string; cancelled: AbortController }>; requestedPermissions: Set<string>;
         emit?: (event: ExecutionEngineEvent) => void } | null = null;
       let turnPermissionSignal: AbortSignal | null = null;
       const isOpenCodeChild = (meta?: Record<string, unknown> | null) =>
         engineId === "opencode" && Boolean(meta?.["opencode/child-session"]);
       const connection = client()
-        .onRequest("session/request_permission", ({ params, signal: requestSignal }) => {
-          const option = id && params.sessionId === id && turnPermissionSignal && !turnPermissionSignal.aborted && !requestSignal.aborted
-            && !isOpenCodeChild(params.toolCall._meta)
-            ? params.options.find(candidate => candidate.kind === "allow_once") : undefined;
-          return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
+        .onRequest("session/request_permission", async ({ params, signal: requestSignal }) => {
+          const cancel = { outcome: { outcome: "cancelled" as const } };
+          const turn = turnPermissionSignal, current = output;
+          if (!id || params.sessionId !== id || !turn || turn.aborted || requestSignal.aborted || !current
+            || isOpenCodeChild(params.toolCall._meta) || (params.toolCall._meta?.claudeCode as { parentToolUseId?: unknown } | undefined)?.parentToolUseId)
+            return cancel;
+          const option = params.options.find(candidate => candidate.kind === "allow_once");
+          if (!option) return cancel;
+          if (restricted && authorizeNative) {
+            const callId = params.toolCall.toolCallId;
+            const record = current.permissionTools.get(callId);
+            if (!record || current.requestedPermissions.has(callId)) return cancel;
+            if (params.toolCall.rawInput !== undefined && permissionOperation(engineId, params.toolCall) !== record.operation) return cancel;
+            current.requestedPermissions.add(callId);
+            const lifetime = AbortSignal.any([turn, requestSignal, record.cancelled.signal]);
+            const stillCurrent = () => !lifetime.aborted && output === current && turnPermissionSignal === turn
+              && current.permissionTools.get(callId) === record;
+            try {
+              if (!await authorizeNative({ engineId, text: record.operation, cwd }, lifetime, stillCurrent) || !stillCurrent()) return cancel;
+            } catch { return cancel; }
+          }
+          return { outcome: { outcome: "selected" as const, optionId: option.optionId } };
         })
         .onNotification("session/update", ({ params: { sessionId: updatedId, update } }) => {
           if (updatedId !== id || !output || isOpenCodeChild(update._meta)) return;
           const meta = engineId === "claude" ? update._meta?.claudeCode as { parentToolUseId?: unknown; kind?: unknown } | undefined : undefined;
           if (meta?.parentToolUseId || meta?.kind === "informational" || meta?.kind === "mcpServerStatus") return;
+          if (restricted && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")) {
+            const record = output.permissionTools.get(update.toolCallId);
+            if (record && (update.status === "completed" || update.status === "failed" || update.rawInput !== undefined
+              && permissionOperation(engineId, update) !== record.operation)) {
+              record.cancelled.abort();
+              output.permissionTools.delete(update.toolCallId);
+            } else if (!record && update.sessionUpdate === "tool_call" && !output.tools.has(update.toolCallId)
+              && (update.status == null || update.status === "pending" || update.status === "in_progress") && output.permissionTools.size < 256) {
+              const operation = permissionOperation(engineId, update);
+              if (operation) output.permissionTools.set(update.toolCallId, { operation, cancelled: new AbortController() });
+            }
+          }
           if (update.sessionUpdate === "tool_call" && !output.tools.has(update.toolCallId)
             && (update.status == null || update.status === "pending" || update.status === "in_progress")
             && update.kind !== "think" && update.kind !== "switch_mode") {
@@ -128,7 +190,7 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
           const selected = result.configOptions?.find(item => item.id === option.id);
           if (!selected || !("currentValue" in selected) || selected.currentValue !== model) throw new Error("ACP agent did not confirm the requested model");
         }
-        const steering = engineId === "claude" && supportsOwnedClaudeSteering(hello.agentInfo?.version)
+        const steering = !restricted && engineId === "claude" && supportsOwnedClaudeSteering(hello.agentInfo?.version)
           && (hello._meta?.steering as { supported?: boolean } | undefined)?.supported === true;
         signal.removeEventListener("abort", terminate);
         signal.throwIfAborted();
@@ -141,7 +203,8 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
               void peer.notify("session/cancel", { sessionId: activeId }).catch(() => {});
             };
             turnSignal.addEventListener("abort", cancel, { once: true });
-            const turnOutput = { text: "", tools: new Set<string>(), retiredMessages: new Set<string>(), emit: onEvent };
+            const turnOutput = { text: "", tools: new Set<string>(), retiredMessages: new Set<string>(), emit: onEvent,
+              permissionTools: new Map<string, { operation: string; cancelled: AbortController }>(), requestedPermissions: new Set<string>() };
             output = turnOutput;
             turnPermissionSignal = turnSignal;
             try {
@@ -150,7 +213,12 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
               turnSignal.throwIfAborted();
               if (result.stopReason !== "end_turn") throw new Error("ACP turn did not finish normally");
               return { status: "completed", text: turnOutput.text };
-            } finally { turnPermissionSignal = null; turnSignal.removeEventListener("abort", cancel); output = null; }
+            } finally {
+              turnPermissionSignal = null;
+              turnSignal.removeEventListener("abort", cancel);
+              for (const record of turnOutput.permissionTools.values()) record.cancelled.abort();
+              output = null;
+            }
           },
           ...(steering ? {
             async steer(text: string, steerSignal: AbortSignal) {
@@ -192,8 +260,15 @@ export function configuredNativeAcpEngines(env: NodeJS.ProcessEnv, invalidLaunch
     const launcher = env[`${prefix}_NATIVE_LAUNCHER`];
     if (!launcher) continue;
     const models = (env[`${prefix}_MODELS`] ?? "").split(",").map(model => model.trim()).filter(Boolean);
-    try { engines.push(createNativeAcpExecutionEngine(id, { launcher, models })); }
-    catch { invalidLauncher(id); }
+    const restrictedLauncher = env[`${prefix}_RESTRICTED_LAUNCHER`];
+    try { engines.push(createNativeAcpExecutionEngine(id, { launcher, models, restrictedLauncher })); }
+    catch {
+      invalidLauncher(id);
+      if (restrictedLauncher) {
+        try { engines.push(createNativeAcpExecutionEngine(id, { launcher, models })); }
+        catch { /* Neither configured path is usable. */ }
+      }
+    }
   }
   return engines;
 }
