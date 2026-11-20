@@ -32,7 +32,7 @@ test("enabled owner message sends once without a card and records its narrow aut
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitive and stale requests", async () => {
+test("trusted sessions do not need cards; untrusted and stale contexts retain their checks", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-owner-message-boundaries-"));
   let cards = 0;
   let sends = 0;
@@ -60,7 +60,7 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
       { recipient: "同名同事", original: "跟同名同事说：test", text: "test" },
       { callTurn: "different-turn" }, { status: "answered" }, { approver: "ou_new_owner" }
     ];
-    let expectedCards = 0;
+    let expectedCards = 0, expectedSends = 0;
     for (const [i, entry] of cases.entries()) {
       const c = entry as { enabled?: boolean; sender?: string; scope?: string; chatType?: string; messageType?: string; text?: string; original?: string; recipient?: string; callTurn?: string; status?: string; approver?: string };
       runtime.store.setSetting("ownerMessageFastPathEnabled", String(c.enabled ?? true));
@@ -79,9 +79,12 @@ test("runtime keeps cards for disabled, non-owner, ambiguous, external, sensitiv
         context: { larkMessageId: inbound.id, chatId: "oc_owner", trustScope: c.scope ?? "trusted", turnId: c.callTurn ?? turn }
       } });
       assert.notEqual(result.statusCode, 200, JSON.stringify(c));
-      if (!c.callTurn && c.status !== "answered") expectedCards++;
+      if (!c.callTurn && c.status !== "answered") {
+        if (c.scope === "untrusted") expectedCards++;
+        else expectedSends++;
+      }
       assert.equal(cards, expectedCards, JSON.stringify(c));
-      assert.equal(sends, 0, JSON.stringify(c));
+      assert.equal(sends, expectedSends, JSON.stringify(c));
     }
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });

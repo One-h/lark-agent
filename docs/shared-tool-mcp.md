@@ -1,21 +1,26 @@
 # Shared Lark tool MCP
 
-`lark_tools` publishes `lark_approval_plan` and named host tools from the
+`lark_tools` publishes `lark_approval_status` and named host tools from the
 runtime capability registry. For example, `forge.deploy.inspect` is exposed as
 `forge__deploy__inspect`. Each tool takes `{context_token, input}`, where
 `input` uses that capability's registered schema. Tools blocked by the runtime
 are not enabled by changing the MCP client. Bot-only installations without a
-host runtime credential still expose plan registration, not host calls.
+host runtime credential still expose current approval status, not host calls.
+The old `lark_approval_plan` call remains compatible but is not listed or
+required before tool execution.
 
 | Runtime capability | MCP tool | Existing behavior |
 | --- | --- | --- |
-| Task plan | `lark_approval_plan` | Registers intent, steps and impact, never grants access |
+| Approval outcome | `lark_approval_status` | Reads the current turn's approval outcomes, never grants access |
 | `forge.deploy.inspect` | `forge__deploy__inspect` | Read-only deployment inspection |
 | `forge.deploy.production` | `forge__deploy__production` | Production deployment; existing approval and target checks |
 | `forge.gitea.review-pr` | `forge__gitea__review-pr` | PR review with existing write policy |
 | `forge.gitea.triage-issue` | `forge__gitea__triage-issue` | Issue analysis with existing write policy |
 | `forge.todo.create` | `forge__todo__create` | Task creation with existing write policy |
 | `lark.message.send` | `lark__message__send` | Bot sends to a resolved contact; existing approval or owner fast path |
+
+Trusted direct sessions do not need a Lark approval card for host calls. Host
+service checks and live turn identity checks still apply.
 
 The separate `lark_stickers` server provides stickers, attachments, history
 images and owner assistance for Codex. External engines get a search/select-only

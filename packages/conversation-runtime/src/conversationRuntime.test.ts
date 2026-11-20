@@ -134,7 +134,7 @@ test("conversation runtime responder preserves prompts, trust profiles and group
     config.larkAgentRuntimeUrl = "http://127.0.0.1:4780";
     assert.equal(buildLarkCodexThreadParams(true).dynamicTools, undefined);
     assert(listLarkMcpTools(true).some(tool => tool.name === "host__demo"));
-    assert.deepEqual(listLarkMcpTools(false).map(tool => tool.name), ["lark_approval_plan", "lark_approval_status"]);
+    assert.deepEqual(listLarkMcpTools(false).map(tool => tool.name), ["lark_approval_status"]);
     assert.deepEqual(buildLarkCodexUserInput("prompt", ["/tmp/image.png"]).at(-1), { type: "localImage", path: "/tmp/image.png" });
     assert.equal(larkAtTag("ou_sender"), '<at user_id="ou_sender"></at>');
     assert.equal(formatLarkFinalReply({ chat_type: "group", sender_id: "ou_sender" }, "收到。"), '<at user_id="ou_sender"></at> 收到。');
@@ -161,22 +161,18 @@ test("restricted read-only queries request execution approval in group and priva
       for (const prompt of [buildLarkCodexPrompt(message, { trustedSender: false }),
         buildLarkCodexDeltaPrompt(message, { trustedSender: false }),
         buildLarkCodexDeltaPrompt(message, { trustedSender: false, includeStableInstructions: false })]) {
-        const section = prompt.split("\n").find(line => line.startsWith("只读查询执行授权："));
+        const section = prompt.split("\n").find(line => line.startsWith("受限模式工具调用："));
         assert.ok(section);
         assert.match(section, /本地检索可直接进行/);
         assert.match(section, /联网、隧道或系统凭据/);
         assert.match(section, /sandbox_permissions=require_escalated/);
-        assert.match(section, /申请对应命令的授权/);
-        assert.match(section, /现有自动\/人工审批/);
+        assert.match(section, /提交实际命令/);
+        assert.match(section, /由工具处理是否可执行/);
         assert.match(prompt, /历史拒绝只约束当时请求及明确拒绝的范围/);
-        assert.match(prompt, /新告警、新任务或新时间窗口按当前范围申请所需授权/);
-        assert.match(prompt, /当前范围内的明确拒绝应停止/);
-        assert.match(prompt, /改写同一操作不构成新授权/);
-        assert.match(prompt, /过期表示该申请已失效/);
-        assert.match(prompt, /来源未核实就说明未知/);
+        assert.doesNotMatch(prompt, /lark_approval_plan|先登记审批|等待审批/);
         assert.match(section, /账号认证失败、业务权限拒绝或来源白名单拦截/);
         assert.match(section, /不能通过提权、换账号或导出凭据绕过/);
-        assert.equal(prompt.split("只读查询执行授权：").length - 1, 1);
+        assert.equal(prompt.split("受限模式工具调用：").length - 1, 1);
         sections.push(section);
       }
     }
@@ -196,8 +192,9 @@ test("trusted execution retains its existing permission policy without adding re
     const message = { content: "查本地记录", chat_type: "group", sender_id: "ou_owner",
       reply_to_message_id: null, reply_to_message_type: null, reply_to_content: null };
     for (const build of [buildLarkCodexPrompt, buildLarkCodexDeltaPrompt]) {
-      assert.doesNotMatch(build(message, { trustedSender: true }), /只读查询执行授权：/);
-      assert.match(build({ ...message, reply_trigger: "owner_mention" }, { trustedSender: true }), /只读查询执行授权：/);
+      const trusted = build(message, { trustedSender: true, stickerContextToken: "fixture-context" });
+      assert.doesNotMatch(trusted, /受限模式工具调用：|lark_approval_plan|lark_approval_status|等待审批/);
+      assert.match(build({ ...message, reply_trigger: "owner_mention" }, { trustedSender: true }), /受限模式工具调用：/);
     }
     const params = buildLarkCodexThreadParams(true);
     assert.equal(params.sandbox, "danger-full-access");
@@ -222,12 +219,11 @@ test("workspace workflows remain generic and permission-bound in full, delta and
           const section = prompt.split("\n").find(line => line.startsWith("工作区流程："));
           assert.ok(section);
           assert.match(section, /遵守当前工作区的指令和适用工作流/);
-          assert.match(section, /通过现有审批机制申请授权，权限不足不等于省略该步骤/);
-          assert.match(section, /用户明确限定的任务范围和现有权限策略/);
+          assert.match(section, /按用户明确限定的任务范围直接调用适当工具/);
+          assert.match(section, /权限不足时按实际工具结果说明/);
           assert.match(section, /工作区指令本身不授予额外权限/);
           assert.equal(prompt.split("工作区流程：").length - 1, 1);
-          assert.equal(prompt.split("审批范围：").length - 1, 1);
-          assert.match(prompt, /历史回复不是本轮审批结果/);
+          assert.doesNotMatch(prompt, /lark_approval_plan|审批范围：|等待审批/);
           assert.doesNotMatch(prompt, /[A-Za-z-]+-task-capture|log-[A-Za-z-]*task|TASKS\.MD/);
           assert.ok(prompt.includes(message.content));
           sections.add(section);
@@ -236,8 +232,8 @@ test("workspace workflows remain generic and permission-bound in full, delta and
         if (!trustedSender) {
           assert.match(full, /按任务和当前工作区的指令选择适用的 skill/);
           assert.match(full, /数据查询保持只读/);
-          assert.match(full, /审批前不执行对应受限操作/);
-          assert.match(full, /授权被拒绝时停止对应操作/);
+          assert.match(full, /由运行时处理权限/);
+          assert.match(full, /工具明确拒绝时不绕过/);
           assert.doesNotMatch(full, /可以使用明确只读的数据查询类 skill|如果用户明确要求代码修改、文件写入/);
         }
       }

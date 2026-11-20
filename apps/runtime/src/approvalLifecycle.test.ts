@@ -14,7 +14,7 @@ async function until(predicate: () => boolean) {
   while (!predicate()) { assert.ok(Date.now() < end, "fixture did not settle"); await new Promise(resolve => setTimeout(resolve, 10)); }
 }
 
-async function fixture(reviewer?: RuntimeConfig["turnApprovalReviewer"], native = false) {
+async function fixture(reviewer?: RuntimeConfig["turnApprovalReviewer"], native = false, wholeTaskAutoApproval?: boolean) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-approval-lifecycle-"));
   const host = Fastify(); let writes = 0; let hostBarrier: Promise<void> | null = null;
   host.post("/api/lark-agent/capabilities/:id", async () => { writes++; await hostBarrier; return { call: writes }; });
@@ -23,7 +23,7 @@ async function fixture(reviewer?: RuntimeConfig["turnApprovalReviewer"], native 
   const cards: CapabilityApprovalCardInput[] = [];
   const updates: Array<Parameters<NonNullable<RuntimeConfig["approvalCardUpdater"]>>[1]> = [];
   const runtime = createRuntime({ databasePath: path.join(root, "agent.sqlite"), workspaceRoot: root, mode: "shadow", runtimeToken: "fixture-token",
-    approverId: "ou_owner", trustedSenderIds: [], hostBaseUrl: `http://127.0.0.1:${hostAddress.port}`, turnApprovalReviewer: reviewer,
+    approverId: "ou_owner", trustedSenderIds: [], hostBaseUrl: `http://127.0.0.1:${hostAddress.port}`, turnApprovalReviewer: reviewer, wholeTaskAutoApproval,
     turnActivityProbe: native ? undefined : async () => true,
     textReplySender: () => ({ ok: true, messageId: "om_reply", chatId: "oc_private", messageAt: null, messageType: "text" }),
     reactionSender: () => ({ ok: true }), approvalCardSender: (_recipient, card) => { cards.push(card); return { ok: true, messageId: `om_card_${card.approvalId}` }; },
@@ -199,7 +199,7 @@ test("graceful shutdown waits for an already authorized operation instead of los
 });
 
 async function nativeFixture(order: "host-first" | "command-first" | "query", reviewer?: RuntimeConfig["turnApprovalReviewer"]) {
-  const f = await fixture(reviewer, true);
+  const f = await fixture(reviewer, true, order === "query");
   const previousExecutable = process.env.CODEX_EXECUTABLE, previousPath = process.env.PATH;
   const executable = path.join(f.root, "codex.mjs");
   const decisions = path.join(f.root, "query-decisions.jsonl");
@@ -223,7 +223,7 @@ else if(m.method==="turn/start"){
 else if(m.method==="turn/steer")send({id:m.id,result:{turnId:"turn-live"}});
 else if(m.method==="fixture/end"){send({id:m.id,result:{}});finish(m.params.status);}
 else if(m.method==="fixture/state-only"){status=m.params.status;send({id:m.id,result:{}});}
-else if(m.method==="fixture/query"){send({id:m.id,result:{}});send({id:m.params.id,method:"item/commandExecution/requestApproval",params:{threadId:"thread-live",turnId:"turn-live",itemId:m.params.id,command:m.params.command,cwd:${JSON.stringify(f.root)}}});}
+else if(m.method==="fixture/query"){send({id:m.id,result:{}});send({id:m.params.id,method:m.params.method??"item/commandExecution/requestApproval",params:{threadId:"thread-live",turnId:"turn-live",itemId:m.params.id,command:m.params.command,reason:"Fixture operation intent",cwd:${JSON.stringify(f.root)}}});}
 else if(m.method==="thread/read")send({id:m.id,result:{thread:{id:"thread-live",status:{type:status==="inProgress"?"active":"idle"}}}});
 else if(m.method==="thread/turns/list")send({id:m.id,result:{data:[{id:"turn-live",status}]}});
 else if(m.method)send({id:m.id,result:{}});
@@ -282,6 +282,50 @@ test("manual whole-turn approval accepts revised queries while automatic approva
       await until(() => decision("query-late") === "decline");
     } finally { await f.close(); }
   }
+});
+
+test("first native operation opens one manual turn card without a registered plan or automatic review", async () => {
+  const f = await nativeFixture("query", async () => assert.fail("automatic reviewer should be disabled"));
+  try {
+    assert.equal(f.runtime.store.setting("turnAutoApprovalEnabled", "false"), "false");
+    await until(() => f.row().codex_status === "running" && fs.existsSync(f.tokens));
+    const request = (id: string, method?: string, command?: string) => codexAppServer.request("fixture/query", { id, method, command });
+    const result = (id: string) => fs.existsSync(f.decisions) ? fs.readFileSync(f.decisions, "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)).find(item => item.id === id)?.decision : undefined;
+    await request("query-file", "item/fileChange/requestApproval");
+    await until(() => f.cards.length === 1);
+    assert.equal(f.cards[0].wholeTask, true);
+    assert.equal(f.cards[0].taskPlan, undefined);
+    assert.match(f.cards[0].originalMessage, /fixture-db/);
+    assert.deepEqual(f.cards[0].operationIntents, ["Fixture operation intent"]);
+    assert.equal(result("query-file"), undefined);
+    assert.equal((await f.decide(f.cards[0].approvalId, "approve-turn")).statusCode, 200);
+    await until(() => result("query-file") === "accept");
+    await request("query-second", undefined, "echo next operation");
+    await until(() => result("query-second") === "accept");
+    assert.equal(f.cards.length, 1);
+    await codexAppServer.request("fixture/end", { status: "completed" });
+    await until(() => f.row().codex_status === "answered");
+    await request("query-late", undefined, "echo must not reuse");
+    await until(() => result("query-late") === "decline");
+  } finally { await f.close(); }
+});
+
+test("trusted direct turns invoke host writes without an approval card", async () => {
+  const f = await fixture();
+  try {
+    f.runtime.store.setSetting("trustedExecutionEnabled", "true");
+    f.seed();
+    f.runtime.store.db.prepare("UPDATE lark_messages SET sender_id='ou_owner' WHERE id=1").run();
+    const response = await f.runtime.app.inject({ method: "POST", url: "/v1/internal/capabilities/forge.deploy.production/execute",
+      headers: { authorization: "Bearer fixture-token" }, payload: { input: { repo: "demo-api" },
+        context: { larkMessageId: 1, chatId: "oc_private", trustScope: "trusted", turnId: "turn-one" } } });
+    assert.equal(response.statusCode, 200);
+    assert.equal(f.writes(), 1);
+    assert.equal(f.cards.length, 0);
+    assert.equal((await f.invoke("bbbbbbb")).status, 409);
+    assert.equal(f.writes(), 1);
+  } finally { await f.close(); }
 });
 
 function approvalStatus(f: Awaited<ReturnType<typeof nativeFixture>>, input: unknown = {}, token = fs.readFileSync(f.tokens, "utf8")) {

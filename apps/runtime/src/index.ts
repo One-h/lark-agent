@@ -40,7 +40,7 @@ import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNoti
 import { applyPlanAuthorization, approvalPlanSummary, currentApprovalPlan, currentApprovalPlanGrant,
   planCoversOperation, type ApprovalPlan, type TurnApprovalInput } from "@lark-agent/conversation-runtime";
 import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, formatApprovalTaskContext, postHostJson, reconcilePendingExecutionTurnApprovals, confirmLarkNativeTurnActive, requiresManualTurnApproval, waitForTurnAuthorization, wholeTaskApprovalCapabilityId,
-  LarkApprovalError, type LarkApprovalStatus } from "@lark-agent/conversation-runtime";
+  LarkApprovalError, loadApprovalDirectQuote, type LarkApprovalStatus } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
@@ -208,8 +208,11 @@ export function createRuntime(config: RuntimeConfig) {
   };
   const approvalDetails = (messageId: number, operation: string) => {
     const source = store.db.prepare("SELECT m.content,m.sender_id,c.name FROM lark_messages m LEFT JOIN contacts c ON c.open_id=m.sender_id WHERE m.id=?").get(messageId) as { content?: string; sender_id?: string; name?: string } | undefined;
+    const sender = source?.sender_id ?? null;
+    const quote = loadApprovalDirectQuote(store.db, messageId, sender);
     return { operation, originalMessage: source?.content ?? "", requester: source?.name ?? source?.sender_id ?? "未知发送人", cwd: workspaceRoot,
-      taskContext: formatApprovalTaskContext(loadApprovalTaskContext(store.db, messageId, source?.sender_id ?? null)) };
+      taskContext: [quote && `[直接引用] ${quote.slice(0, 300)}`, formatApprovalTaskContext(loadApprovalTaskContext(store.db, messageId, sender))]
+        .filter(Boolean).join("\n") };
   };
   const approvalIdentityMatches = (row: NonNullable<ReturnType<typeof store.approval>>) => {
     const source = store.db.prepare("SELECT sender_id,codex_session_id FROM lark_messages WHERE id=?").get(row.lark_message_id) as { sender_id: string; codex_session_id: string | null } | undefined;
@@ -236,6 +239,7 @@ export function createRuntime(config: RuntimeConfig) {
       const shownPlan = pending?.planInput.readOnlyWholeTask ? boundedReadApprovalPlan(pending.plan) : pending?.plan;
       try { (config.approvalCardUpdater ?? updateApprovalCard)(row.card_message_id, { ...approvalDetails(row.lark_message_id, row.operation),
         taskPlan: shownPlan ? approvalPlanSummary(shownPlan) : undefined, wholeTask: pending?.wholeTask,
+        operationIntents: pending?.planInput.operationIntent ? [pending.planInput.operationIntent] : undefined,
         status, approvalScope: storedScope, planApproved, decidedAt: new Date().toISOString(), reason }); }
       catch { app.log.warn("capability_approval_card_update_failed"); }
     }
@@ -257,6 +261,7 @@ export function createRuntime(config: RuntimeConfig) {
     try {
       const shownPlan = planInput.readOnlyWholeTask ? boundedReadApprovalPlan(plan) : plan;
       const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation),
+        operationIntents: planInput.operationIntent ? [planInput.operationIntent] : undefined,
         taskPlan: shownPlan ? approvalPlanSummary(shownPlan) : undefined, wholeTask: planInput.wholeTask,
         allowPlanApproval: planInput.wholeTask ? true : plan ? planCoversOperation(plan, planInput) : requiresPlan ? false : undefined,
         reason: planInput.readOnlyWholeTask ? "仅授权本轮限定只读查询，不含写入或部署。" :
@@ -283,15 +288,17 @@ export function createRuntime(config: RuntimeConfig) {
       if (!allows(input)) throw new LarkApprovalError("blocked");
       const reviewed = { ...input, wholeTask: true };
       const stillCurrent = () => store.db.open && approverId === approver
-        && store.setting("turnAutoApprovalEnabled", "false") === "true" && !options.signal.aborted && (options.stillCurrent?.() ?? true)
+        && !options.signal.aborted && (options.stillCurrent?.() ?? true)
         && currentApprovalPlan(store.db, input) === plan;
+      const automaticReviewEnabled = () => store.setting("turnAutoApprovalEnabled", "false") === "true";
       const decision = Promise.resolve().then(async (): Promise<WholeTaskDecision> => {
         if (!stillCurrent()) return { approved: false, status: "failed" };
-        if (options.allowModelReview) {
+        if (options.allowModelReview && automaticReviewEnabled()) {
           const result = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(reviewed), options.signal);
           options.assertActive();
           if (!stillCurrent()) return { approved: false, status: "failed" };
-          if (result.approved && result.scope === "turn") return { approved: true, source: "automatic", reviewId: result.reviewId };
+          if (automaticReviewEnabled() && result.approved && result.scope === "turn")
+            return { approved: true, source: "automatic", reviewId: result.reviewId };
         }
         const status = await awaitApproval({ messageId: input.messageId, turnId: input.turnId, operation: options.display, capabilityId: wholeTaskApprovalCapabilityId },
           options.signal, reviewed, () => {}, stillCurrent);
@@ -306,9 +313,10 @@ export function createRuntime(config: RuntimeConfig) {
     const result = await waitForTurnAuthorization(state.decision, options.signal);
     const validate = () => {
       options.assertActive();
-      if (wholeTasks.get(input.turnId) !== state || approver !== approverId
-        || store.setting("turnAutoApprovalEnabled", "false") !== "true") throw new LarkApprovalError("failed");
+      if (wholeTasks.get(input.turnId) !== state || approver !== approverId) throw new LarkApprovalError("failed");
       if (!result.approved) throw new LarkApprovalError(result.status);
+      if (result.source === "automatic" && store.setting("turnAutoApprovalEnabled", "false") !== "true")
+        throw new LarkApprovalError("failed");
       const manual = result.source === "manual" && !requiresManualTurnApproval(input);
       if (!state.allows(input, manual))
         throw new LarkApprovalError("blocked");
@@ -331,7 +339,7 @@ export function createRuntime(config: RuntimeConfig) {
   }) => {
     const { signal, assertActive } = options;
     if (config.wholeTaskAutoApproval !== false && options.required && !options.explicitlyApproved && !options.legacyOnly
-      && store.setting("turnAutoApprovalEnabled", "false") === "true") {
+      && (wholeTasks.has(input.turnId) || store.setting("turnAutoApprovalEnabled", "false") === "true")) {
       const whole = await authorizeWholeTask(input, options);
       return { legacyRevoked: () => false, validate() { whole.validate(); whole.markApplied(); } };
     }
@@ -525,7 +533,9 @@ export function createRuntime(config: RuntimeConfig) {
       if (existing.status === "failed") throw new Error(existing.error ?? "Previous capability invocation failed");
       throw new Error("The same capability invocation is already running in this turn");
     }
-    const approvalRequired = capability.risk === "external-write" || (capability.risk === "local-write" && expectedScope !== "trusted");
+    const trustedConversation = expectedScope === "trusted" && message.reply_trigger !== "owner_mention";
+    const approvalRequired = !trustedConversation
+      && (capability.risk === "external-write" || capability.risk === "local-write" && expectedScope !== "trusted");
     const call = { turnId, messageId: larkMessageId, controller: new AbortController(), started: false };
     authorizations.add(call);
     const signal = requestSignal ? AbortSignal.any([requestSignal, call.controller.signal]) : call.controller.signal;

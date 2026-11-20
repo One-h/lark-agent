@@ -76,7 +76,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
       const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
       const thread = calls.find(call => call.method === "thread/start").params;
       assert.equal(thread.sandbox, "read-only"); assert.equal(thread.approvalPolicy, "on-request");
-      assert.match(JSON.stringify(calls.find(call => call.method === "turn/start").params.input), /只读查询执行授权/);
+      assert.match(JSON.stringify(calls.find(call => call.method === "turn/start").params.input), /受限模式工具调用/);
     } finally {
       await runtime.app.close(); runtime.stop();
       if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable;

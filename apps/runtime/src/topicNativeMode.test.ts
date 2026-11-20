@@ -605,13 +605,13 @@ test("compact topic turns refresh persona, approval and media guidance after cha
     await f.settings({ stickerUsageMode: "always" });
     const next = await f.message({ sender_id: "ou_member" }); await next.started();
     const prompt = fs.readFileSync(path.join(next.row().codex_task_dir, "prompt.md"), "utf8");
-    assert.match(prompt, /updated fixture persona/); assert.match(prompt, /只读查询执行授权/);
+    assert.match(prompt, /updated fixture persona/); assert.match(prompt, /受限模式工具调用/);
     assert.match(prompt, /history_images_search/); assert.match(prompt, /attach_files/); assert.match(prompt, /表情包（每次回复）/);
     await f.complete(next.id);
     await codexAppServer.request("fixture/emit", { notifications: [{ method: "thread/compacted", params: { threadId: next.row().codex_session_id } }] });
     const after = await f.message({ sender_id: "ou_member" }); await after.started();
     const refreshed = fs.readFileSync(path.join(after.row().codex_task_dir, "prompt.md"), "utf8");
-    assert.match(refreshed, /updated fixture persona/); assert.match(refreshed, /只读查询执行授权/); assert.match(refreshed, /history_images_search/);
+    assert.match(refreshed, /updated fixture persona/); assert.match(refreshed, /受限模式工具调用/); assert.match(refreshed, /history_images_search/);
     await f.complete(after.id);
   } finally { await f.close(); }
 });

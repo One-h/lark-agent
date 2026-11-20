@@ -90,7 +90,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal((await app.app.inject({ method: "POST", url: "/v1/capabilities/register", headers: auth,
       payload: { capabilities: catalog } })).statusCode, 200);
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_plan", "lark_approval_status", "lark__message__send",
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_status", "lark__message__send",
       ...capableIds.map(id => id.replaceAll(".", "__"))].sort());
     const inspectTool = tools.find(t => t.name === "forge__deploy__inspect");
     assert.deepEqual(inspectTool?.inputSchema.properties?.input, catalog[0].inputSchema);
@@ -182,10 +182,10 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
       _meta: { codex_approval_kind: "mcp_tool_call", tool_name: "lark__message__send", tool_params: { context_token: ownerToken, input: message } } });
     assert.deepEqual((await waitFor(() => confirmations().find(r => r.id === "confirm-owner"))).result, { action: "accept", content: {} });
     assert.equal(cards.length, 2);
-    app.store.setSetting("ownerMessageFastPathEnabled", "false");
+    app.store.setSetting("trustedExecutionEnabled", "false");
     const revoked = await call("lark__message__send", message, ownerToken);
     assert.equal(revoked.isError, true);
-    assert.match(JSON.stringify(revoked.content), /MCP 授权条件已变化/);
+    assert.match(JSON.stringify(revoked.content), /Capability trust scope|Capability identity/);
     assert.equal(sends, 0);
     await codexAppServer.request("fixture/finish", {});
     await waitFor(() => ownerRow().codex_status === "answered");
