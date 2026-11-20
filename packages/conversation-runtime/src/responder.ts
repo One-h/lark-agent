@@ -11,7 +11,7 @@ import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, s
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
 import { PromptInstructionCache, type PromptInstructionSnapshot } from "./promptInstructionCache.js";
 import { sanitizeLarkReply } from "./replySanitization.js";
-import { hasLarkManualTurnApproval, notifyLarkTurnEnded } from "./approvalLifecycle.js";
+import { hasLarkManualTurnApproval, LarkApprovalError, notifyLarkTurnEnded } from "./approvalLifecycle.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { postHostJson } from "./hostHttp.js";
 import { finishLarkProgressCard, queueLarkProgressUpdate, rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
@@ -127,9 +127,11 @@ function larkHostDynamicToolName(capabilityId: string): string {
   return capabilityId.replace(/[^a-zA-Z0-9_-]+/g, "__").slice(0, 64);
 }
 
+export const approvalStatusToolName = "lark_approval_status";
+
 function larkMcpHostCapabilities(): Map<string, LarkHostCapability> {
   const capabilities = new Map<string, LarkHostCapability>();
-  const duplicates = new Set<string>([approvalPlanToolName]);
+  const duplicates = new Set<string>([approvalPlanToolName, approvalStatusToolName]);
   for (const capability of registeredLarkHostCapabilities()) {
     const name = larkHostDynamicToolName(capability.id);
     if (capabilities.has(name)) duplicates.add(name);
@@ -145,6 +147,9 @@ export function listLarkMcpTools(includeHostCapabilities: boolean) {
   return [
     { name: approvalPlanToolName, description: approvalPlanTool.description, inputSchema: inputSchema(approvalPlanTool.inputSchema),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
+    { name: approvalStatusToolName, description: "读取当前飞书回合的实际审批结果，区分超时、人工拒绝、策略拦截和失效；不授予权限。",
+      inputSchema: inputSchema({ type: "object", properties: {}, additionalProperties: false }),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
     ...(includeHostCapabilities ? [...larkMcpHostCapabilities()].map(([name, capability]) => ({
       name, title: capability.title, description: capability.description, inputSchema: inputSchema(capability.inputSchema),
       annotations: { readOnlyHint: capability.risk === "read", destructiveHint: capability.risk === "external-write", openWorldHint: true }
@@ -158,7 +163,7 @@ export function larkMcpHostCapabilityId(tool: string): string | undefined {
 
 function larkMcpToolsInstruction(token?: string): string {
   if (!token) return "";
-  return `发布、PR 评审、Issue 分析、待办、飞书消息等能力通过 lark_tools MCP 调用。工具参数使用本轮 context_token=${token}，业务参数放在 input 内；令牌不可对外展示，不使用历史令牌。可能包含受限操作时，先用 lark_tools 的 lark_approval_plan 提交整项任务的目标、步骤和预计影响。区分本地登记、线上只读和实际线上变更；为每步提供完整命令与绝对目录，或能力 ID 和实际 JSON 参数（operation 格式 '能力ID: JSON'，cwd=null）。未核实的目标不猜测，计划变化时重新登记。登记不等于批准。`;
+  return `发布、PR 评审、Issue 分析、待办、飞书消息等能力通过 lark_tools MCP 调用。工具参数使用本轮 context_token=${token}，业务参数放在 input 内；令牌不可对外展示，不使用历史令牌。可能包含受限操作时，先用 lark_tools 的 lark_approval_plan 提交整项任务的目标、步骤和预计影响。区分本地登记、线上只读和实际线上变更；为每步提供完整命令与绝对目录，或能力 ID 和实际 JSON 参数（operation 格式 '能力ID: JSON'，cwd=null）。未核实的目标不猜测，计划变化时重新登记。登记不等于批准。工具仅返回 declined 或「用户拒绝」而没有明确来源时，先调用 lark_approval_status（input={}）核实。超时没有人工决定；可以交付已完成的部分，用户仍需要时再申请。仅在确认人工拒绝时称为人工拒绝；多个结果不能混为一谈。`;
 }
 
 export function larkCodexTaskPaths(
@@ -242,7 +247,7 @@ type ActiveLarkCodexRun = {
   pendingSteers: number;
   hostToolCalls: Set<AbortController>;
   pendingApprovalIds: Set<number>;
-  approvalAudit: Map<string, ExecutionApprovalAudit>;
+  approvalAudit: Map<string, ExecutionApprovalAudit & { messageId: number | null }>;
   authRetryAttempted: boolean;
   authRecovering: boolean;
   capacityRetryAttempts: number;
@@ -2609,7 +2614,8 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
     if (item?.type === "commandExecution" && item.status === "declined" && typeof item.id === "string") {
       const prior = run.approvalAudit.get(`${run.turnId}:${item.id}`);
       const known = prior && ["rejected", "expired", "failed", "declined"].includes(prior.outcome) ? prior : null;
-      recordExecutionApprovalAudit(run, responseRunMember(run), {
+      const target = prior?.messageId != null ? run.members.get(prior.messageId) : responseRunMember(run);
+      recordExecutionApprovalAudit(run, target, {
         threadId: run.threadId, turnId: run.turnId, itemId: item.id,
         requestId: prior?.requestId ?? null, requestMethod: prior?.requestMethod ?? null,
         source: known?.source ?? "native_unknown", outcome: "declined",
@@ -2904,7 +2910,7 @@ function recordExecutionApprovalAudit(run: ActiveLarkCodexRun | undefined, targe
   audit: ExecutionApprovalAudit): void {
   const params = { ...audit, messageId: target?.row.id ?? null, recordedAt: nowIso() };
   if (run && audit.turnId === run.turnId && audit.itemId) {
-    run.approvalAudit.set(`${audit.turnId}:${audit.itemId}`, audit);
+    run.approvalAudit.set(`${audit.turnId}:${audit.itemId}`, params);
   }
   if (target) appendPreparedLog(target, { method: "approval/decision", params });
   // Deliberately exclude command text, permission paths and native error payloads.
@@ -2925,8 +2931,8 @@ function auditApprovalRequest(run: ActiveLarkCodexRun | undefined, target: Prepa
 
 function declineExecutionApproval(run: ActiveLarkCodexRun | undefined, target: PreparedLarkCodexMessage | undefined,
   request: CodexAppServerRequest, details: ApprovalRequestDetails, reasonCode: string, reason: string,
-  source: ExecutionApprovalAudit["source"] = "policy"): void {
-  auditApprovalRequest(run, target, request, details, { source, outcome: "rejected", reasonCode, reason });
+  source: ExecutionApprovalAudit["source"] = "policy", outcome: ExecutionApprovalAudit["outcome"] = "rejected"): void {
+  auditApprovalRequest(run, target, request, details, { source, outcome, reasonCode, reason });
   codexAppServer.respondToRequest(request.id, details.rejectedResponse);
 }
 
@@ -3487,6 +3493,37 @@ export function submitLarkMcpApprovalPlan(context: ReturnType<typeof toolContext
   return { success: true, text: "已登记整项任务计划，尚未授权。实际操作会按审批范围检查。" };
 }
 
+export function readLarkMcpApprovalStatus(context: NonNullable<ReturnType<typeof toolContext>>, input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length) {
+    return { success: false, text: "请使用空的 input 对象，仅可查询当前回合。" };
+  }
+  const statuses = new Set(db.prepare(`
+    SELECT status FROM lark_execution_approvals WHERE lark_message_id=? AND turn_id=?
+    UNION SELECT status FROM lark_capability_approvals WHERE lark_message_id=? AND turn_id=?`
+  ).pluck().all(context.larkMessageId, context.turnId, context.larkMessageId, context.turnId) as string[]);
+  const run = context.native && [...activeLarkCodexRuns.values()].find(run =>
+    !run.settled && run.turnId === context.turnId && approvalRunMember(run) === context.native);
+  for (const audit of run ? run.approvalAudit.values() : []) {
+    if (audit.messageId !== context.larkMessageId || !["rejected", "expired", "declined", "failed"].includes(audit.outcome)) continue;
+    if (audit.source === "policy") statuses.add("blocked");
+    else if (audit.source === "timeout") statuses.add("expired");
+    else if (audit.source === "manual" && audit.reasonCode === "human_rejected") statuses.add("rejected");
+    else if (audit.source === "native_unknown") statuses.add("unknown");
+    else statuses.add("failed");
+  }
+  const messages: Record<string, string> = {
+    expired: new LarkApprovalError("expired").message,
+    rejected: new LarkApprovalError("rejected").message,
+    failed: new LarkApprovalError("failed").message,
+    blocked: "系统策略拦截了操作，不代表有人点了拒绝。",
+    unknown: "原生工具未放行，拒绝来源未核实。",
+    approved: "本轮有操作获批，不表示全部操作获批或已成功执行。",
+    pending: "本轮有申请仍在等待审批。"
+  };
+  return { success: true, text: JSON.stringify({ outcomes: [...statuses].filter(status => Object.hasOwn(messages, status))
+    .map(status => ({ status, message: messages[status] })) }) };
+}
+
 const ownerAssistMcpCalls = new Set<string>();
 export async function runLarkOwnerAssistMcpTool(contextToken: string, args: Record<string, unknown>) {
   const fail = (text: string) => ({ success: false, contentItems: [{ type: "inputText", text }] });
@@ -3685,8 +3722,17 @@ function handleAppServerRequest(request: CodexAppServerRequest): boolean {
     void wholeTask(botReadOnly ? { ...currentInput, readOnlyWholeTask: true } : currentInput, controller.signal, stillCurrent).then(approval => {
       approval.validate();
       if (autoApproveTurnExecution(run, request, details, target, { scope: "turn", reviewId: approval.reviewId })) approval.markApplied();
-    }).catch(() => {
-      if (!run.settled && run.turnId === turnId) declineExecutionApproval(run, target, request, details,
+    }).catch((error: unknown) => {
+      if (run.settled || run.turnId !== turnId) return;
+      if (error instanceof LarkApprovalError) {
+        switch (error.status) {
+          case "expired": return declineExecutionApproval(run, target, request, details, "approval_expired", error.message, "timeout", "expired");
+          case "rejected": return declineExecutionApproval(run, target, request, details, "human_rejected", error.message, "manual");
+          case "failed": return declineExecutionApproval(run, target, request, details, "approval_failed", error.message, "lifecycle", "failed");
+          case "blocked": return declineExecutionApproval(run, target, request, details, "whole_task_not_authorized", error.message);
+        }
+      }
+      declineExecutionApproval(run, target, request, details,
         "whole_task_not_authorized", "本轮任务未获批准、操作超出本轮范围或授权已失效。");
     }).finally(() => run.hostToolCalls.delete(controller));
     return true;

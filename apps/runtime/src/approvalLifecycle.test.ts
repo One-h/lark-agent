@@ -135,7 +135,12 @@ test("terminal turns, replacement turns and expired cards cannot start deploymen
       if (reason === "expired") f.runtime.store.db.prepare("UPDATE lark_capability_approvals SET expires_at='2000-01-01' WHERE id=?").run(id);
       if (reason === "identity-changed") f.runtime.store.db.prepare("UPDATE lark_messages SET sender_id='ou_changed' WHERE id=1").run();
       assert.equal((await f.decide(id)).statusCode, 409);
-      assert.equal((await pending).status, 409); assert.equal(f.writes(), 0);
+      const result = await pending;
+      assert.equal(result.status, 409); assert.equal(f.writes(), 0);
+      if (reason === "expired") {
+        assert.equal(JSON.parse(result.body).approvalStatus, "expired");
+        assert.match(JSON.parse(result.body).error, /超时.*未收到审批人的决定/);
+      }
       assert.ok(["failed", "expired"].includes(f.runtime.store.approval(id)!.status));
       assert.equal((await f.decide(id, "approve-turn")).statusCode, 409);
     } finally { await f.close(); }
@@ -198,6 +203,7 @@ async function nativeFixture(order: "host-first" | "command-first" | "query", re
   const previousExecutable = process.env.CODEX_EXECUTABLE, previousPath = process.env.PATH;
   const executable = path.join(f.root, "codex.mjs");
   const decisions = path.join(f.root, "query-decisions.jsonl");
+  const tokens = path.join(f.root, "query-tokens.txt");
   fs.writeFileSync(path.join(f.root, "lark-cli"), '#!/bin/sh\nprintf \'%s\\n\' \'{"data":{"message_id":"om_native"}}\'\n', { mode: 0o755 });
   fs.writeFileSync(executable, `#!${process.execPath}
 import readline from "node:readline"; import {appendFileSync} from "node:fs";
@@ -208,7 +214,12 @@ const host=()=>send({id:"host-one",method:"item/tool/call",params:{threadId:"thr
 const finish=value=>{status=value;if(status==="completed")send({method:"item/completed",params:{threadId:"thread-live",turnId:"turn-live",item:{id:"answer",type:"agentMessage",phase:"final_answer",text:"fixture done"}}});send({method:"turn/completed",params:{threadId:"thread-live",turn:{id:"turn-live",status}}});};
 readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.parse(line);
 if(m.method==="thread/start"||m.method==="thread/resume")send({id:m.id,result:{thread:{id:"thread-live"}}});
-else if(m.method==="turn/start"){send({id:m.id,result:{turn:{id:"turn-live",status:"inProgress"}}});${order === "query" ? "" : `setTimeout(${order === "host-first" ? "host" : "command"},20);`}}
+else if(m.method==="turn/start"){
+ send({id:m.id,result:{turn:{id:"turn-live",status:"inProgress"}}});
+ ${order === "query"
+    ? `const token=JSON.stringify(m.params.input).match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];if(token)appendFileSync(${JSON.stringify(tokens)},token);`
+    : `setTimeout(${order === "host-first" ? "host" : "command"},20);`}
+}
 else if(m.method==="turn/steer")send({id:m.id,result:{turnId:"turn-live"}});
 else if(m.method==="fixture/end"){send({id:m.id,result:{}});finish(m.params.status);}
 else if(m.method==="fixture/state-only"){status=m.params.status;send({id:m.id,result:{}});}
@@ -225,7 +236,7 @@ else if(m.id==="command-one"&&status==="inProgress"){${order === "command-first"
   f.seed("failed", "");
   if (order === "query") f.runtime.store.db.prepare("UPDATE lark_messages SET content='查询 fixture-db 的示例数据' WHERE id=1").run();
   assert.equal(enqueueLarkCodexReply(1), true);
-  return { ...f, decisions, async close() { await f.close(); if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; } };
+  return { ...f, decisions, tokens, async close() { await f.close(); if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; } };
 }
 
 test("manual whole-turn approval accepts revised queries while automatic approval stays scoped", async () => {
@@ -262,12 +273,53 @@ test("manual whole-turn approval accepts revised queries while automatic approva
       await until(() => decision("query-revised") === (manual ? "accept" : "decline"));
       await send("query-write", "mysql -e 'DELETE FROM fixture_rows'");
       await until(() => decision("query-write") === "decline");
+      assert.equal((await approvalStatus(f)).json().text.includes('"status":"blocked"'), true);
       assert.equal(f.cards.length, manual ? 1 : 0);
       assert.equal(reviews, 1);
       await codexAppServer.request("fixture/end", { status: "completed" });
       await until(() => f.row().codex_status === "answered");
       await send("query-late", revised);
       await until(() => decision("query-late") === "decline");
+    } finally { await f.close(); }
+  }
+});
+
+function approvalStatus(f: Awaited<ReturnType<typeof nativeFixture>>, input: unknown = {}, token = fs.readFileSync(f.tokens, "utf8")) {
+  return f.runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call",
+    headers: { authorization: `Bearer ${config.larkAgentMcpToken}` },
+    payload: { tool: "lark_approval_status", contextToken: token, input } });
+}
+
+test("native declines expose different model-visible outcomes for timeout and human rejection", async () => {
+  for (const outcome of ["expired", "rejected"] as const) {
+    const f = await nativeFixture("query", async () => ({ decision: "manual", reason: "fixture" }));
+    try {
+      f.runtime.store.setSetting("turnAutoApprovalEnabled", "true");
+      await until(() => f.row().codex_status === "running" && fs.existsSync(f.tokens));
+      await codexAppServer.request("fixture/query", { id: "query-first", command: "python3 query-fixture.py" });
+      await until(() => f.cards.length === 1);
+      const id = f.cards[0].approvalId;
+      assert.deepEqual(JSON.parse((await approvalStatus(f)).json().text).outcomes.map((row: { status: string }) => row.status), ["pending"]);
+      assert.equal((await approvalStatus(f, { messageId: 99 })).statusCode, 400);
+      assert.equal((await approvalStatus(f, {}, "x".repeat(32))).statusCode, 409);
+      if (outcome === "expired") {
+        f.runtime.store.db.prepare("UPDATE lark_capability_approvals SET expires_at='2000-01-01' WHERE id=?").run(id);
+        f.runtime.expireApprovals();
+      } else {
+        assert.equal((await f.decide(id, "reject")).statusCode, 200);
+      }
+      await until(() => fs.existsSync(f.decisions));
+      assert.equal(JSON.parse(fs.readFileSync(f.decisions, "utf8")).decision, "decline");
+      const result = await approvalStatus(f);
+      assert.equal(result.statusCode, 200);
+      const { outcomes } = JSON.parse(result.json().text);
+      assert.deepEqual(outcomes.map((row: { status: string }) => row.status), [outcome]);
+      assert.match(outcomes[0].message, outcome === "expired" ? /超时.*未收到审批人的决定/ : /明确拒绝/);
+      assert.equal(f.runtime.store.approval(id)?.status, outcome);
+      assert.equal(f.writes(), 0);
+      await codexAppServer.request("fixture/end", { status: "completed" });
+      await until(() => f.row().codex_status === "answered");
+      assert.equal((await approvalStatus(f)).statusCode, 409);
     } finally { await f.close(); }
   }
 });

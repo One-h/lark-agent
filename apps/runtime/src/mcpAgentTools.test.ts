@@ -90,11 +90,12 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal((await app.app.inject({ method: "POST", url: "/v1/capabilities/register", headers: auth,
       payload: { capabilities: catalog } })).statusCode, 200);
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_plan", "lark__message__send",
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_plan", "lark_approval_status", "lark__message__send",
       ...capableIds.map(id => id.replaceAll(".", "__"))].sort());
     const inspectTool = tools.find(t => t.name === "forge__deploy__inspect");
     assert.deepEqual(inspectTool?.inputSchema.properties?.input, catalog[0].inputSchema);
     assert.equal(inspectTool?.annotations?.readOnlyHint, true);
+    assert.equal(tools.find(t => t.name === "lark_approval_status")?.annotations?.readOnlyHint, true);
     assert.equal(tools.find(t => t.name === "forge__deploy__production")?.annotations?.readOnlyHint, false);
     const now = new Date().toISOString(), source = { chat_id: "oc_fixture", chat_type: "p2p" };
     app.store.db.prepare("INSERT INTO lark_codex_sessions (session_key,chat_id,trust_scope,codex_session_id,created_at,updated_at) VALUES (?,?,'untrusted','old-thread',?,?)")
@@ -141,7 +142,13 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const changedCard = await waitFor(() => cards[1]);
     assert.equal(writes, 0);
     assert.equal((await app.app.inject({ method: "POST", url: `/v1/approvals/${changedCard.approvalId}/reject`, headers: auth })).statusCode, 200);
-    assert.equal((await changed).isError, true);
+    const rejected = await changed;
+    assert.equal(rejected.isError, true);
+    assert.match(JSON.stringify(rejected.content), /审批人明确拒绝/);
+    const approvalState = await call("lark_approval_status", {});
+    assert.notEqual(approvalState.isError, true);
+    assert.match(JSON.stringify(approvalState.content), /rejected/);
+    assert.doesNotMatch(JSON.stringify(approvalState.content), /ou_owner|demo-api|forge\.deploy/);
     assert.equal(Boolean((await call("forge__deploy__production", input)).isError), false);
     assert.equal(writes, 1);
     await confirm("confirm-cached");
@@ -155,6 +162,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     await codexAppServer.request("fixture/finish", {});
     await waitFor(() => row().codex_status === "answered");
     assert.equal(Boolean((await call("forge__deploy__inspect", input)).isError), true);
+    assert.equal((await call("lark_approval_status", {})).isError, true);
 
     app.store.setSetting("trustedExecutionEnabled", "true");
     app.store.setSetting("ownerMessageFastPathEnabled", "true");

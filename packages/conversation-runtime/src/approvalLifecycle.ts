@@ -2,6 +2,19 @@ import type Database from "better-sqlite3";
 
 const listeners = new WeakMap<Database.Database, Set<(turnId: string) => void>>();
 
+export type LarkApprovalStatus = "approved" | "rejected" | "expired" | "failed";
+
+export class LarkApprovalError extends Error {
+  constructor(readonly status: Exclude<LarkApprovalStatus, "approved"> | "blocked") {
+    super({
+      expired: "审批等待超时，未收到审批人的决定，相关操作未执行。用户仍需要时可重新发起申请。",
+      rejected: "审批人明确拒绝了本次申请，相关操作未执行。",
+      failed: "审批未完成或已失效，相关操作未执行，不代表人工拒绝。",
+      blocked: "系统策略拦截：操作超出本轮授权范围，未执行。"
+    }[status]);
+  }
+}
+
 export function waitForTurnAuthorization<T>(result: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const abort = () => reject(new Error("Authorization wait was cancelled"));
