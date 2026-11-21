@@ -67,13 +67,14 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   const oldExecutable = process.env.CODEX_EXECUTABLE, oldPath = process.env.PATH;
   process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${root}:${oldPath ?? ""}`;
   const host = Fastify();
-  let writes = 0, sends = 0;
+  let writes = 0, sends = 0, groupCreates = 0;
   host.post("/api/lark-agent/capabilities/forge.deploy.inspect", async () => ({ found: true, _receipt: { internal: "not forwarded" } }));
   host.post("/api/lark-agent/capabilities/forge.deploy.production", async () => ({ applied: ++writes }));
   const hostUrl = await host.listen({ host: "127.0.0.1", port: 0 });
   const cards: Array<{ approvalId: number; taskPlan?: string }> = [];
   const app = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: ["ou_owner"],
     runtimeToken: "fixture-host-token", approverId: "ou_owner", hostBaseUrl: hostUrl,
+    managedChatCreator: async input => { assert.equal(input.ownerId, "ou_owner"); groupCreates++; return { chatId: "oc_newgroup", ownerConfirmed: true }; },
     approvalCardSender: (_id, card) => { cards.push(card); return { ok: true, messageId: "om_fixture_card" }; },
     approvalCardUpdater: () => {}, textReplySender: () => ({ ok: true, messageId: "om_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" }),
     proactiveMessageSender: () => { sends++; return { ok: true, messageId: "om_fake_send", chatId: "oc_contact", messageAt: null, messageType: "text" }; } });
@@ -90,7 +91,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal((await app.app.inject({ method: "POST", url: "/v1/capabilities/register", headers: auth,
       payload: { capabilities: catalog } })).statusCode, 200);
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_status", "lark__message__send",
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_status", "lark__message__send", "lark__chat__create", "lark__chat__list_managed",
       ...capableIds.map(id => id.replaceAll(".", "__"))].sort());
     const inspectTool = tools.find(t => t.name === "forge__deploy__inspect");
     assert.deepEqual(inspectTool?.inputSchema.properties?.input, catalog[0].inputSchema);
@@ -110,6 +111,9 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const context_token = fs.readFileSync(path.join(row().codex_task_dir, "prompt.md"), "utf8").match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     assert(context_token);
     const call = (name: string, input: unknown, token = context_token) => client.callTool({ name, arguments: { context_token: token, input } });
+    const groupInput = { requestId: "767dfbee-0ffd-4b61-8599-4d559e8686be", name: "Example group" };
+    assert.equal((await call("lark__chat__create", groupInput)).isError, true);
+    assert.equal(groupCreates, 0);
     const read = await call("forge__deploy__inspect", { repo: "demo-api" });
     assert.equal(Boolean(read.isError), false);
     assert.match(JSON.stringify(read.content), /found/);
@@ -177,6 +181,23 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     await waitFor(() => ownerRow().codex_turn_id === "fixture-owner-turn");
     const ownerToken = fs.readFileSync(path.join(ownerRow().codex_task_dir, "prompt.md"), "utf8").match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     assert(ownerToken);
+    assert.equal((await call("lark__chat__create", groupInput, ownerToken)).isError, true, "an unverified local event is not a Feishu owner message");
+    app.store.db.prepare("UPDATE lark_messages SET listener_verified=1 WHERE id=?").run(ownerId);
+    await app.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      message_id: "om_owner", chat_id: "oc_fixture", chat_type: "p2p", sender_id: "ou_other", content: "Unverified replacement"
+    } });
+    assert.equal((app.store.db.prepare("SELECT sender_id FROM lark_messages WHERE id=?").get(ownerId) as { sender_id: string }).sender_id, "ou_owner");
+    const direct = await app.app.inject({ method: "POST", url: "/v1/capabilities/lark.chat.create/invoke", headers: auth,
+      payload: { input: groupInput, context: { larkMessageId: ownerId, turnId: "fixture-owner-turn", chatId: source.chat_id, trustScope: "trusted" } } });
+    assert.notEqual(direct.statusCode, 200);
+    assert.equal(groupCreates, 0);
+    const createdGroup = await call("lark__chat__create", groupInput, ownerToken);
+    assert.notEqual(createdGroup.isError, true, JSON.stringify(createdGroup.content));
+    assert.match(JSON.stringify(createdGroup.content), /oc_newgroup/);
+    assert.equal(groupCreates, 1);
+    assert.match(JSON.stringify((await call("lark__chat__list_managed", {}, ownerToken)).content), /oc_newgroup/);
+    assert.notEqual((await call("lark__chat__create", groupInput, ownerToken)).isError, true);
+    assert.equal(groupCreates, 1);
     const message = { recipient: "Example", text: "hello" };
     await confirm("confirm-owner", { turnId: "fixture-owner-turn",
       _meta: { codex_approval_kind: "mcp_tool_call", tool_name: "lark__message__send", tool_params: { context_token: ownerToken, input: message } } });
@@ -189,6 +210,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal(sends, 0);
     await codexAppServer.request("fixture/finish", {});
     await waitFor(() => ownerRow().codex_status === "answered");
+    assert.equal((await call("lark__chat__list_managed", {}, ownerToken)).isError, true);
   } finally {
     await client.close(); await app.app.close(); app.stop(); await host.close();
     if (oldExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = oldExecutable;

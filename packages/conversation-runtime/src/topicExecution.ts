@@ -70,7 +70,7 @@ function saveRoute(key: string, previous: StoredRoute | null, route: ExecutionEn
 export function updateConversationExecutionSettings(chatId: string, route: ExecutionEngineRoute | null): "ok" | "busy" | "unavailable" | "missing" {
   const latest = db.prepare("SELECT MAX(id) AS id FROM lark_messages WHERE chat_id=? AND chat_type IN ('group','p2p') AND direction='inbound'")
     .get(chatId) as { id: number | null };
-  if (latest.id === null) return "missing";
+  if (latest.id === null && !db.prepare("SELECT 1 FROM lark_managed_chats WHERE chat_id=?").get(chatId)) return "missing";
   const external = route?.engineId !== "codex" ? route : null;
   const previous = conversationExecutionRoute(chatId);
   if (external && !available(external)) return "unavailable";
@@ -80,7 +80,7 @@ export function updateConversationExecutionSettings(chatId: string, route: Execu
     if (external) {
       // Each engine keeps its own native conversation when switching away and back.
       const bindingId = JSON.stringify(["conversation", chatId, external.engineId, external.model === null]);
-      setAppSettingValue(conversationRouteKey(chatId), JSON.stringify({ ...external, bindingId, afterMessageId: latest.id }));
+      setAppSettingValue(conversationRouteKey(chatId), JSON.stringify({ ...external, bindingId, afterMessageId: latest.id ?? 0 }));
     } else {
       if (previous) setAppSettingValue(conversationRouteKey(chatId), "");
       setConversationCodexModel(chatId, route?.model ?? null);

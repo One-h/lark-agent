@@ -5,3 +5,4 @@ export * from "./reactions.js";
 export * from "./reply.js";
 export * from "./richReply.js";
 export * from "./progress.js";
+export * from "./managedChat.js";

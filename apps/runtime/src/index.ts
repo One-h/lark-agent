@@ -12,6 +12,8 @@ import { config as conversationConfig, configuredLarkCodexModel, configuredLarkC
 import { registerHostOutboundRoutes } from "./outbound.js";
 import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
+import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
+import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import { registerPersonaRoutes } from "./personaRoutes.js";
 import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
 import { configuredNativeAcpEngines, configureTopicExecutionEngines, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
@@ -43,6 +45,7 @@ import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, fo
   LarkApprovalError, loadApprovalDirectQuote, type LarkApprovalStatus } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
+type ManagedChatRuntimeOptions = { managedChatCreator?: ManagedChatCreator };
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
 type PendingApproval = { resolve: (status: LarkApprovalStatus) => void; timer: NodeJS.Timeout; cleanup: () => void; stillCurrent?: () => boolean; wholeTask?: boolean;
@@ -144,7 +147,7 @@ function messageFiles(store: SqliteAgentStore, messageId: number) {
   try { return (JSON.parse(text) as Array<{ name: string; path: string; mimeType?: string; size?: number; text: string }>).flatMap((item) => { const file = path.isAbsolute(item.path) ? item.path : path.resolve(directory, item.path); if (!file.startsWith(`${path.resolve(directory)}${path.sep}`) || !existsSync(file)) return []; return [{ name: item.name, path: file, mimeType: item.mimeType ?? "text/plain", size: item.size ?? readFileSync(file).byteLength, text: item.text }]; }); } catch { return []; }
 }
 
-export function createRuntime(config: RuntimeConfig) {
+export function createRuntime(config: RuntimeConfig & ManagedChatRuntimeOptions) {
   const app = Fastify({ logger: true });
   configureTopicExecutionEngines(config.executionEngines ?? []);
   const probeLarkCli = createLarkCliProbe();
@@ -178,6 +181,13 @@ export function createRuntime(config: RuntimeConfig) {
   configureOwnerMentionAssist({ membershipProbe: config.ownerMentionAssistMembershipProbe, privateSender: config.proactiveMessageSender, delayMs: config.ownerMentionAssistDelayMs, reviewAvailable: Boolean(config.runtimeToken) });
   configureAutoApprovalNotificationSender(config.autoApprovalNotificationSender);
   store.registerCapabilities([{ id: "lark.message.send", title: "发送飞书消息", description: "Send a bot text message to a known Lark contact. Input requires recipient (name, alias, or open_id) and text.", inputSchema: { type: "object", properties: { recipient: { type: "string" }, text: { type: "string" } }, required: ["recipient", "text"] }, risk: "external-write" }]);
+  store.registerCapabilities(managedChatCapabilities);
+  const groupManagement = managedChats(store.db, {
+    owner: () => approverId,
+    create: config.managedChatCreator ?? (config.mode === "active" ? createManagedLarkChat : undefined),
+    codexModels: config.mode === "active" ? async () => (await listLarkCodexModels()).map(model => model.id) : undefined,
+    reportError: phase => app.log.warn({ phase }, "managed_lark_chat_unconfirmed")
+  });
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
@@ -472,6 +482,8 @@ export function createRuntime(config: RuntimeConfig) {
     return true;
   });
   const invokeHost = async (capability: StoredCapability, input: unknown, context: Record<string, unknown>): Promise<unknown> => {
+    if (capability.id === "lark.chat.create") return groupManagement.create(input);
+    if (capability.id === "lark.chat.list_managed") return groupManagement.list(input);
     if (capability.id === "lark.message.send") {
       const payload = input && typeof input === "object" ? input as { recipient?: unknown; text?: unknown } : {};
       const recipient = typeof payload.recipient === "string" ? payload.recipient.trim() : "";
@@ -508,13 +520,18 @@ export function createRuntime(config: RuntimeConfig) {
     if (!capability) throw new Error("Capability is not registered");
     const larkMessageId = Number(context.larkMessageId);
     const message = Number.isInteger(larkMessageId) && typeof context.chatId === "string"
-      ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_session_id, codex_turn_id, codex_status, message_type, sender_type, direction, reply_trigger FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_session_id?: string | null; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string; reply_trigger?: string } | undefined
+      ? store.db.prepare("SELECT chat_id, chat_type, sender_id, content, codex_session_id, codex_turn_id, codex_status, message_type, sender_type, direction, reply_trigger, listener_verified FROM lark_messages WHERE id=?").get(larkMessageId) as { chat_id?: string | null; chat_type?: string | null; sender_id?: string | null; content?: string; codex_session_id?: string | null; codex_turn_id?: string | null; codex_status?: string; message_type?: string; sender_type?: string; direction?: string; reply_trigger?: string; listener_verified: number } | undefined
       : undefined;
     if (!message || message.chat_id !== context.chatId) throw new Error("Invalid capability context");
     if (!ownerAssistMayExecute(larkMessageId)) throw new Error("Owner assistance has not accepted this request; publishing a draft does not authorize execution");
     if (message.chat_type === "group" && conversationConfig.groupPrivacyEnforced) throw new Error("群消息不能调用旧宿主能力；请使用群聊隐私单次审批。");
     const expectedScope = isTrustedLarkSender(message.sender_id) ? "trusted" : "untrusted";
     if (context.trustScope !== expectedScope) throw new Error("Capability trust scope does not match the current sender");
+    const managedChat = isManagedChatCapability(id);
+    const ownerCanManage = () => Boolean(contextStillCurrent?.() && approverId && message.sender_id === approverId
+      && isTrustedLarkSender(message.sender_id) && message.sender_type === "user" && message.direction === "inbound"
+      && message.listener_verified === 1 && message.chat_type === "p2p" && message.reply_trigger === "p2p");
+    if (managedChat && !ownerCanManage()) throw new Error("建群工具仅限机器人所有者在飞书私聊中使用。");
     const turnId = typeof context.turnId === "string" && context.turnId ? context.turnId : message.codex_turn_id ?? `capability:${id}`;
     const encodedInput = JSON.stringify(input ?? null);
     const inputHash = createHash("sha256").update(encodedInput).digest("hex");
@@ -529,9 +546,10 @@ export function createRuntime(config: RuntimeConfig) {
         if (beforeExecution && requestSignal) {
           requestSignal.throwIfAborted();
           await beforeExecution(requestSignal);
-          if (requestSignal.aborted || !liveTurn(larkMessageId, turnId) || !contextStillCurrent?.())
+          if (requestSignal.aborted || !liveTurn(larkMessageId, turnId) || !contextStillCurrent?.() || managedChat && !ownerCanManage())
             throw new Error("MCP 审批对应回合已结束，未返回历史结果。");
         }
+        if (id === "lark.chat.list_managed") return groupManagement.list(input);
         return JSON.parse(existing.result_json ?? "null");
       }
       if (existing.status === "failed") throw new Error(existing.error ?? "Previous capability invocation failed");
@@ -549,6 +567,7 @@ export function createRuntime(config: RuntimeConfig) {
     };
     signal.addEventListener("abort", cancelled, { once: true });
     const assertActive = () => {
+      if (managedChat && !ownerCanManage()) throw new Error("飞书建群工具的会话或所有者已变化。");
       if (!ownerAssistMayExecute(larkMessageId)) throw new Error("协同上下文或开关已变化，未放行新的操作。");
       if (signal.aborted || !liveTurn(larkMessageId, turnId) || contextStillCurrent && !contextStillCurrent())
         throw new Error("会话已结束、turn 已变化或调用已断开，未开始新的操作。");
@@ -630,6 +649,19 @@ export function createRuntime(config: RuntimeConfig) {
     finally { activeCapabilityCalls--; }
   };
   const authenticated = (request: FastifyRequest) => !config.runtimeToken || request.headers.authorization === `Bearer ${config.runtimeToken}`;
+  app.route({
+    method: ["GET", "POST"], url: "/v1/managed-chats",
+    async handler(request, reply) {
+      if (!config.runtimeToken || !authenticated(request) || !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip))
+        return reply.code(401).send({ error: "local runtime token required" });
+      try {
+        return request.method === "POST" ? await groupManagement.create(request.body) : await groupManagement.list();
+      } catch (error) {
+        if (!(error instanceof ManagedChatError)) throw error;
+        return reply.code(error.status).send({ code: error.code, message: error.message, error: error.message });
+      }
+    }
+  });
   let groupPrivacy: GroupPrivacy;
   const agentMessaging = new AgentMessaging(store, { ownerId: () => approverId ?? "",
     groupReviewRequired: () => groupPrivacy.enabled(),

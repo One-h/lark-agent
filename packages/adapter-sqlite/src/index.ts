@@ -165,6 +165,11 @@ export class SqliteAgentStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_lark_messages_event_id ON lark_messages(event_id) WHERE event_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_lark_messages_message_id ON lark_messages(message_id) WHERE message_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS lark_managed_chats (
+        creator_id TEXT NOT NULL, request_id TEXT NOT NULL, request_json TEXT NOT NULL, chat_id TEXT UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('creating','ready','attention')), error TEXT, created_at TEXT NOT NULL,
+        PRIMARY KEY (creator_id, request_id)
+      );
       CREATE TABLE IF NOT EXISTS lark_codex_sessions (session_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, codex_session_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS lark_topic_engine_runs (lark_message_id INTEGER PRIMARY KEY, engine_id TEXT NOT NULL, model TEXT, session_id TEXT, turn_id TEXT);
       CREATE TABLE IF NOT EXISTS lark_codex_archive_queue (thread_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, activity_version INTEGER NOT NULL, token TEXT NOT NULL, due_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL);
@@ -217,6 +222,7 @@ export class SqliteAgentStore {
     this.ensureColumn("contacts", "last_seen_at", "TEXT");
     this.ensureColumn("lark_messages", "direction", "TEXT NOT NULL DEFAULT 'inbound'");
     this.ensureColumn("lark_messages", "sender_type", "TEXT");
+    this.ensureColumn("lark_messages", "listener_verified", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("lark_messages", "recipient_id", "TEXT");
     this.ensureColumn("lark_messages", "message_at", "TEXT");
     this.ensureColumn("lark_messages", "outbound_source", "TEXT");

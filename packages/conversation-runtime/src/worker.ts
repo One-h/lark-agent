@@ -274,11 +274,16 @@ function resolveReplyContext(messageId: string | null, eventReplyToId: string | 
   };
 }
 
-function persistLarkEvent(event: LarkEvent): void {
+function persistLarkEvent(event: LarkEvent, fromListener = false): void {
   const eventId = stringValue(event.event_id);
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
-  const existingTrigger = messageId && (db.prepare("SELECT reply_trigger FROM lark_messages WHERE message_id=?").get(messageId) as { reply_trigger?: string } | undefined)?.reply_trigger;
-  if (existingTrigger === "topic" || existingTrigger === "topic_command") return;
+  // A local intake request cannot replace a listener-authenticated message.
+  const existing = messageId || eventId
+    ? db.prepare("SELECT reply_trigger, listener_verified FROM lark_messages WHERE message_id=? OR event_id=? ORDER BY listener_verified DESC LIMIT 1")
+      .get(messageId, eventId) as { reply_trigger: string; listener_verified: number } | undefined
+    : undefined;
+  if (existing?.reply_trigger === "topic" || existing?.reply_trigger === "topic_command"
+    || (!fromListener && existing?.listener_verified === 1)) return;
   const fromBot = event.sender_type === "bot";
   const botOpenId = fromBot ? resolveCurrentBotOpenId() : undefined;
   const directlyMentioned = fromBot
@@ -317,9 +322,9 @@ function persistLarkEvent(event: LarkEvent): void {
     INSERT OR IGNORE INTO lark_messages (
       event_id, message_id, chat_id, chat_type, sender_id, sender_type, direction, message_type, content, message_at,
       reply_to_message_id, root_message_id, thread_id, reply_to_message_type, reply_to_content, reply_to_raw_json,
-      mentioned, reply_trigger, reply_status, reply_error, raw_json, received_at, created_at
+      mentioned, reply_trigger, reply_status, reply_error, raw_json, received_at, created_at, listener_verified
     )
-    VALUES (?, ?, ?, ?, ?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     eventId,
     messageId,
@@ -342,7 +347,8 @@ function persistLarkEvent(event: LarkEvent): void {
     replyError,
     JSON.stringify(event),
     receivedAt,
-    receivedAt
+    receivedAt,
+    fromListener && event.sender_type === "user" ? 1 : 0
   );
   if (insert.changes === 0) {
     const keyColumn = messageId ? "message_id" : "event_id";
@@ -465,7 +471,7 @@ function handleLine(line: string): void {
     return;
   }
   try {
-    persistLarkEvent(JSON.parse(trimmed) as LarkEvent);
+    persistLarkEvent(JSON.parse(trimmed) as LarkEvent, true);
   } catch (error) {
     console.warn(`Lark message event skipped: ${error instanceof Error ? error.message : String(error)}`);
   }

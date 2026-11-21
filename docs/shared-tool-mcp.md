@@ -18,9 +18,25 @@ required before tool execution.
 | `forge.gitea.triage-issue` | `forge__gitea__triage-issue` | Issue analysis with existing write policy |
 | `forge.todo.create` | `forge__todo__create` | Task creation with existing write policy |
 | `lark.message.send` | `lark__message__send` | Bot sends to a resolved contact; existing approval or owner fast path |
+| `lark.chat.create` | `lark__chat__create` | Creates a private group for the configured owner and the connected bot |
+| `lark.chat.list_managed` | `lark__chat__list_managed` | Lists those groups and their Feishu open links |
 
 Trusted direct sessions do not need a Lark approval card for host calls. Host
 service checks and live turn identity checks still apply.
+
+The group tools require a trusted, listener-verified Feishu direct message from
+the current runtime owner (the configured approver). HTTP-ingested messages
+cannot use them. The create input is `{requestId, name, persona?, execution?}`;
+`requestId` is a UUID, `persona` is `{mode: "custom", name, instructions}`,
+and `execution` is `{engineId, model}`. Omit either option to keep the default.
+Use a new UUID only for a new group. If the outcome is uncertain, look up the
+original request in the managed list before doing anything else. The runtime
+will not send a second create request with the same UUID.
+
+Local Forge uses the same persisted records and creation flow. Creating groups
+requires active mode, the runtime token, a configured owner, and the bot's
+Feishu group creation scope (`im:chat:create`). The bot becomes a group admin;
+the configured user becomes the owner. This operation does not send a message.
 
 The separate `lark_stickers` server provides stickers, attachments, history
 images and owner assistance for Codex. External engines get a search/select-only

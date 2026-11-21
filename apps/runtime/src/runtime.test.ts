@@ -507,8 +507,8 @@ test("runtime stores host capability registrations", async () => {
   try {
     const response = await runtime.app.inject({ headers: { authorization: "Bearer test-token" }, method: "POST", url: "/v1/capabilities/register", payload: { capabilities: [{ id: "host.demo", title: "Demo", description: "demo", inputSchema: { type: "object" }, risk: "read" }] } });
     assert.deepEqual(response.json(), { registered: 1 });
-    assert.equal((runtime.store.db.prepare("SELECT count(*) AS count FROM capabilities").get() as { count: number }).count, 2);
-    assert.ok(runtime.store.db.prepare("SELECT 1 FROM capabilities WHERE id='lark.message.send'").get());
+    assert.deepEqual(runtime.store.db.prepare("SELECT id FROM capabilities ORDER BY id").pluck().all(),
+      ["host.demo", "lark.chat.create", "lark.chat.list_managed", "lark.message.send"]);
   } finally { await runtime.app.close(); runtime.store.close(); }
 });
 
