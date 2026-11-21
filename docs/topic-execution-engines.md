@@ -38,13 +38,23 @@ state and do not import trusted sessions or stored grants. Missing or invalid
 restricted launchers leave that engine unavailable to non-trusted senders;
 there is no silent fallback to an unrestricted launcher or to Codex.
 
+A restricted launcher can be a small policy wrapper around the same installed
+CLI. It does not require a second CLI installation, a container, or a change
+to the configured workspace or model. Before registering it, verify that
+protected tools are blocked before approval and that saved grants, settings
+and provider state cannot weaken that policy.
+
 DSH receives `DSH_PERMISSION_MODE=read-only` on the restricted path. Use a
 controlled profile that retains its shell and file sandbox backends and does
 not override that setting. This setting alone is a write policy, not a
 read/network or credential isolation mechanism. For Claude, OpenCode and AGY
 the restricted executable must set the corresponding provider policy itself;
 this runtime does not change a provider's managed settings or claim that its
-stock launcher enforces read-only operation.
+stock launcher enforces read-only operation. Restricted Claude requests also
+disable native permission bypass; restricted AGY receives `--sandbox`. Both
+must confirm `default` mode on session open or restore, and switching away
+from that mode ends the session. These checks do not replace the launcher's
+tool policy.
 
 For an active turn, a request from that exact ACP session can grant the offered
 single-use option. The first restricted native callback opens the shared Lark

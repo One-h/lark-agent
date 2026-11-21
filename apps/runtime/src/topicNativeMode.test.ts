@@ -316,7 +316,8 @@ for (const { provider, automaticReview } of restrictedApprovalCases) test(`restr
 import { appendFileSync, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 const provider=${JSON.stringify(provider)},toolName=${JSON.stringify(toolName)};
-if((provider==="dsh"&&process.env.DSH_PERMISSION_MODE!=="read-only")||process.env.LARK_AGENT_RUNTIME_TOKEN)throw Error("incorrect launch policy");
+if((provider==="dsh"&&process.env.DSH_PERMISSION_MODE!=="read-only")
+  ||(provider==="agy"&&!process.argv.includes("--sandbox"))||process.env.LARK_AGENT_RUNTIME_TOKEN)throw Error("incorrect launch policy");
 const sessionId="fixture-restricted";
 const send=x=>console.log(JSON.stringify({jsonrpc:"2.0",...x}));
 const reply=(id,result)=>send({id,result});
@@ -340,7 +341,10 @@ const next=()=>{
 createInterface({input:process.stdin}).on("line",l=>{
  const m=JSON.parse(l);
  if(m.method==="initialize")reply(m.id,{protocolVersion:1,agentInfo:{name:provider,version:"0.0.1"},agentCapabilities:{sessionCapabilities:{close:{},resume:{}}}});
- else if(m.method==="session/new")reply(m.id,{sessionId});
+ else if(m.method==="session/new"){
+  if(provider==="claude"&&m.params._meta?.claudeCode?.options?.allowDangerouslySkipPermissions!==false)throw Error("Claude bypass not disabled");
+  reply(m.id,{sessionId,modes:{currentModeId:"default",availableModes:[{id:"default",name:"Default"}]}});
+ }
  else if(m.method==="session/prompt"){
   prompt=m.id;timer=setInterval(()=>{if(existsSync(${JSON.stringify(gate)})){clearInterval(timer);next()}},15);
  }else if(m.method==="session/cancel"){
@@ -385,6 +389,39 @@ createInterface({input:process.stdin}).on("line",l=>{
     await until(() => message.row().codex_status === "failed");
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/approvals/${cards[0].approvalId}/approve-turn`, headers })).statusCode, 409);
   } finally { await f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("restricted Claude refuses an unsafe startup mode and stops on an unsafe runtime mode", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-acp-mode-fence-"));
+  try {
+    const trusted = path.join(root, "trusted");
+    fs.writeFileSync(trusted, "#!/bin/sh\nexit 91\n", { mode: 0o700 });
+    for (const mode of ["bypassPermissions", "default"]) {
+      const restricted = path.join(root, `restricted-${mode}.mjs`);
+      fs.writeFileSync(restricted, `#!${process.execPath}
+import { createInterface } from "node:readline";
+const send = value => console.log(JSON.stringify({jsonrpc:"2.0",...value}));
+const mode = ${JSON.stringify(mode)};
+createInterface({input:process.stdin}).on("line",line=>{
+ const m=JSON.parse(line);
+ if(m.method==="initialize")send({id:m.id,result:{protocolVersion:1,agentInfo:{name:"claude",version:"0.108.1"}}});
+ else if(m.method==="session/new")send({id:m.id,result:{sessionId:"fixture",modes:{currentModeId:mode,availableModes:[{id:mode,name:mode}]}}});
+ else if(m.method==="session/prompt"){
+   send({method:"session/update",params:{sessionId:"fixture",update:{sessionUpdate:"current_mode_update",currentModeId:"acceptEdits"}}});
+   send({id:m.id,result:{stopReason:"end_turn"}});
+ }
+});`, { mode: 0o700 });
+      const engine = createNativeAcpExecutionEngine("claude", { launcher: trusted, restrictedLauncher: restricted, models: [] });
+      const open = engine.open({ sessionId: null, model: null, policy: larkExecutionPolicy(root, false), signal: new AbortController().signal,
+        authorizeNative: async () => assert.fail("mode changes must not be treated as tool approvals") });
+      if (mode === "bypassPermissions") await assert.rejects(open, /did not confirm the restricted permission mode/);
+      else {
+        const session = await open;
+        try { await assert.rejects(session.run("test", new AbortController().signal)); }
+        finally { await session.close(); }
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("Claude, DSH, OpenCode and AGY share the Lark workflow over ACP stdio", async () => {

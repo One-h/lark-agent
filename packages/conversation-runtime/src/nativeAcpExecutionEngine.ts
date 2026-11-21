@@ -75,13 +75,15 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
     async open({ sessionId, model, policy, signal, mcpServers, authorizeNative }) {
       signal.throwIfAborted();
       const restricted = policy.trustScope === "untrusted";
+      const requireDefaultMode = restricted && (engineId === "claude" || engineId === "agy");
       if (!supportsPolicy(policy) || restricted && !authorizeNative) throw new Error(`${profile.label} cannot enforce this execution policy`);
       const { cwd } = policy;
       if (!path.isAbsolute(cwd) || !statSync(cwd).isDirectory()) throw new Error("Invalid shared workspace");
       const env = Object.fromEntries(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", ...profile.env]
         .flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
       if (restricted && engineId === "dsh") env.DSH_PERMISSION_MODE = "read-only";
-      const child = spawn(restricted ? restrictedLauncher! : launcher, profile.args, { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
+      const args = restricted && engineId === "agy" ? [...profile.args, "--sandbox"] : profile.args;
+      const child = spawn(restricted ? restrictedLauncher! : launcher, args, { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
       let id = sessionId;
       let output: { text: string; messageId?: string; retiredMessages: Set<string>; tools: Set<string>;
         permissionTools: Map<string, { operation: string; cancelled: AbortController }>; requestedPermissions: Set<string>;
@@ -114,9 +116,18 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
           return { outcome: { outcome: "selected" as const, optionId: option.optionId } };
         })
         .onNotification("session/update", ({ params: { sessionId: updatedId, update } }) => {
-          if (updatedId !== id || !output || isOpenCodeChild(update._meta)) return;
+          if (updatedId !== id || isOpenCodeChild(update._meta)) return;
           const meta = engineId === "claude" ? update._meta?.claudeCode as { parentToolUseId?: unknown; kind?: unknown } | undefined : undefined;
           if (meta?.parentToolUseId || meta?.kind === "informational" || meta?.kind === "mcpServerStatus") return;
+          if (requireDefaultMode && (
+            update.sessionUpdate === "current_mode_update" && update.currentModeId !== "default"
+            || update.sessionUpdate === "config_option_update" && update.configOptions.some(option =>
+              option.category === "mode" && (!("currentValue" in option) || option.currentValue !== "default"))
+          )) {
+            terminate();
+            return;
+          }
+          if (!output) return;
           if (restricted && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")) {
             const record = output.permissionTools.get(update.toolCallId);
             if (record && (update.status === "completed" || update.status === "failed" || update.rawInput !== undefined
@@ -165,24 +176,32 @@ export function createNativeAcpExecutionEngine(engineId: NativeAcpEngineId, opti
       try {
         const hello = await peer.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } });
         if (hello.protocolVersion !== 1) throw new Error("ACP protocol version is unsupported");
-        const request = { cwd, mcpServers: mcpServers ?? [] };
-        const options = sessionId
+        const request = { cwd, mcpServers: mcpServers ?? [],
+          ...(restricted && engineId === "claude" ? { _meta: { claudeCode: { options: { allowDangerouslySkipPermissions: false } } } } : {}) };
+        const session = sessionId
           ? await (async () => {
               if (engineId !== "claude" && hello.agentCapabilities?.sessionCapabilities?.resume != null) {
                 const result = await peer.request<ResumeSessionResponse>("session/resume", { ...request, sessionId });
-                return result.configOptions;
+                return result;
               }
               if (!hello.agentCapabilities?.loadSession) throw new Error("ACP agent cannot restore the saved session");
               const result = await peer.request<LoadSessionResponse>("session/load", { ...request, sessionId });
-              return result.configOptions;
+              return result;
             })()
           : await (async () => {
               const result = await peer.request<NewSessionResponse>("session/new", request);
               id = result.sessionId;
-              return result.configOptions;
+              return result;
             })();
         if (!id) throw new Error("ACP agent returned no session ID");
         const activeId = id;
+        const options = session.configOptions;
+        const modeOptions = options?.filter(option => option.category === "mode") ?? [];
+        if (requireDefaultMode && (
+          (!session.modes && modeOptions.length === 0)
+          || (session.modes && session.modes.currentModeId !== "default")
+          || modeOptions.some(option => !("currentValue" in option) || option.currentValue !== "default")
+        )) throw new Error(`${profile.label} ACP did not confirm the restricted permission mode`);
         if (model) {
           const option = options?.find(item => item.category === "model");
           if (!option) throw new Error("ACP agent did not advertise a model selector");
