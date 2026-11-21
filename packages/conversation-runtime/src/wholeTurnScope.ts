@@ -128,14 +128,6 @@ export function boundedReadApprovalPlan(plan?: ApprovalPlan): ApprovalPlan | und
   return steps?.length ? { goal: "本轮只读排查", impact: "仅限已审核的只读查询，不授权写入或部署。", steps } : undefined;
 }
 
-export function wholeTurnPlanCovers(plan: ApprovalPlan, input: TurnApprovalInput): boolean {
-  if (planCoversOperation(plan, input)) return true;
-  if (input.operationKind !== "command") return false;
-  const key = readScope(input.operation, input.cwd);
-  return key !== undefined && plan.steps.some(step => step.effect === "read" && step.kind === "command"
-    && step.cwd === input.cwd && readScope(step.operation, step.cwd) === key);
-}
-
 /** An intent is not a permission to run unrecognized shell commands. The
  * precise declared steps remain usable if no semantic matcher is available. */
 export function wholeTurnScope(first: TurnApprovalInput, plan?: ApprovalPlan, readOnlyTask = false) {

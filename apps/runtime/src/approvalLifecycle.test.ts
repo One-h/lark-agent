@@ -159,6 +159,29 @@ test("client disconnect cancels the approval promise even when its native messag
   } finally { await f.close(); }
 });
 
+test("automatic intent approval cannot be reused by another requester in the same turn", async () => {
+  let reviews = 0;
+  const f = await fixture(async () => { reviews++; return { decision: "approve_turn", reason: "fixture" }; });
+  try {
+    f.seed();
+    f.runtime.store.setSetting("turnAutoApprovalEnabled", "true");
+    assert.equal((await f.invoke()).status, 200);
+    assert.equal(f.writes(), 1);
+    const now = new Date().toISOString();
+    f.runtime.store.db.prepare(`INSERT INTO lark_messages
+      (id,message_id,chat_id,chat_type,sender_id,sender_type,content,message_type,mentioned,codex_status,codex_turn_id,raw_json,received_at,created_at)
+      VALUES(10,'om_other','oc_private','p2p','ou_other','user','部署 demo-api','text',1,'running','turn-one','{}',?,?)`).run(now, now);
+    const second = await f.runtime.app.inject({ method: "POST", url: "/v1/internal/capabilities/forge.deploy.production/execute",
+      headers: { authorization: "Bearer fixture-token" }, payload: { input: { repo: "demo-api", apps: ["demo-api"], expectedRevision: "bbbbbbb" },
+        context: { larkMessageId: 10, chatId: "oc_private", trustScope: "untrusted", turnId: "turn-one" } } });
+    assert.equal(second.statusCode, 409);
+    assert.match(second.json().error, /身份已变化/);
+    assert.equal(reviews, 1);
+    assert.equal(f.cards.length, 0);
+    assert.equal(f.writes(), 1);
+  } finally { await f.close(); }
+});
+
 test("production defaults cannot approve a running database row without native activity proof", async () => {
   const f = await fixture(undefined, true);
   try {
@@ -239,7 +262,7 @@ else if(m.id==="command-one"&&status==="inProgress"){${order === "command-first"
   return { ...f, decisions, tokens, async close() { await f.close(); if (previousExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previousExecutable; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; } };
 }
 
-test("manual whole-turn approval accepts revised queries while automatic approval stays scoped", async () => {
+test("ordinary automatic turn approval continues without a registered plan or matching later query", async () => {
   for (const manual of [true, false]) {
     let reviews = 0;
     const f = await nativeFixture("query", async () => {
@@ -259,7 +282,7 @@ test("manual whole-turn approval accepts revised queries while automatic approva
       const send = (id: string, command: string) => codexAppServer.request("fixture/query", { id, command });
       const decision = (id: string) => fs.existsSync(f.decisions) ? fs.readFileSync(f.decisions, "utf8").trim().split("\n")
         .map(line => JSON.parse(line)).find(item => item.id === id)?.decision : undefined;
-      declareApprovalPlan(store.db, identity, plan(first));
+      if (manual) declareApprovalPlan(store.db, identity, plan(first));
       await send("query-first", first);
       if (manual) {
         await until(() => f.cards.length === 1);
@@ -268,12 +291,20 @@ test("manual whole-turn approval accepts revised queries while automatic approva
         assert.equal((await f.decide(f.cards[0].approvalId, "approve-turn")).statusCode, 200);
       }
       await until(() => decision("query-first") === "accept");
-      declareApprovalPlan(store.db, identity, plan(revised));
+      if (manual) declareApprovalPlan(store.db, identity, plan(revised));
       await send("query-revised", revised);
-      await until(() => decision("query-revised") === (manual ? "accept" : "decline"));
-      await send("query-write", "mysql -e 'DELETE FROM fixture_rows'");
-      await until(() => decision("query-write") === "decline");
-      assert.equal((await approvalStatus(f)).json().text.includes('"status":"blocked"'), true);
+      await until(() => decision("query-revised") === "accept");
+      if (manual) {
+        await send("query-write", "mysql -e 'DELETE FROM fixture_rows'");
+        await until(() => decision("query-write") === "decline");
+        assert.equal((await approvalStatus(f)).json().text.includes('"status":"blocked"'), true);
+      } else {
+        assert.deepEqual(store.db.prepare("SELECT decision,approval_scope,plan_summary,applied_at IS NOT NULL AS used FROM lark_turn_auto_reviews").all(),
+          [{ decision: "approved", approval_scope: "turn", plan_summary: null, used: 1 }]);
+        store.setSetting("turnAutoApprovalEnabled", "false");
+        await send("query-revoked", "python3 query-fixture.py after-switch");
+        await until(() => decision("query-revoked") === "decline");
+      }
       assert.equal(f.cards.length, manual ? 1 : 0);
       assert.equal(reviews, 1);
       await codexAppServer.request("fixture/end", { status: "completed" });

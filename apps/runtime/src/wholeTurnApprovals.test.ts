@@ -22,7 +22,7 @@ for (const manual of [false, true]) test(`whole task approval reviews a bounded 
     "kubectl logs deploy/demo-api --namespace=production --tail=100 --since=20m",
     "kubectl logs deploy/demo-worker --namespace=production --tail=20",
     "kubectl logs deploy/demo-api --namespace=staging --tail=20",
-    "kubectl apply -f fixture.yaml"
+    ...(manual ? ["kubectl apply -f fixture.yaml"] : [])
   ];
   fs.writeFileSync(executable, `#!${process.execPath}
 import readline from "node:readline";
@@ -41,7 +41,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
  else if(m.method)send({id:m.id,result:{}});
  else if(String(m.id).startsWith("approval-")){
   accepted[m.id]=m.result?.decision;
-  if(Object.keys(accepted).length===2){call(2);call(3);call(4)}
+  if(Object.keys(accepted).length===2){for(let i=2;i<commands.length;i++)call(i)}
   if(Object.keys(accepted).length===commands.length){
    fs.writeFileSync(${JSON.stringify(outcomes)},JSON.stringify(accepted));
    const item={type:"agentMessage",id:"final",phase:"final_answer",text:"Fixture complete"};
@@ -87,8 +87,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const row = () => db.prepare("SELECT codex_status FROM lark_messages WHERE id=1").pluck().get();
     await until(() => row() === "answered");
     assert.deepEqual(JSON.parse(fs.readFileSync(outcomes, "utf8")), {
-      "approval-0": "accept", "approval-1": "accept", "approval-2": manual ? "accept" : "decline",
-      "approval-3": manual ? "accept" : "decline", "approval-4": "decline"
+      "approval-0": "accept", "approval-1": "accept", "approval-2": "accept",
+      "approval-3": "accept", ...(manual ? { "approval-4": "decline" } : {})
     });
     assert.equal(reviews, 1);
     assert.equal(cards.length, manual ? 1 : 0);

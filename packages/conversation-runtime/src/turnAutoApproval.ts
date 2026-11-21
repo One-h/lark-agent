@@ -8,7 +8,7 @@ import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskCont
 import { approvalPlanSummary, clearApprovalPlan, currentApprovalPlan, currentApprovalPlanGrant, maxReviewedOperationChars,
   operationIsDeclaredRemoteWrite, planCoversOperation, type ApprovalOperationKind, type ApprovalPlan } from "./approvalPlan.js";
 import { redactReplyValues } from "./replySanitization.js";
-import { boundedReadApprovalPlan, hasWholeTurnReadScope, wholeTurnPlanCovers } from "./wholeTurnScope.js";
+import { boundedReadApprovalPlan, hasWholeTurnReadScope } from "./wholeTurnScope.js";
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
@@ -256,15 +256,11 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
     if (options.signal?.aborted) return finish({ approved: false, source: "manual", reason: "自动审核已取消" });
     const plan = reviewedInput.approvalPlan;
     if (reviewedInput.wholeTask) {
-      const currentInPlan = plan && wholeTurnPlanCovers(plan, reviewedInput);
-      const safePlan = currentInPlan && plan.steps.every(step => !outsideAutomaticOperationScope({ ...reviewedInput, operation: step.operation,
-        operationKind: step.kind, cwd: step.cwd }, reviewedTask));
-      const approveWhole = judged.decision === "approve_turn" && (reviewedInput.readOnlyWholeTask
-        ? hasWholeTurnReadScope(reviewedInput)
-        : safePlan || !plan && (reviewedTask?.type === "deployment_query" || reviewedTask?.type === "data_query") && hasWholeTurnReadScope(reviewedInput));
+      const approveWhole = judged.decision === "approve_turn"
+        && (!reviewedInput.readOnlyWholeTask || hasWholeTurnReadScope(reviewedInput));
       const reason = approveWhole || judged.decision === "manual" ? judged.reason
         : judged.decision === "approve_once" ? "审核未确认整轮任务，转人工决定，不单独放行当前操作。"
-        : "整轮计划或操作范围未能核对，转人工决定。";
+        : "未能验证本轮限定只读操作，转人工决定。";
       return finish({ approved: Boolean(approveWhole), source: "model", scope: "turn", reason: reason.slice(0, 300) }, judged.usage);
     }
     const approvePlan = judged.decision === "approve_turn" && plan && planCoversOperation(plan, reviewedInput)
