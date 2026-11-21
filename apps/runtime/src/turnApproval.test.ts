@@ -179,7 +179,7 @@ test("failed model review returns to the existing human card and cannot execute 
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("whole task host approval shares one review and notification across concurrent planned operations", async () => {
+test("whole task host approval shares one intent review and notification without a plan", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-host-whole-task-"));
   const host = Fastify();
   const effects: number[] = [];
@@ -193,8 +193,8 @@ test("whole task host approval shares one review and notification across concurr
     approverId: "ou_owner", runtimeToken: "fixture-token", workspaceRoot: root, hostBaseUrl: hostUrl, turnActivityProbe: async () => true,
     turnApprovalReviewer: async input => {
       assert.equal(input.wholeTask, true);
-      assert.equal(input.approvalPlan?.steps.length, 2);
-      reviews++; return { decision: "approve_turn", reason: "Approve both fixture updates" };
+      assert.equal(input.approvalPlan, undefined);
+      reviews++; return { decision: "approve_turn", reason: "Approve the fixture updates" };
     },
     approvalCardSender: () => { cards++; return { ok: false, error: "No manual card expected" }; },
     autoApprovalNotificationSender: async () => {
@@ -205,21 +205,16 @@ test("whole task host approval shares one review and notification across concurr
   const identity = { messageId: 1, turnId: "fixture-turn", senderId: "ou_sender" };
   try {
     const now = new Date().toISOString(), db = runtime.store.db;
-    const goal = "Update two local fixture entries";
+    const goal = "Update the local fixture entries";
     db.prepare("INSERT INTO lark_messages(id,chat_id,sender_id,content,codex_turn_id,codex_status,raw_json,received_at,created_at) VALUES (1,'oc_fixture','ou_sender',?,?,'running','{}',?,?)").run(goal, identity.turnId, now, now);
     await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { turnAutoApprovalEnabled: true } });
     runtime.store.registerCapabilities([{ id: "demo.update", title: "Update fixture", description: "Fixture-only update", inputSchema: {}, risk: "local-write" }]);
-    const plan = parseApprovalPlan({ goal, impact: "Temporary local fixture only",
-      steps: [1, 2].map(target => ({ intent: `Update fixture ${target}`, effect: "local-write", kind: "capability", cwd: null,
-        operation: `demo.update: ${JSON.stringify({ target })}` })) });
-    assert(plan);
-    declareApprovalPlan(db, identity, plan);
     const invoke = (target: number) => runtime.app.inject({ method: "POST", url: "/v1/capabilities/demo.update/invoke", headers,
       payload: { input: { target }, context: { larkMessageId: 1, chatId: "oc_fixture", trustScope: "untrusted", turnId: identity.turnId } } });
     const approved = await Promise.all([invoke(1), invoke(2)]);
     assert.deepEqual(approved.map(r => r.statusCode), [200, 200]);
-    assert.equal((await invoke(3)).statusCode, 409);
-    assert.deepEqual(effects.sort(), [1, 2]);
+    assert.equal((await invoke(3)).statusCode, 200);
+    assert.deepEqual(effects.sort(), [1, 2, 3]);
     assert.equal(reviews, 1);
     assert.equal(cards, 0);
     await retryPendingAutoApprovalNotifications();
