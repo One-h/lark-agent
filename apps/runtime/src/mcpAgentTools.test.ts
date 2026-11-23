@@ -111,7 +111,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const context_token = fs.readFileSync(path.join(row().codex_task_dir, "prompt.md"), "utf8").match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     assert(context_token);
     const call = (name: string, input: unknown, token = context_token) => client.callTool({ name, arguments: { context_token: token, input } });
-    const groupInput = { requestId: "767dfbee-0ffd-4b61-8599-4d559e8686be", name: "Example group" };
+    const groupInput = { requestId: "767dfbee-0ffd-4b61-8599-4d559e8686be", name: "Example group",
+      execution: { engineId: "codex", model: null } };
     assert.equal((await call("lark__chat__create", groupInput)).isError, true);
     assert.equal(groupCreates, 0);
     const read = await call("forge__deploy__inspect", { repo: "demo-api" });
@@ -194,6 +195,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const createdGroup = await call("lark__chat__create", groupInput, ownerToken);
     assert.notEqual(createdGroup.isError, true, JSON.stringify(createdGroup.content));
     assert.match(JSON.stringify(createdGroup.content), /oc_newgroup/);
+    assert(Array.isArray(createdGroup.content) && createdGroup.content[0]?.type === "text");
+    assert.deepEqual(JSON.parse(createdGroup.content[0].text).item.execution, groupInput.execution);
     assert.equal(groupCreates, 1);
     assert.match(JSON.stringify((await call("lark__chat__list_managed", {}, ownerToken)).content), /oc_newgroup/);
     assert.notEqual((await call("lark__chat__create", groupInput, ownerToken)).isError, true);

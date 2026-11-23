@@ -13,6 +13,10 @@ test("managed group creation validates, persists, configures and deduplicates wi
     descriptor: { id: "example", label: "Fixture", models: ["fixture-model"] },
     supportsPolicy: () => true,
     open: async () => { throw new Error("Group creation does not start an execution engine"); }
+  }, {
+    descriptor: { id: "default-only", label: "Default-only fixture", models: [] },
+    supportsPolicy: () => true,
+    open: async () => { throw new Error("Group creation does not start an execution engine"); }
   }];
   const calls: string[] = [];
   let release!: () => void;
@@ -28,7 +32,7 @@ test("managed group creation validates, persists, configures and deduplicates wi
       if (name === "Unconfirmed owner") return { chatId: "oc_partial", ownerConfirmed: false };
       started();
       await wait;
-      return { chatId: name === "Default group" ? "oc_defaults" : "oc_created", ownerConfirmed: true };
+      return { chatId: name === "Default group" ? "oc_defaults" : name === "Engine default group" ? "oc_enginedefaults" : "oc_created", ownerConfirmed: true };
     } });
   const url = "/v1/managed-chats";
   const headers = { authorization: "Bearer fixture-token" };
@@ -45,6 +49,9 @@ test("managed group creation validates, persists, configures and deduplicates wi
     assert.equal((await create({ ...input, ownerId: "ou_other" })).statusCode, 400);
     assert.equal((await create({ ...input, persona: { ...input.persona, instructions: "" } })).statusCode, 400);
     assert.equal((await create({ ...input, execution: { ...input.execution, model: "missing" } })).statusCode, 400);
+    assert.equal((await create({ ...input, execution: { engineId: "missing", model: null } })).statusCode, 400);
+    assert.equal((await create({ ...input, execution: { engineId: "default-only" } })).statusCode, 400);
+    assert.equal((await create({ ...input, execution: { engineId: "default-only", model: "not-in-catalog" } })).statusCode, 400);
     assert.equal(calls.length, 0);
     assert.deepEqual((await list()).json().items, []);
     const pending = create(input);
@@ -71,6 +78,15 @@ test("managed group creation validates, persists, configures and deduplicates wi
     assert.equal(defaults.statusCode, 200, defaults.body);
     assert.equal(conversationPersona("oc_defaults").mode, "default");
     assert.equal(getConversationExecutionSettings("oc_defaults").override, null);
+    const defaultEngine = { engineId: "default-only", model: null };
+    const engineInput = { requestId: randomUUID(), name: "Engine default group", execution: defaultEngine };
+    const withEngine = await create(engineInput);
+    assert.equal(withEngine.statusCode, 200, withEngine.body);
+    assert.deepEqual(withEngine.json().item.execution, defaultEngine);
+    assert.deepEqual(getConversationExecutionSettings("oc_enginedefaults").effective, defaultEngine);
+    const listed = (await list()).json();
+    assert.deepEqual(listed.engines.find((row: { id: string }) => row.id === defaultEngine.engineId), engines[1].descriptor);
+    assert.deepEqual(listed.items.find((row: { requestId: string }) => row.requestId === engineInput.requestId).execution, defaultEngine);
     const uncertain = { requestId: randomUUID(), name: "Network timeout" };
     const failure = await create(uncertain);
     assert.equal(failure.statusCode, 409);

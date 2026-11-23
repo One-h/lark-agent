@@ -3,7 +3,7 @@ import type { ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import {
   configuredLarkCodexModel, getConversationExecutionSettings, parsePersonaInput, resolveTopicExecutionEngine,
   saveConversationPersona, updateConversationExecutionSettings, validLarkCodexModel, validPersonaChatId,
-  type PersonaInput
+  type ExecutionEngineRoute, type PersonaInput
 } from "@lark-agent/conversation-runtime";
 
 const createId = "lark.chat.create";
@@ -19,7 +19,7 @@ export const managedChatCapabilities = [{
   inputSchema: object({
     requestId: { ...string, format: "uuid" }, name: { ...string, minLength: 1, maxLength: 60 },
     persona: object({ mode: { ...string, enum: ["custom"] }, name: string, instructions: string }, ["mode", "name", "instructions"]),
-    execution: object({ engineId: string, model: string }, ["engineId", "model"])
+    execution: object({ engineId: string, model: { type: ["string", "null"], description: "Use null for the selected engine's default model." } }, ["engineId", "model"])
   }, ["requestId", "name"])
 }, {
   id: listId, title: "查看已建飞书群聊",
@@ -35,7 +35,7 @@ type Input = {
   requestId: string;
   name: string;
   persona?: PersonaInput;
-  execution?: { engineId: string; model: string };
+  execution?: ExecutionEngineRoute;
 };
 type Row = {
   request_id: string; request_json: string; chat_id: string | null;
@@ -63,9 +63,9 @@ function parse(input: unknown): Input {
   if ("execution" in body) {
     const route = fields(body.execution, ["engineId", "model"]);
     if (typeof route.engineId !== "string" || !/^[a-z][a-z0-9-]{0,39}$/.test(route.engineId)
-      || typeof route.model !== "string" || !route.model.trim() || route.model.length > 120)
+      || (route.model !== null && (typeof route.model !== "string" || !route.model.trim() || route.model.length > 120)))
       throw new Error("无效的引擎或模型。");
-    parsed.execution = { engineId: route.engineId, model: route.model.trim() };
+    parsed.execution = { engineId: route.engineId, model: route.model === null ? null : route.model.trim() };
   }
   return parsed;
 }
@@ -122,7 +122,7 @@ export function managedChats(db: Database.Database, options: {
       }
       if (!options.create) throw new ManagedChatError(503, "LARK_MANAGED_CHAT_INACTIVE", "飞书机器人当前未启用建群。");
       const route = parsed.execution;
-      if (route && (route.engineId === "codex" ? !validLarkCodexModel(route.model) : !resolveTopicExecutionEngine(route)))
+      if (route && (route.engineId === "codex" ? route.model !== null && !validLarkCodexModel(route.model) : !resolveTopicExecutionEngine(route)))
         throw new ManagedChatError(400, "LARK_MANAGED_CHAT_ENGINE_UNAVAILABLE", "该引擎或模型当前不可用。");
       db.prepare("INSERT INTO lark_managed_chats (creator_id, request_id, request_json, status, created_at) VALUES (?, ?, ?, 'creating', ?)")
         .run(id, parsed.requestId, json, new Date().toISOString());

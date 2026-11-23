@@ -29,6 +29,7 @@ the current runtime owner (the configured approver). HTTP-ingested messages
 cannot use them. The create input is `{requestId, name, persona?, execution?}`;
 `requestId` is a UUID, `persona` is `{mode: "custom", name, instructions}`,
 and `execution` is `{engineId, model}`. Omit either option to keep the default.
+Set `model` to `null` to select an engine and use its default model.
 Use a new UUID only for a new group. If the outcome is uncertain, look up the
 original request in the managed list before doing anything else. The runtime
 will not send a second create request with the same UUID.
