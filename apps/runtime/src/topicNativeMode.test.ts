@@ -246,6 +246,7 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     const progressCardId = progress()!.card_message_id;
     startSearch!();
     startSearch!();
+    await until(() => JSON.parse(progress()!.entries_json).some((entry: { id: string }) => entry.id === "work:search"));
     assert.equal(progress()!.card_message_id, progressCardId);
     assert.deepEqual(JSON.parse(progress()!.entries_json).map((entry: { id: string }) => entry.id), ["work:read", "work:search"]);
     reconcileLarkProgressCards();
