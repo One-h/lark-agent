@@ -20,7 +20,7 @@ export type LarkSentMessage = {
   messageType: string | null;
 };
 
-type LarkSendResult = LarkSentMessage | { ok: false; error: string };
+export type LarkSendResult = LarkSentMessage | { ok: false; error: string; notSent?: true };
 
 export function jsonFromCliOutput(stdout: string): unknown {
   const trimmed = stdout.trim();
@@ -91,7 +91,9 @@ export function sendLarkTextReply(
   if (result.status === 0) {
     return parseLarkSentMessage(result.stdout);
   }
-  return { ok: false, error: (result.stderr || result.stdout || `lark-cli exited with code ${result.status}`).trim() };
+  const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  return { ok: false, error: (result.stderr || result.stdout || `lark-cli exited with code ${result.status}`).trim(),
+    ...(!result.pid && (code === "ENOENT" || code === "EACCES") ? { notSent: true as const } : {}) };
 }
 
 export function sendLarkTextMessage(recipientId: string, text: string, idempotencyKey: string): LarkSendResult {

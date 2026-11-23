@@ -15,6 +15,7 @@ import { createGroupNameCache } from "./groupNames.js";
 import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
 import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import { registerPersonaRoutes } from "./personaRoutes.js";
+import { inspectInterruptedLarkTurns, resumeQueuedLarkCodexReplies } from "@lark-agent/conversation-runtime";
 import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
 import { configuredNativeAcpEngines, configureTopicExecutionEngines, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
@@ -1053,8 +1054,11 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   });
   app.post("/v1/messages/:id/retry", async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
-    const message = store.db.prepare("SELECT id, codex_status, chat_id, thread_id FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string; chat_id: string | null; thread_id: string | null } | undefined;
+    const message = store.db.prepare("SELECT id, codex_status, codex_dispatch_phase, chat_id, thread_id FROM lark_messages WHERE id=?").get(id) as { id: number; codex_status: string; codex_dispatch_phase: string | null; chat_id: string | null; thread_id: string | null } | undefined;
     if (!message) return reply.code(404).send({ error: "message not found" });
+    if (message.codex_dispatch_phase === "needs_review") return reply.code(409).send({
+      code: "LARK_EXECUTION_NEEDS_REVIEW", error: "原操作结果未确认，请先核对实际结果；不会重跑原消息。"
+    });
     if (topicExecutionPreviouslyDispatched(id) || hasExternalExecutionRoute(message.chat_id, message.thread_id)) {
       return reply.code(409).send({ error: "An external engine requires a new message instead of replay" });
     }
@@ -1263,7 +1267,13 @@ if (process.argv[1]?.endsWith("index.ts")) {
     console.warn(`Native ACP engine ${id} is unavailable: check the configured launcher`));
   const runtime = createRuntime({ executionEngines, wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
   await runtime.app.listen({ host: "127.0.0.1", port });
+  const recoveryLifetime = new AbortController();
+  resumeQueuedLarkCodexReplies();
   setInterval(() => { runtime.expireApprovals(); runtime.recoverOrphanedRuns(); retryPendingLarkTextReplies(); retryPendingLarkMediaReplies(); retryPendingLarkCompletionReactions(); retryPendingLarkExecutionReceipts();
+    if (!recoveryLifetime.signal.aborted) {
+      resumeQueuedLarkCodexReplies();
+      void inspectInterruptedLarkTurns(recoveryLifetime.signal).catch(() => console.warn("lark_execution_recovery_readback_failed"));
+    }
     void retryPendingLarkProgressCards();
     retryOwnerAssistNotifications();
     void retryPendingAutoApprovalNotifications().catch((error) => console.warn(`Auto-approval notification retry failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -1273,6 +1283,7 @@ if (process.argv[1]?.endsWith("index.ts")) {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    recoveryLifetime.abort();
     stopLarkMessageWorker();
     // Drain, never replay or force-kill a possibly paid/external operation.
     while (larkCodexAppServerStatus().activeTurns > 0) await new Promise(resolve => setTimeout(resolve, 500));

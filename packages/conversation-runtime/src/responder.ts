@@ -34,7 +34,8 @@ import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingErro
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
 import { conversationCodexModelSettings } from "./context.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
-import { queueLarkCompletionReactions } from "./completionReactions.js";
+import { queueLarkCompletionReactions, retryPendingLarkCompletionReactions } from "./completionReactions.js";
+import { quarantineLarkExecution, reconcileInterruptedNativeTurns, reconcileLarkCrash } from "./crashRecovery.js";
 import { decideOwnerMentionAssist, deferOwnerAssistDelivery, ensureOwnerMentionAssist, finishOwnerMentionAssist, markOwnerAssistSent,
   ownerAssistMayExecute, ownerAssistPrompt, ownerAssistPublicAllowed, ownerAssistRow, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
 import { attachmentDigest, attachmentToolPrompt, createReplyMarkdownAttachment, matchingAttachmentState, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment,
@@ -1061,7 +1062,7 @@ function deliverQueuedLarkTextReply(id: number): boolean {
     return false;
   }
   const message = db.prepare("SELECT * FROM lark_messages WHERE id = ?").get(id) as LarkMessageRow | undefined;
-  if (!message?.message_id || !message.reply_delivery_text || !message.reply_delivery_key) return false;
+  if (!message?.message_id || message.reply_status !== "pending" || !message.reply_delivery_text || !message.reply_delivery_key) return false;
   if (!ownerAssistPublicAllowed(id)) {
     deferOwnerAssistDelivery(id, "投递前本人发言或配置已有变化，草稿已保留，请确认是否仍需补充。");
     db.prepare("UPDATE lark_messages SET reply_status='skipped',reply_next_attempt_at=NULL,reply_error='Owner assistance needs review' WHERE id=?").run(id);
@@ -1075,34 +1076,36 @@ function deliverQueuedLarkTextReply(id: number): boolean {
     return false;
   }
   let delivered: ReturnType<typeof larkTextReplySender>;
+  db.prepare("UPDATE lark_messages SET reply_send_stage='attempted' WHERE id=?").run(id);
   try { delivered = larkTextReplySender(message.message_id, message.reply_delivery_text, message.reply_delivery_key, presentation); }
   catch { delivered = { ok: false, error: "Reply transport failed" }; }
-  const sent = (presentation || message.reply_trigger === "owner_mention") && delivered.ok && !delivered.messageId
+  const sent: ReturnType<typeof larkTextReplySender> = (presentation || message.reply_trigger === "owner_mention") && delivered.ok && !delivered.messageId
     ? { ok: false as const, error: "Reply returned no delivery receipt" } : delivered;
-  if (sent.ok && sent.messageId) {
-    try {
-      recordOutboundLarkMessage({ messageId: sent.messageId, chatId: sent.chatId ?? message.chat_id, chatType: message.chat_type, recipientId: message.sender_id, content: message.reply_delivery_text, replyToMessageId: message.message_id, messageAt: sent.messageAt, messageType: sent.messageType ?? presentation?.msgType, source: "reply" });
-    } catch (error) {
-      console.error(`lark_outbound_record_failed source=reply inboundMessageId=${message.id} platformMessageId=${sent.messageId} error=${error instanceof Error ? error.message : String(error)}`);
-    }
-  } else if (sent.ok) {
-    console.warn(`lark_outbound_record_skipped source=reply inboundMessageId=${message.id} reason=missing_platform_message_id`);
-  }
   if (sent.ok) {
-    db.prepare(`UPDATE lark_messages SET reply_status = 'sent', reply_error = NULL, reply_sent_at = ?, reply_next_attempt_at = NULL WHERE id = ?`)
-      .run(nowIso(), id);
-    markOwnerAssistSent(id);
+    db.transaction(() => {
+      if (sent.messageId) {
+        try {
+          recordOutboundLarkMessage({ messageId: sent.messageId, chatId: sent.chatId ?? message.chat_id, chatType: message.chat_type,
+            recipientId: message.sender_id, content: message.reply_delivery_text!, replyToMessageId: message.message_id,
+            messageAt: sent.messageAt, messageType: sent.messageType ?? presentation?.msgType, source: "reply" });
+        } catch { console.warn("lark_outbound_record_failed", { messageId: message.id }); }
+      }
+      db.prepare(`UPDATE lark_messages SET reply_status='sent',reply_error=NULL,reply_sent_at=?,reply_next_attempt_at=NULL WHERE id=?`)
+        .run(nowIso(), id);
+      markOwnerAssistSent(id);
+    })();
     return true;
   }
   const attempts = message.reply_delivery_attempts + 1;
   const nextAt = new Date(Date.now() + retryDelayMs(attempts)).toISOString();
-  db.prepare(`UPDATE lark_messages SET reply_status = ?, reply_error = ?, reply_delivery_attempts = ?, reply_next_attempt_at = ? WHERE id = ?`)
-    .run(attempts >= 8 ? "failed" : "pending", sent.error, attempts, attempts >= 8 ? null : nextAt, id);
+  const stage = sent.notSent === true && message.reply_send_stage === "queued" ? "queued" : "attempted";
+  db.prepare(`UPDATE lark_messages SET reply_status=?, reply_error=?, reply_delivery_attempts=?, reply_next_attempt_at=?,reply_send_stage=? WHERE id=?`)
+    .run(attempts >= 8 ? "failed" : "pending", sent.error, attempts, attempts >= 8 ? null : nextAt, stage, id);
   if (attempts >= 8) deferOwnerAssistDelivery(id, "群回复投递多次失败，已保留草稿；请核对实际投递结果后决定是否重发。");
   return false;
 }
 
-function queueLarkTextReply(message: LarkMessageRow, text: string, idempotencyKey: string, rich?: { taskDir: string; turnId: string; markdown: string }): number[] {
+function queueLarkTextReply(message: LarkMessageRow, text: string, idempotencyKey: string, rich?: { taskDir: string; turnId: string; markdown: string }, defer = false): number[] {
   if (!message.message_id) return [];
   let presentation: LarkReplyPresentation | undefined;
   let overflow: ReplyMedia | undefined;
@@ -1121,20 +1124,24 @@ function queueLarkTextReply(message: LarkMessageRow, text: string, idempotencyKe
   db.transaction(() => {
     db.prepare(`UPDATE lark_messages
       SET reply_status='pending',reply_error=NULL,reply_delivery_key=?,reply_delivery_text=?,reply_delivery_payload=?,
-        reply_delivery_attempts=0,reply_next_attempt_at=?,reply_sent_at=NULL WHERE id=?`)
+        reply_send_stage='queued',reply_delivery_attempts=0,reply_next_attempt_at=?,reply_sent_at=NULL WHERE id=?`)
       .run(idempotencyKey, text, presentation ? JSON.stringify(presentation) : null, nowIso(), message.id);
     if (overflow && rich) {
       const payload: LarkDeliveryPayload = { messageId: message.message_id!, taskDir: rich.taskDir, paths: [overflow.relativePath],
         turnId: rich.turnId, afterTextKey: idempotencyKey, expectedFiles: [{ path: overflow.relativePath, sha256: overflow.sha256! }] };
       const key = larkReplyIdempotencyKey("replydetails", `${idempotencyKey}:${overflow.sha256}`);
-      db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'media',?,?,?,?)")
+      db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at,send_stage) VALUES (?,'media',?,?,?,?,'queued')")
         .run(message.id, JSON.stringify(payload), key, nowIso(), nowIso());
       mediaIds.push((db.prepare("SELECT id FROM lark_delivery_outbox WHERE idempotency_key=?").get(key) as { id: number }).id);
     }
   })();
-  deliverQueuedLarkTextReply(message.id);
-  for (const id of mediaIds) deliverLarkOutboxRow(db.prepare("SELECT * FROM lark_delivery_outbox WHERE id=?").get(id) as LarkDeliveryOutboxRow);
+  if (!defer) deliverStagedLarkReply(message.id, mediaIds);
   return mediaIds;
+}
+
+function deliverStagedLarkReply(textMessageId: number | undefined, mediaIds: number[]): void {
+  if (textMessageId !== undefined) deliverQueuedLarkTextReply(textMessageId);
+  for (const id of mediaIds) deliverLarkOutboxRow(db.prepare("SELECT * FROM lark_delivery_outbox WHERE id=?").get(id) as LarkDeliveryOutboxRow);
 }
 
 export function retryPendingLarkTextReplies(limit = 10): number {
@@ -1160,7 +1167,7 @@ export function replyToNativeTopicCommand(source: LarkMessageRow, text: string):
 
 function queueLarkMediaFailureNotice(messageId: number, platformMessageId: string, turnId: string | undefined, seed: string): void {
   const now = nowIso();
-  db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'media-notice',?,?,?,?)")
+  db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox(lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at,send_stage) VALUES (?,'media-notice',?,?,?,?,'queued')")
     .run(messageId, JSON.stringify({ messageId: platformMessageId, turnId }), larkReplyIdempotencyKey("mediafail", turnId ? `${turnId}:${messageId}` : seed), now, now);
 }
 
@@ -1170,6 +1177,10 @@ function retryLarkMediaFailureNotices(limit: number): number {
     .all(nowIso(), limit) as Array<{ id: number; lark_message_id: number; payload: string; idempotency_key: string; attempts: number }>;
   for (const row of rows) {
     if ((db.prepare("SELECT status FROM lark_delivery_outbox WHERE id=?").get(row.id) as { status?: string } | undefined)?.status !== "pending") continue;
+    if (groupPrivacyBlocks(row.lark_message_id) || !ownerAssistPublicAllowed(row.lark_message_id)) {
+      db.prepare("UPDATE lark_delivery_outbox SET status='failed',last_error='Delivery policy changed' WHERE id=?").run(row.id);
+      continue;
+    }
     let payload: { messageId: string; turnId?: string };
     try {
       payload = JSON.parse(row.payload);
@@ -1185,6 +1196,7 @@ function retryLarkMediaFailureNotices(limit: number): number {
     }
     const text = formatLarkFinalReply(message, "本次有附件未能送达，不能视为已交付；请重试附件发送。已生成的文件不会因此删除。");
     let sent;
+    db.prepare("UPDATE lark_delivery_outbox SET send_stage='attempted' WHERE id=?").run(row.id);
     try { sent = larkTextReplySender(payload.messageId, text, row.idempotency_key); }
     catch { sent = { ok: false as const, error: "Attachment failure notification could not be delivered" }; }
     if (sent.ok) {
@@ -1265,6 +1277,7 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
     return { ok: false, sentCount: 0, error: "Registered attachment failed integrity validation" };
   }
   let sent: { ok: true; imageCount?: number } | { ok: false; error: string };
+  db.prepare("UPDATE lark_delivery_outbox SET send_stage='attempted' WHERE id=?").run(row.id);
   try {
     sent = row.kind === "image-post"
       ? sendLarkImagePostReply(payload.messageId, payload.taskDir, payload.paths, row.idempotency_key)
@@ -1272,8 +1285,11 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
   } catch { sent = { ok: false, error: "Attachment transport failed" }; }
   if (sent.ok) {
     const sentAt = nowIso();
-    db.prepare("UPDATE lark_delivery_outbox SET status='sent', sent_at=?, last_error=NULL, next_attempt_at=? WHERE id=?").run(sentAt, sentAt, row.id);
-    for (const stickerId of payload.stickerIds ?? []) recordLarkStickerSend(stickerId, row.lark_message_id, payload.chatId ?? null);
+    db.transaction(() => {
+      db.prepare("UPDATE lark_delivery_outbox SET status='sent', sent_at=?, last_error=NULL, next_attempt_at=? WHERE id=?").run(sentAt, sentAt, row.id);
+      for (const stickerId of payload.stickerIds ?? []) recordLarkStickerSend(stickerId, row.lark_message_id, payload.chatId ?? null);
+      markAttachmentOnlyReplyDelivered(row.lark_message_id);
+    })();
     return { ok: true, sentCount: row.kind === "image-post" ? (sent as unknown as { imageCount: number }).imageCount : 1 };
   }
   const attempts = row.attempts + 1;
@@ -1286,11 +1302,10 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
   return { ok: false, sentCount: 0, error: sent.error };
 }
 
-function queueLarkMediaDelivery(larkMessageId: number, kind: LarkDeliveryOutboxRow["kind"], payload: LarkDeliveryPayload, idempotencyKey: string): { ok: boolean; sentCount: number; error?: string; deliveryId: number } {
+function stageLarkMediaDelivery(larkMessageId: number, kind: LarkDeliveryOutboxRow["kind"], payload: LarkDeliveryPayload, idempotencyKey: string): number {
   const createdAt = nowIso();
-  db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox (lark_message_id, kind, payload, idempotency_key, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(larkMessageId, kind, JSON.stringify(payload), idempotencyKey, createdAt, createdAt);
-  const row = db.prepare("SELECT id, lark_message_id, kind, payload, idempotency_key, attempts FROM lark_delivery_outbox WHERE idempotency_key=?").get(idempotencyKey) as LarkDeliveryOutboxRow;
-  return { ...deliverLarkOutboxRow(row), deliveryId: row.id };
+  db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox (lark_message_id, kind, payload, idempotency_key, next_attempt_at, created_at, send_stage) VALUES (?, ?, ?, ?, ?, ?, 'queued')").run(larkMessageId, kind, JSON.stringify(payload), idempotencyKey, createdAt, createdAt);
+  return db.prepare("SELECT id FROM lark_delivery_outbox WHERE idempotency_key=?").pluck().get(idempotencyKey) as number;
 }
 
 export function retryPendingLarkMediaReplies(limit = 10): number {
@@ -1827,16 +1842,26 @@ export function appendOwnerAssistContext(message: LarkMessageRow): void {
 function groupPrivacyBlocks(messageId: number): boolean {
   return config.groupPrivacyEnforced && (db.prepare("SELECT chat_type FROM lark_messages WHERE id=?").get(messageId) as {chat_type?:string}|undefined)?.chat_type !== "p2p";
 }
-export function claimLarkCodexReply(larkMessageId: number): boolean {
-  if (groupPrivacyBlocks(larkMessageId)) return false;
+function dispatchContext(message: LarkMessageRow): string {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    message.message_id, message.chat_id, message.thread_id, message.root_message_id, message.sender_id,
+    message.sender_type, message.listener_verified, message.reply_trigger, message.content, message.reply_to_message_id,
+    message.reply_to_content, config.workspaceRoot, isTrustedLarkSender(message.sender_id),
+    config.larkExecutionApproverId, externalExecutionForMessage(message) ?? null
+  ])).digest("hex");
+}
+
+function canDispatchLarkReply(larkMessageId: number): LarkMessageRow | undefined {
+  if (groupPrivacyBlocks(larkMessageId)) return;
   const settings = getAppSettings();
   if (!settings.larkCodexRepliesEnabled) {
-    return false;
+    return;
   }
   const target = db.prepare("SELECT * FROM lark_messages WHERE id=?").get(larkMessageId) as LarkMessageRow | undefined;
+  if (!target?.message_id || target.direction !== "inbound") return;
   if (target?.chat_type === "group" && target.sender_type === "bot"
     && !(target.reply_trigger === "mention" && target.mentioned === 1)
-    && (target.reply_trigger !== "owner_mention" || !ownerAssistSourceAllowed(target.sender_type, target.sender_id))) return false;
+    && (target.reply_trigger !== "owner_mention" || !ownerAssistSourceAllowed(target.sender_type, target.sender_id))) return;
   const chatId = target?.chat_id;
   const spontaneousPolicy = target?.reply_trigger === "spontaneous" && chatId ? conversationSpontaneousSettings(chatId) : null;
   const spontaneousChatIds = spontaneousPolicy?.effectiveEnabled && spontaneousPolicy.effectiveReplyRate > 0 && chatId ? [chatId] : [];
@@ -1845,6 +1870,14 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
     && ownerAssistRow(larkMessageId)?.owner_id === ownerPolicy.ownerId);
   const canContinueTopic = Boolean(target && target.reply_trigger === "topic" && isNativeTopicConversation(target));
 
+  if ((target.mentioned === 1 && !["owner_mention", "topic", "topic_command"].includes(target.reply_trigger))
+    || canContinueTopic || canAssist || (spontaneousChatIds.length > 0 && target.chat_type === "group"
+      && target.sender_type === "user" && target.message_type === "text" && target.content?.trim())) return target;
+}
+
+export function claimLarkCodexReply(larkMessageId: number): boolean {
+  const target = canDispatchLarkReply(larkMessageId);
+  if (!target) return false;
   const claimed = db.prepare(`
     UPDATE lark_messages
     SET codex_status = 'queued',
@@ -1852,17 +1885,18 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
         codex_error = NULL,
         codex_task_dir = NULL,
         codex_started_at = NULL,
-        codex_finished_at = NULL
+        codex_finished_at = NULL,
+        codex_session_id = NULL,
+        codex_turn_id = NULL,
+        codex_last_heartbeat_at = NULL,
+        codex_runner_generation = NULL,
+        codex_dispatch_phase = 'queued',
+        codex_dispatch_context = ?,
+        codex_recovery_engine_status = NULL
     WHERE id = ?
-      AND ((mentioned = 1 AND reply_trigger NOT IN ('owner_mention','topic','topic_command')) OR (reply_trigger='topic' AND ?=1) OR (reply_trigger='owner_mention' AND chat_type='group' AND ?=1) OR (
-        reply_trigger = 'spontaneous'
-        AND chat_type = 'group' AND sender_type = 'user' AND message_type = 'text'
-        AND length(trim(content)) > 0
-        AND chat_id IN (SELECT value FROM json_each(?))
-      ))
-      AND message_id IS NOT NULL
       AND codex_status IN ('skipped', 'failed', 'timeout')
-  `).run(larkMessageId, canContinueTopic ? 1 : 0, canAssist ? 1 : 0, JSON.stringify(spontaneousChatIds));
+      AND codex_dispatch_phase IS NOT 'needs_review'
+  `).run(dispatchContext(target), larkMessageId);
   return claimed.changes > 0;
 }
 
@@ -1870,6 +1904,12 @@ export function enqueueLarkCodexReply(larkMessageId: number): boolean {
   if (!claimLarkCodexReply(larkMessageId)) return false;
   scheduleLarkCodexReply(larkMessageId);
   return true;
+}
+
+function markLarkTurnSubmitted(messageId: number): void {
+  // The durable boundary precedes the RPC: a lost acceptance is not a safe retry.
+  if (!db.prepare("UPDATE lark_messages SET codex_dispatch_phase='submitted' WHERE id=? AND codex_dispatch_phase IN ('preparing','submitted')").run(messageId).changes)
+    throw new Error("Could not journal the turn submission");
 }
 
 export function trustedLarkCodexSenderIds(): string[] {
@@ -1984,8 +2024,9 @@ function updateRunMembers(
   run: ActiveLarkCodexRun,
   status: LarkMessageRow["codex_status"],
   error: string | null
-): void {
+): () => void {
   const finishedAt = nowIso();
+  const artifacts: Array<() => void> = [];
   for (const prepared of run.members.values()) {
     const storedReply = run.memberReplies.get(prepared.row.id) ?? null;
     const reply = status === "failed" && storedReply === legacyLongRunningProgressText ? null : storedReply;
@@ -1997,6 +2038,7 @@ function updateRunMembers(
       taskDir: prepared.taskDir,
       finishedAt
     });
+    db.prepare("UPDATE lark_messages SET codex_dispatch_phase='finalized' WHERE id=?").run(prepared.row.id);
     if (status === "failed" && !reply) {
       db.prepare(`
         UPDATE lark_messages
@@ -2004,7 +2046,7 @@ function updateRunMembers(
         WHERE id = ? AND reply_status = 'pending'
       `).run(error ?? "Codex failed before producing a reply", prepared.row.id);
     }
-    fs.writeFileSync(path.join(prepared.taskDir, "turn-result.json"), `${JSON.stringify({
+    artifacts.push(() => fs.writeFileSync(path.join(prepared.taskDir, "turn-result.json"), `${JSON.stringify({
       transport: "codex-app-server",
       threadId: run.threadId,
       turnId: run.turnId,
@@ -2012,8 +2054,11 @@ function updateRunMembers(
       reply,
       error,
       finishedAt
-    }, null, 2)}\n`);
+    }, null, 2)}\n`));
   }
+  return () => { for (const write of artifacts) {
+    try { write(); } catch { console.warn("lark_turn_result_artifact_write_failed"); }
+  } };
 }
 
 function approvalOutcomeReply(decision: "rejected" | "expired"): string {
@@ -2089,8 +2134,8 @@ export function recordExecutionReceipt(larkMessageId: number, turnId: string): v
   const now = nowIso();
   const deliveryStatus = getAppSettings().larkExecutionReceiptsEnabled && ownerAssistPublicAllowed(larkMessageId) ? "pending" : "suppressed";
   db.prepare(`
-    INSERT INTO lark_execution_receipts (lark_message_id, turn_id, status, entries_json, delivery_status, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO lark_execution_receipts (lark_message_id, turn_id, status, entries_json, delivery_status, next_attempt_at, created_at, updated_at, send_stage)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')
     ON CONFLICT(lark_message_id, turn_id) DO UPDATE SET
       status=excluded.status,
       entries_json=excluded.entries_json,
@@ -2112,11 +2157,12 @@ export function retryPendingLarkExecutionReceipts(limit = 10): number {
     ORDER BY receipts.id LIMIT ?
   `).all(nowIso(), limit) as Array<{ id: number; lark_message_id: number; turn_id: string; status: LarkExecutionReceiptEntry["status"]; entries_json: string; message_id: string }>;
   for (const row of rows) {
-    if (!ownerAssistPublicAllowed(row.lark_message_id)) {
-      db.prepare("UPDATE lark_execution_receipts SET delivery_status='suppressed',delivery_error='Owner assistance policy changed',updated_at=? WHERE id=?").run(nowIso(), row.id);
+    if (groupPrivacyBlocks(row.lark_message_id) || !ownerAssistPublicAllowed(row.lark_message_id)) {
+      db.prepare("UPDATE lark_execution_receipts SET delivery_status='suppressed',delivery_error='Delivery policy changed',updated_at=? WHERE id=?").run(nowIso(), row.id);
       continue;
     }
     const entries = JSON.parse(row.entries_json) as LarkExecutionReceiptEntry[];
+    db.prepare("UPDATE lark_execution_receipts SET send_stage='attempted' WHERE id=?").run(row.id);
     const sent = sendLarkExecutionReceiptCard(row.message_id, { status: row.status, entries }, larkReplyIdempotencyKey("receipt", `${row.lark_message_id}:${row.turn_id}`));
     if (sent.ok) {
       db.prepare("UPDATE lark_execution_receipts SET card_message_id=?, delivery_status='sent', delivery_error=NULL, updated_at=? WHERE id=?").run(sent.messageId, nowIso(), row.id);
@@ -2136,27 +2182,23 @@ export function suppressPendingLarkExecutionReceipts(): number {
 function queuePreparedReplyMedia(target: Pick<PreparedLarkCodexMessage, "row" | "messageId" | "taskDir">, turnId: string,
   mediaResult: ReturnType<typeof extractLarkReplyMedia>, afterTextKey?: string, afterTextMessageId = target.row.id): number[] {
   const ids: number[] = [];
-  let sentCount = 0;
   const enqueue = (kind: LarkDeliveryOutboxRow["kind"], media: LarkReplyMedia[], key: string) => {
-    const sent = queueLarkMediaDelivery(target.row.id, kind, {
+    ids.push(stageLarkMediaDelivery(target.row.id, kind, {
       messageId: target.messageId, taskDir: target.taskDir, paths: media.map(file => file.relativePath),
       stickerIds: media.flatMap(file => file.stickerId ? [file.stickerId] : []), chatId: target.row.chat_id,
       turnId, afterTextKey, afterTextMessageId,
       expectedFiles: media.flatMap(file => file.sha256 ? [{ path: file.relativePath, sha256: file.sha256 }] : [])
-    }, key);
-    ids.push(sent.deliveryId);
-    sentCount += sent.sentCount;
-    if (!sent.ok) mediaResult.errors.push(`附件待重试：${sent.error}`);
+    }, key));
   };
   const images = mediaResult.media.filter(file => file.kind === "image" && !file.stickerId);
   if (images.length) enqueue("image-post", images, larkReplyIdempotencyKey("codeximages", `${turnId}:${target.messageId}:${images.map(file => file.relativePath).join(",")}`));
   const individual = mediaResult.media.filter(file => file.kind === "file" || file.stickerId && afterTextKey);
   for (const [index, media] of individual.entries()) enqueue("media", [media],
     larkReplyIdempotencyKey(`codexmedia${index + 1}`, `${turnId}:${target.messageId}:${media.relativePath}`));
-  if (mediaResult.media.length || mediaResult.errors.length) fs.writeFileSync(path.join(target.taskDir, "outbound-media.json"), `${JSON.stringify({
+  if (mediaResult.media.length || mediaResult.errors.length) try { fs.writeFileSync(path.join(target.taskDir, "outbound-media.json"), `${JSON.stringify({
     requested: mediaResult.media.map(file => ({ path: file.relativePath, kind: file.kind, size: file.size, stickerId: file.stickerId ?? null })),
-    stickerIds: mediaResult.stickerIds, errors: mediaResult.errors, sentCount, recordedAt: nowIso()
-  }, null, 2)}\n`);
+    stickerIds: mediaResult.stickerIds, errors: mediaResult.errors, stagedDeliveryCount: ids.length, recordedAt: nowIso()
+  }, null, 2)}\n`); } catch { console.warn("lark_outbound_media_artifact_write_failed"); }
   return ids;
 }
 
@@ -2217,55 +2259,66 @@ function finishRun(
     run.memberReplies.set(target.row.id, reply);
   }
   let finalTextKey: string | undefined;
-  if (sendReply && reply) {
-    const newKey = larkReplyIdempotencyKey("codexfinal", `${run.turnId}:${target.messageId}`);
-    const delivery = larkFinalTextDeliveryDecision({
-      reply,
-      previousReply: run.sentReplies.get(target.row.id),
-      previousKey: run.sentReplyKeys.get(target.row.id),
-      hasSticker: mediaResult.stickerIds.length > 0,
-      newKey
-    });
-    finalTextKey = delivery.dependencyKey;
-    if (delivery.shouldQueue) {
-      mediaDeliveryIds.push(...queueLarkTextReply(target.row, formatLarkFinalReply(target.row, reply, { mentionDirectBot: true }),
-        newKey, { taskDir: target.taskDir, turnId: run.turnId, markdown: reply }));
-      run.sentReplies.set(target.row.id, reply);
-      run.sentReplyKeys.set(target.row.id, newKey);
+  let textMessageId: number | undefined;
+  // The engine outcome and all delivery intent commit before the first send.
+  const writeArtifacts = db.transaction(() => {
+    if (sendReply && reply) {
+      const newKey = larkReplyIdempotencyKey("codexfinal", `${run.turnId}:${target.messageId}`);
+      const delivery = larkFinalTextDeliveryDecision({
+        reply,
+        previousReply: run.sentReplies.get(target.row.id),
+        previousKey: run.sentReplyKeys.get(target.row.id),
+        hasSticker: mediaResult.stickerIds.length > 0,
+        newKey
+      });
+      finalTextKey = delivery.dependencyKey;
+      if (delivery.shouldQueue) {
+        mediaDeliveryIds.push(...queueLarkTextReply(target.row, formatLarkFinalReply(target.row, reply, { mentionDirectBot: true }),
+          newKey, { taskDir: target.taskDir, turnId: run.turnId, markdown: reply }, true));
+        textMessageId = target.row.id;
+        run.sentReplies.set(target.row.id, reply);
+        run.sentReplyKeys.set(target.row.id, newKey);
+      }
     }
-  }
-  if (sendReply && validationErrors.length > 0) {
-    finalStatus = "failed";
-    finalError = `${finalError ? `${finalError}\n\n` : ""}附件发送失败：${validationErrors.join("；")}`;
-  }
-  if (sendReply) {
-    mediaDeliveryIds.push(...queuePreparedReplyMedia(target, run.turnId, mediaResult, finalTextKey));
-    for (const [member, result] of otherAttachments) {
-      if (result.errors.length) queueLarkMediaFailureNotice(member.row.id, member.messageId, run.turnId, `${run.turnId}:${member.messageId}:invalid`);
-      otherDeliveryIds.set(member, queuePreparedReplyMedia(member, run.turnId, result, finalTextKey, target.row.id));
+    if (sendReply && validationErrors.length > 0) {
+      finalStatus = "failed";
+      finalError = `${finalError ? `${finalError}\n\n` : ""}附件发送失败：${validationErrors.join("；")}`;
     }
-  }
-  if (finalStatus !== "failed") {
-    finalStatus = larkCodexTerminalStatus(
-      status,
-      Boolean(reply) || mediaResult.media.length > 0 || otherAttachments.size > 0 || run.memberReplies.size > 0 || run.sentReplies.has(target.row.id)
-    );
-  }
-  if (!reply) {
-    reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
-  }
-  updateRunMembers(run, finalStatus, finalError);
+    if (sendReply) {
+      mediaDeliveryIds.push(...queuePreparedReplyMedia(target, run.turnId, mediaResult, finalTextKey));
+      for (const [member, result] of otherAttachments) {
+        if (result.errors.length) queueLarkMediaFailureNotice(member.row.id, member.messageId, run.turnId, `${run.turnId}:${member.messageId}:invalid`);
+        otherDeliveryIds.set(member, queuePreparedReplyMedia(member, run.turnId, result, finalTextKey, target.row.id));
+      }
+    }
+    if (finalStatus !== "failed") {
+      finalStatus = larkCodexTerminalStatus(
+        status,
+        Boolean(reply) || mediaResult.media.length > 0 || otherAttachments.size > 0 || run.memberReplies.size > 0 || run.sentReplies.has(target.row.id)
+      );
+    }
+    if (!reply) {
+      reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
+    }
+    const artifacts = updateRunMembers(run, finalStatus, finalError);
+    if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0 && ownerAssistPublicAllowed(target.row.id)) {
+      queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
+        run.turnId, target.row.id, finalTextKey ?? run.sentReplyKeys.get(target.row.id), mediaDeliveryIds, true);
+      for (const [member, ids] of otherDeliveryIds) queueLarkCompletionReactions([{ id: member.row.id, messageId: member.messageId }], run.turnId, member.row.id, undefined, ids, true);
+    }
+    for (const prepared of run.members.values()) recordExecutionReceipt(prepared.row.id, run.turnId);
+    return artifacts;
+  })();
+  writeArtifacts();
+  if (sendReply) deliverStagedLarkReply(textMessageId, [...mediaDeliveryIds, ...[...otherDeliveryIds.values()].flat()]);
   publishLarkTurnObservation(db, { kind: "turn.finished", runId: run.progressId, turnId: run.turnId,
     threadId: run.threadId, sourceMessageId: target.row.id, outcome: !sendReply ? "interrupted" : finalStatus === "failed"
       ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed" });
   if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
-  if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0 && ownerAssistPublicAllowed(target.row.id)) {
-    queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
-      run.turnId, target.row.id, finalTextKey ?? run.sentReplyKeys.get(target.row.id), mediaDeliveryIds);
-    for (const [member, ids] of otherDeliveryIds) queueLarkCompletionReactions([{ id: member.row.id, messageId: member.messageId }], run.turnId, member.row.id, undefined, ids);
+  if (sendReply) {
+    retryPendingLarkCompletionReactions();
+    retryPendingLarkExecutionReceipts();
   }
-  for (const prepared of run.members.values()) recordExecutionReceipt(prepared.row.id, run.turnId);
-  if (sendReply) retryPendingLarkExecutionReceipts();
   if (activeLarkCodexRuns.get(run.sessionKey) === run) {
     activeLarkCodexRuns.delete(run.sessionKey);
   }
@@ -4211,6 +4264,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   setLarkThreadDisplayName(threadId, prepared);
   let turnParams = buildLarkCodexTurnParams(prepared, threadId, model);
   let turn: TurnStartResponse;
+  markLarkTurnSubmitted(prepared.row.id);
   try {
     turn = await codexAppServer.request<TurnStartResponse>("turn/start", turnParams);
   } catch (error) {
@@ -4346,6 +4400,7 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
 async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedLarkCodexMessage): Promise<void> {
   if (skipDisabledTopicContinuation(prepared.row)) return;
   updatePreparedPrompt(prepared, "delta", run.threadId);
+  markLarkTurnSubmitted(prepared.row.id);
   run.members.set(prepared.row.id, prepared);
   run.pendingSteers += 1;
   updateCodexState(prepared.row.id, {
@@ -4450,24 +4505,29 @@ export function cancelExternalTopicTurns(chatId: string, threadId: string): numb
   return controllers.length;
 }
 
-function finishExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string,
-  final?: { turnId: string; trusted: boolean; selectedSticker?: string }): void {
+function stageExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string,
+  final?: { turnId: string; trusted: boolean; selectedSticker?: string }): (() => void) | undefined {
   updateCodexState(message.id, { status, reply: text || null, error, finishedAt: nowIso() });
+  db.prepare("UPDATE lark_messages SET codex_dispatch_phase='finalized' WHERE id=?").run(message.id);
   if (!text) {
     db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=?").run(message.id);
     return;
   }
   const textKey = larkReplyIdempotencyKey("topicengine", String(message.id));
   const taskDir = final && larkCodexTaskPaths(message, final.trusted).taskDir;
-  queueLarkTextReply(message, formatLarkFinalReply(message, text), textKey,
-    final && taskDir ? { taskDir, turnId: final.turnId, markdown: text } : undefined);
-  if (!final?.selectedSticker || !taskDir || !message.message_id) return;
-  try {
+  const mediaIds = queueLarkTextReply(message, formatLarkFinalReply(message, text), textKey,
+    final && taskDir ? { taskDir, turnId: final.turnId, markdown: text } : undefined, true);
+  if (final?.selectedSticker && taskDir && message.message_id) try {
     const media = stageLarkStickerSelection(final.selectedSticker, taskDir, message.chat_id);
-    queuePreparedReplyMedia({ row: message, messageId: message.message_id, taskDir }, final.turnId, media, textKey);
+    mediaIds.push(...queuePreparedReplyMedia({ row: message, messageId: message.message_id, taskDir }, final.turnId, media, textKey));
   } catch {
     console.warn("lark_external_sticker_staging_failed", { messageId: message.id });
   }
+  return () => deliverStagedLarkReply(message.id, mediaIds);
+}
+
+function finishExternalTopicMessage(...args: Parameters<typeof stageExternalTopicMessage>): void {
+  db.transaction(() => stageExternalTopicMessage(...args))()?.();
 }
 
 function externalLarkMcpInstructions(message: LarkMessageRow, token: string, trusted: boolean): string {
@@ -4500,6 +4560,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     const nextToken = running.mcp ? crypto.randomBytes(24).toString("base64url") : undefined;
     const input = nextToken ? `${text}\n\n${externalLarkMcpInstructions(message, nextToken, trusted)}` : text;
     const sendSteer = active.session.steer.bind(active.session);
+    markLarkTurnSubmitted(message.id);
     const steer = Promise.resolve().then(() => sendSteer(input, AbortSignal.any([running.controller.signal, AbortSignal.timeout(12_000)]))).then(outcome => {
       if (outcome === "injected") {
         recordTopicExecution(message.id, route, running.session.id, running.id);
@@ -4597,7 +4658,10 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     controller.signal.addEventListener("abort", closeAfterAbort, { once: true });
     let result: ExecutionTurnResult | null = null;
     const nativePolicy = authorizeNative ? "\n\n默认保持只读。按工具契约发起实际调用，由引擎和运行时处理权限，依据工具结果继续。" : "";
-    try { result = await session.run(`${prompt}${mcpToken ? `\n\n${externalLarkMcpInstructions(message, mcpToken, trusted)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent); }
+    try {
+      markLarkTurnSubmitted(message.id);
+      result = await session.run(`${prompt}${mcpToken ? `\n\n${externalLarkMcpInstructions(message, mcpToken, trusted)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent);
+    }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
       run.accepting = false;
@@ -4623,10 +4687,10 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
         && !groupPrivacyBlocks(mcp.source.id) && configuredLarkStickerUsageMode(message.chat_id) !== "off"
         ? applySelectedSticker(answer, mcp.stickers, { threadId: session.id, turnId: progressId, messageId: mcp.source.id }) ?? undefined
         : undefined;
-      for (const member of run.members.values()) {
-        finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
-          status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined);
-      }
+      const deliveries = db.transaction(() => [...run.members.values()].map(member =>
+        stageExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
+          status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined)))();
+      for (const deliver of deliveries) deliver?.();
       publishLarkTurnObservation(db, { kind: "turn.finished", runId: progressId, turnId: progressId, threadId: session.id,
         sourceMessageId: message.id, outcome: cancelled ? "cancelled" : result ? "completed" : "failed" });
     } finally { externalTopicTurns.delete(key); }
@@ -4639,15 +4703,16 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
   let prepared: PreparedLarkCodexMessage | null = null;
   preparingLarkMessages.add(larkMessageId);
   try {
-    const message = db.prepare("SELECT * FROM lark_messages WHERE id = ?").get(larkMessageId) as LarkMessageRow | undefined;
-    if (!message?.message_id) {
-      throw new Error("Missing Lark message_id");
-    }
-    if (skipDisabledTopicContinuation(message)) return;
-    if (groupPrivacyBlocks(larkMessageId)) {
-      updateCodexState(larkMessageId, {status:"skipped"});
+    const message = db.prepare("SELECT * FROM lark_messages WHERE id=? AND codex_status='queued' AND codex_dispatch_phase='queued'")
+      .get(larkMessageId) as LarkMessageRow | undefined;
+    if (!message) return;
+    if (!canDispatchLarkReply(larkMessageId) || message.codex_dispatch_context !== dispatchContext(message)) {
+      db.prepare(`UPDATE lark_messages SET codex_status='skipped',codex_dispatch_phase=NULL,
+        codex_error='Execution context changed or was disabled before dispatch',
+        reply_status=CASE WHEN reply_status='pending' AND reply_delivery_key IS NULL THEN 'skipped' ELSE reply_status END WHERE id=?`).run(larkMessageId);
       return;
     }
+    db.prepare("UPDATE lark_messages SET codex_dispatch_phase='preparing' WHERE id=?").run(larkMessageId);
     const trustedSender = isTrustedSender(message.sender_id);
     const external = externalExecutionForMessage(message);
     if (external) {
@@ -4710,17 +4775,44 @@ export function chainLarkCodexReplyDispatch(
     .then(task);
 }
 
-function scheduleLarkCodexReply(larkMessageId: number): void {
+const scheduledLarkReplies = new WeakMap<object, Set<number>>();
+
+export function scheduleLarkCodexReply(larkMessageId: number): void {
+  const database = db;
+  let ids = scheduledLarkReplies.get(database);
+  if (!ids) { ids = new Set(); scheduledLarkReplies.set(database, ids); }
+  if (ids.has(larkMessageId)) return;
+  ids.add(larkMessageId);
   const message = db.prepare("SELECT * FROM lark_messages WHERE id = ?").get(larkMessageId) as LarkMessageRow | undefined;
   const trustedSender = isTrustedSender(message?.sender_id ?? null);
   const key = message ? preparedSessionKey(message, trustedSender) : `message:${larkMessageId}`;
   const previous = dispatchChains.get(key);
-  const next = chainLarkCodexReplyDispatch(previous, () => routeLarkCodexReply(larkMessageId));
+  const next = chainLarkCodexReplyDispatch(previous, async () => {
+    if (database === db && database.open) await routeLarkCodexReply(larkMessageId);
+  });
   dispatchChains.set(key, next);
   void next.finally(() => {
+    ids.delete(larkMessageId);
     if (dispatchChains.get(key) === next) {
       dispatchChains.delete(key);
     }
+  });
+}
+
+export function resumeQueuedLarkCodexReplies(): void {
+  if (config.runtimeMode !== "active") return;
+  const rows = db.prepare("SELECT id FROM lark_messages WHERE codex_status='queued' AND codex_dispatch_phase='queued' ORDER BY id LIMIT 100")
+    .pluck().all() as number[];
+  for (const id of rows) scheduleLarkCodexReply(id);
+}
+
+export function inspectInterruptedLarkTurns(signal?: AbortSignal): Promise<void> {
+  if (config.runtimeMode !== "active" || signal?.aborted) return Promise.resolve();
+  const database = db;
+  return reconcileInterruptedNativeTurns(database, async (method, params) => {
+    signal?.throwIfAborted();
+    if (!database.open || database !== db) throw new Error("Recovery runtime closed");
+    return codexAppServer.request(method, params, 3_000);
   });
 }
 
@@ -4786,35 +4878,13 @@ export function reconcileLarkCodexResponder(): void {
       spawnSync("tmux", ["kill-session", "-t", sessionName], { encoding: "utf8" });
     }
   }
-  const finishedAt = nowIso();
-  db.prepare(`
-    UPDATE lark_execution_approvals
-    SET status = 'failed',
-        card_error = COALESCE(card_error, 'Codex responder restarted before approval was decided'),
-        decided_at = COALESCE(decided_at, ?)
-    WHERE status = 'pending'
-  `).run(finishedAt);
-  db.prepare(`
-    UPDATE lark_messages
-    SET codex_status = 'failed',
-        codex_error = COALESCE(codex_error, 'Codex responder restarted before the turn completed'),
-        codex_finished_at = COALESCE(codex_finished_at, ?)
-    WHERE codex_status IN ('queued', 'running')
-  `).run(finishedAt);
+  reconcileLarkCrash(db, nowIso());
   db.prepare(`
     UPDATE lark_messages
     SET codex_status = 'no_reply',
         codex_error = NULL
     WHERE codex_status = 'failed'
       AND codex_error = 'Codex app-server turn completed without an answer'
-  `).run();
-  db.prepare(`
-    UPDATE lark_messages
-    SET reply_status = 'sent', reply_error = NULL
-    WHERE reply_trigger = 'spontaneous'
-      AND reply_status = 'pending'
-      AND codex_status = 'answered'
-      AND codex_reply IS NOT NULL
   `).run();
   db.prepare(`
     UPDATE lark_messages
@@ -4832,7 +4902,7 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
   nextOrphanedLarkRunReconciliationMs = nowMs + 60_000;
   const cutoff = new Date(nowMs - config.larkCodexOrphanRecoveryMs).toISOString();
   const activeMessageIds = new Set(
-    [...activeLarkCodexRuns.values(), ...externalTopicTurns.values()].flatMap((run) => [...run.members.keys()])
+    [...preparingLarkMessages, ...[...activeLarkCodexRuns.values(), ...externalTopicTurns.values()].flatMap(run => [...run.members.keys()])]
   );
   const candidates = db.prepare(`
     SELECT id
@@ -4846,19 +4916,9 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
     return 0;
   }
   const finishedAt = nowIso();
-  const update = db.prepare(`
-    UPDATE lark_messages
-    SET codex_status = 'failed',
-        codex_reply = CASE WHEN codex_reply = ? THEN NULL ELSE codex_reply END,
-        codex_error = ?,
-        codex_finished_at = ?
-    WHERE id = ?
-      AND codex_status = 'running'
-  `);
-  const error = "Codex turn is no longer active and was recovered. Retry this message to start a fresh turn.";
   const transaction = db.transaction(() => {
     for (const id of ids) {
-      update.run(legacyLongRunningProgressText, error, finishedAt, id);
+      quarantineLarkExecution(db, id, finishedAt);
     }
   });
   transaction();

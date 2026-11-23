@@ -34,12 +34,12 @@ readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.pa
   const previousExecutable = process.env.CODEX_EXECUTABLE;
   process.env.CODEX_EXECUTABLE = executable;
   const sent: Array<{ text: string; key: string; presentation?: LarkReplyPresentation }> = [], media: string[] = [], events: string[] = [];
-  let failText = false, failMedia = false, missingReceipt = false;
+  let failText = false, failMedia = false, missingReceipt = false, notSent = false;
   const options = { databasePath: path.join(root, "test.sqlite"), mode: "active" as const, workspaceRoot: root, trustedSenderIds: [],
     textReplySender: (_id: string, text: string, key: string, presentation?: LarkReplyPresentation) => {
       sent.push({ text, key, presentation: presentation ? JSON.parse(JSON.stringify(presentation)) : undefined });
       events.push(failText ? "text-failed" : "text-sent");
-      return failText ? { ok: false as const, error: "fixture network failure" } : { ok: true as const, messageId: missingReceipt ? null : `om_sent${sent.length}`, chatId: "oc_fixture", messageAt: new Date().toISOString(), messageType: presentation?.msgType ?? "text" };
+      return failText ? { ok: false as const, error: "fixture transport failure", ...(notSent ? { notSent: true as const } : {}) } : { ok: true as const, messageId: missingReceipt ? null : `om_sent${sent.length}`, chatId: "oc_fixture", messageAt: new Date().toISOString(), messageType: presentation?.msgType ?? "text" };
     }, reactionSender: (_id: string, emoji: string) => { events.push(emoji); return { ok: true as const }; }
   };
   let runtime = createRuntime(options);
@@ -56,7 +56,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.pa
   const due = () => { runtime.store.db.prepare("UPDATE lark_messages SET reply_next_attempt_at='1970-01-01' WHERE reply_status='pending'").run();
     runtime.store.db.prepare("UPDATE lark_delivery_outbox SET next_attempt_at='1970-01-01' WHERE status='pending'").run(); };
   return { root, sent, media, events, row, due, get runtime() { return runtime; },
-    failText(value: boolean) { failText = value; }, failMedia(value: boolean) { failMedia = value; }, missingReceipt(value: boolean) { missingReceipt = value; },
+    failText(value: boolean, confirmedNotSent = false) { failText = value; notSent = confirmedNotSent; }, failMedia(value: boolean) { failMedia = value; }, missingReceipt(value: boolean) { missingReceipt = value; },
     async start(source: string) {
       await runtime.app.inject({ method: "PATCH", url: "/v1/settings", payload: { stickerUsageMode: "off", executionReceiptsEnabled: false, interimRepliesEnabled: false } });
       await installMedia(); fs.writeFileSync(answer, source);
@@ -85,9 +85,9 @@ test("native final replies deliver post/card snapshots and archive readable orig
   }
 });
 
-test("failed rich replies survive restart and retry the exact snapshot and idempotency key", async () => {
+test("rich replies confirmed not sent survive restart with the exact snapshot and idempotency key", async () => {
   const f = fixture(); try {
-    f.failText(true); await f.start("| A | B |\n| --- | --- |\n| Demo | 2 |");
+    f.failText(true, true); await f.start("| A | B |\n| --- | --- |\n| Demo | 2 |");
     const snapshot = f.row().reply_delivery_payload, key = f.row().reply_delivery_key;
     assert.equal(f.row().reply_status, "pending"); assert.equal(f.events.includes("DONE"), false);
     f.runtime.store.db.prepare("UPDATE lark_messages SET reply_next_attempt_at='2999-01-01',codex_reply='later diagnostics are not a delivery template' WHERE id=1").run();
@@ -95,6 +95,19 @@ test("failed rich replies survive restart and retry the exact snapshot and idemp
     assert.equal(f.row().reply_delivery_payload, snapshot); assert.equal(f.sent[1].key, key);
     assert.deepEqual(f.sent[0].presentation, f.sent[1].presentation);
     assert.equal(f.row().reply_status, "sent"); assert.equal(f.events.filter(item => item === "DONE").length, 1);
+  } finally { await f.close(); }
+});
+
+test("an ambiguous rich reply is not resent after restart even if a later retry was confirmed not sent", async () => {
+  const f = fixture(); try {
+    f.failText(true); await f.start("**Ready**");
+    f.failText(true, true); f.due(); retryPendingLarkTextReplies();
+    assert.equal(f.row().reply_send_stage, "attempted");
+    await f.reopen(); f.failText(false); f.due();
+    assert.equal(retryPendingLarkTextReplies(), 0);
+    assert.equal(f.sent.length, 2);
+    assert.equal(f.row().reply_status, "failed");
+    assert.match(f.row().reply_error, /未能确认飞书投递结果/);
   } finally { await f.close(); }
 });
 

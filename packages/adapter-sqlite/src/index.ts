@@ -229,6 +229,13 @@ export class SqliteAgentStore {
     this.ensureColumn("lark_messages", "root_message_id", "TEXT");
     this.ensureColumn("lark_messages", "thread_id", "TEXT");
     this.ensureColumn("lark_messages", "reply_delivery_payload", "TEXT");
+    this.ensureColumn("lark_messages", "reply_send_stage", "TEXT");
+    this.ensureColumn("lark_delivery_outbox", "send_stage", "TEXT");
+    this.ensureColumn("lark_execution_receipts", "send_stage", "TEXT");
+    this.ensureColumn("lark_messages", "codex_dispatch_phase", "TEXT");
+    this.ensureColumn("lark_messages", "codex_dispatch_context", "TEXT");
+    this.ensureColumn("lark_messages", "codex_recovery_engine_status", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_recovery_queue ON lark_messages(id) WHERE codex_status='queued' AND codex_dispatch_phase='queued'");
     this.ensureColumn("lark_capability_approvals", "approval_scope", "TEXT NOT NULL DEFAULT 'once'");
     this.ensureColumn("lark_capability_approvals", "error", "TEXT");
     this.ensureColumn("lark_capability_approvals", "requester_id", "TEXT");

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 import { sendLarkProgressCard, updateLarkProgressCard } from "@lark-agent/adapter-lark-cli";
-import { sendLarkTextReply, sendLarkMediaReply, sendLarkReaction, type LarkSentMessage, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
+import { sendLarkTextReply, sendLarkMediaReply, sendLarkReaction, type LarkSendResult, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
 
 export type LarkStickerRow = {
   id: string;
@@ -42,7 +42,7 @@ export type LarkExecutionApprovalRow = { id: number; token: string; lark_message
 
 export const config = { groupPrivacyEnforced: false, runtimeMode: "shadow" as "shadow" | "active", workspaceRoot: "", larkStickerDirectory: "", repoRoot: "", taskOutputDir: "", larkAgentRuntimeUrl: "", larkAgentRuntimeToken: "", larkAgentMcpToken: "", larkGroupSpontaneousReplyCooldownMs: 600_000, larkGroupSpontaneousReplyRate: 0.08, larkCodexInterimReplyDelayMs: 30_000, larkCodexMaxInterimReplies: 1, larkCodexModel: "gpt-5.6-terra", larkCodexOrphanRecoveryMs: 120_000, larkCodexReasoningEffort: "low", larkCodexStartupStallMs: 60_000, larkCodexStreamReplyMinIntervalMs: 15_000, larkExecutionApproverId: "", larkRecentMessageContextMaxChars: 6000, larkRecentMessageFetchLimit: 50, trustedLarkCodexSenderIds: [] as string[] };
 export let db: Database.Database;
-export type LarkTextReplySender = (messageId: string, text: string, idempotencyKey: string, presentation?: LarkReplyPresentation) => LarkSentMessage | { ok: false; error: string };
+export type LarkTextReplySender = (messageId: string, text: string, idempotencyKey: string, presentation?: LarkReplyPresentation) => LarkSendResult;
 export type LarkReactionSender = (messageId: string, emojiType: string) => { ok: true } | { ok: false; error: string };
 export let larkTextReplySender: LarkTextReplySender = sendLarkTextReply;
 export let larkMediaReplySender: typeof sendLarkMediaReply = sendLarkMediaReply;

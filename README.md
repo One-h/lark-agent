@@ -106,6 +106,8 @@ supported local engine adapters use the same runtime authorization checks.
 
 Native Codex and ACP share [internal turn observations](docs/turn-observations.md)
 for progress cards. They are distinct from approval and delivery receipts.
+See [crash recovery](docs/crash-recovery.md) for queued execution and delivery
+recovery, and for what cannot be resumed after losing an engine connection.
 
 Final replies use [Markdown posts and data cards](docs/rich-replies.md).
 Optional [native topic conversations](docs/native-topics.md) continue an explicitly

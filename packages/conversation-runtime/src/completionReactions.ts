@@ -58,7 +58,8 @@ export function queueLarkCompletionReactions(
   turnId: string,
   targetId: number,
   afterTextKey: string | undefined,
-  mediaDeliveryIds: number[]
+  mediaDeliveryIds: number[],
+  defer = false
 ): void {
   if (config.runtimeMode !== "active") return;
   const createdAt = nowIso();
@@ -69,7 +70,7 @@ export function queueLarkCompletionReactions(
       insert.run(id, JSON.stringify(payload), larkReplyIdempotencyKey("codexdone", `${turnId}:${messageId}`), createdAt, createdAt);
     }
   })();
-  retryPendingLarkCompletionReactions();
+  if (!defer) retryPendingLarkCompletionReactions();
 }
 
 export function retryPendingLarkCompletionReactions(limit = 10): number {

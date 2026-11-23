@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { defaultLarkAcknowledgeReactionEmoji, isLarkReactionEmojiType, larkReactionEmojiTypes } from "@lark-agent/adapter-lark-cli";
 import { config, db, getAppSettings, larkReactionSender, nowIso, type LarkMessageRow } from "./context.js";
 import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
-import { appendOwnerAssistContext, decideLarkExecutionApprovalFromCard, enqueueLarkCodexReply, replyToNativeTopicCommand } from "./responder.js";
+import { appendOwnerAssistContext, claimLarkCodexReply, decideLarkExecutionApprovalFromCard, scheduleLarkCodexReply, replyToNativeTopicCommand } from "./responder.js";
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { imageKeysFromContent } from "./mediaImages.js";
@@ -279,10 +279,10 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
   const messageId = stringValue(event.message_id) ?? stringValue(event.id);
   // A local intake request cannot replace a listener-authenticated message.
   const existing = messageId || eventId
-    ? db.prepare("SELECT reply_trigger, listener_verified FROM lark_messages WHERE message_id=? OR event_id=? ORDER BY listener_verified DESC LIMIT 1")
-      .get(messageId, eventId) as { reply_trigger: string; listener_verified: number } | undefined
+    ? db.prepare("SELECT reply_trigger, listener_verified, codex_dispatch_phase FROM lark_messages WHERE message_id=? OR event_id=? ORDER BY listener_verified DESC LIMIT 1")
+      .get(messageId, eventId) as { reply_trigger: string; listener_verified: number; codex_dispatch_phase: string | null } | undefined
     : undefined;
-  if (existing?.reply_trigger === "topic" || existing?.reply_trigger === "topic_command"
+  if (existing?.codex_dispatch_phase || existing?.reply_trigger === "topic" || existing?.reply_trigger === "topic_command"
     || (!fromListener && existing?.listener_verified === 1)) return;
   const fromBot = event.sender_type === "bot";
   const botOpenId = fromBot ? resolveCurrentBotOpenId() : undefined;
@@ -319,7 +319,8 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
 
   const receivedAt = nowIso();
   const messageAt = eventMessageAt(event, receivedAt);
-  const insert = db.prepare(`
+  const { insert, queuedId } = db.transaction(() => {
+    const insert = db.prepare(`
     INSERT OR IGNORE INTO lark_messages (
       event_id, message_id, chat_id, chat_type, sender_id, sender_type, direction, message_type, content, message_at,
       reply_to_message_id, root_message_id, thread_id, reply_to_message_type, reply_to_content, reply_to_raw_json,
@@ -350,7 +351,16 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
     receivedAt,
     receivedAt,
     fromListener && event.sender_type === "user" ? 1 : 0
-  );
+    );
+    let queuedId: number | undefined;
+    if (insert.changes > 0 && shouldRespond && messageId) {
+      const persisted = db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(messageId) as LarkMessageRow;
+      if (ownerMentioned) ensureOwnerMentionAssist(persisted);
+      if (claimLarkCodexReply(persisted.id)) queuedId = persisted.id;
+      else db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=? AND codex_status='skipped' AND reply_status='pending'").run(persisted.id);
+    }
+    return { insert, queuedId };
+  })();
   if (insert.changes === 0) {
     const keyColumn = messageId ? "message_id" : "event_id";
     const keyValue = messageId ?? eventId;
@@ -427,7 +437,6 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
       }
       return;
     }
-    if (shouldRespond && ownerMentioned) ensureOwnerMentionAssist(persisted);
     observeOwnerAssistContext(persisted);
     appendOwnerAssistContext(persisted);
     const groupEmoji = groupMessageReactionEmoji(event);
@@ -439,14 +448,7 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
       }
     }
   }
-  if (shouldRespond && insert.changes > 0) {
-    const row = db.prepare("SELECT id FROM lark_messages WHERE message_id = ? OR event_id = ? ORDER BY id DESC LIMIT 1").get(messageId, eventId) as { id: number } | undefined;
-    if (row) {
-      if (!enqueueLarkCodexReply(row.id)) {
-        db.prepare("UPDATE lark_messages SET reply_status = 'skipped' WHERE id = ? AND codex_status = 'skipped' AND reply_status = 'pending'").run(row.id);
-      }
-    }
-  }
+  if (queuedId !== undefined) scheduleLarkCodexReply(queuedId);
 }
 
 export function ingestLarkEvent(event: Record<string, unknown>): { id: number | null; duplicate: boolean; responded: boolean } {
