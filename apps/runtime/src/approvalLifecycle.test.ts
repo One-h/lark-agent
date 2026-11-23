@@ -315,6 +315,57 @@ test("ordinary automatic turn approval continues without a registered plan or ma
   }
 });
 
+test("new input in the same native turn gets a fresh decision and makes its earlier approval card unusable", async () => {
+  const reviewed: number[] = [];
+  const f = await nativeFixture("query", async input => {
+    reviewed.push(input.messageId);
+    return { decision: input.messageId === 1 ? "approve_turn" : "manual", reason: "fixture" };
+  });
+  try {
+    const { store } = f.runtime;
+    store.setSetting("turnAutoApprovalEnabled", "true");
+    await until(() => fs.existsSync(f.tokens) && f.row().codex_turn_id === "turn-live");
+    const request = (id: string, command: string) => codexAppServer.request("fixture/query", { id, command });
+    const result = (id: string) => fs.existsSync(f.decisions) ? fs.readFileSync(f.decisions, "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)).find(item => item.id === id)?.decision : undefined;
+    const append = async (id: number, content: string) => {
+      const now = new Date().toISOString();
+      store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,content,message_type,mentioned,
+        reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
+        SELECT ?,?,chat_id,chat_type,sender_id,'user',?,'text',1,reply_trigger,'skipped','failed','{}',?,? FROM lark_messages WHERE id=1`)
+        .run(id, `om_followup_${id}`, content, now, now);
+      assert.equal(enqueueLarkCodexReply(id), true);
+      await until(() => {
+        const row = store.db.prepare("SELECT codex_turn_id,codex_task_dir FROM lark_messages WHERE id=?").get(id) as
+          { codex_turn_id?: string; codex_task_dir?: string };
+        if (row.codex_turn_id !== "turn-live" || !row.codex_task_dir) return false;
+        const file = path.join(row.codex_task_dir, "resume-session.json");
+        return fs.existsSync(file) && JSON.parse(fs.readFileSync(file, "utf8")).action === "turn/steer";
+      });
+    };
+    await request("query-first", "python3 query-fixture.py");
+    await until(() => result("query-first") === "accept");
+    await append(2, "改成 60:40 并导出表格");
+    await request("query-export", "python3 export-fixture.py output/plan.xlsx");
+    await until(() => f.cards.length === 1);
+    const oldCard = f.cards[0];
+    assert.match(oldCard.originalMessage!, /60:40/);
+    assert.equal(result("query-export"), undefined);
+    await append(3, "改成 65:35 并导出表格");
+    await request("query-revised", "python3 export-fixture.py output/revised.xlsx");
+    await until(() => f.cards.length === 2);
+    assert.match(f.cards[1].originalMessage!, /65:35/);
+    assert.equal((await f.decide(oldCard.approvalId, "approve-turn")).statusCode, 409);
+    await until(() => result("query-export") === "decline");
+    assert.equal(result("query-revised"), undefined);
+    assert.equal((await f.decide(f.cards[1].approvalId, "approve-turn")).statusCode, 200);
+    await until(() => result("query-revised") === "accept");
+    assert.deepEqual(reviewed, [1, 2, 3]);
+    await codexAppServer.request("fixture/end", { status: "completed" });
+    await until(() => f.row().codex_status === "answered");
+  } finally { await f.close(); }
+});
+
 test("first native operation opens one manual turn card without a registered plan or automatic review", async () => {
   const f = await nativeFixture("query", async () => assert.fail("automatic reviewer should be disabled"));
   try {

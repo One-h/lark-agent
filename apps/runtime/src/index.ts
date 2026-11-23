@@ -210,7 +210,8 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
-  const wholeTasks = new Map<string, { identity: string; limitedReadOnly: boolean; allows: ReturnType<typeof wholeTurnScope>;
+  const wholeTasks = new Map<string, { identity: string; messageId: number; senderId: string; approverId: string;
+    limitedReadOnly: boolean; allows: ReturnType<typeof wholeTurnScope>;
     decision: Promise<WholeTaskDecision> }>();
   const authorizations = new Set<{ turnId: string; messageId: number; controller: AbortController; started: boolean }>();
   const removeOwnerContextListener = onOwnerAssistContextChanged(messageId => {
@@ -319,6 +320,16 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     const approver = approverId;
     const identity = JSON.stringify([input.messageId, input.senderId, input.originalMessage, approver]);
     let state = wholeTasks.get(input.turnId);
+    if (state && state.identity !== identity) {
+      if (state.senderId !== input.senderId || state.approverId !== approver || input.messageId <= state.messageId
+        || !store.db.prepare(`SELECT 1 FROM lark_messages next JOIN lark_messages previous
+          ON next.chat_id=previous.chat_id AND next.codex_session_id=previous.codex_session_id
+          WHERE next.id=? AND previous.id=? AND next.codex_turn_id=? AND previous.codex_turn_id=?`)
+          .get(input.messageId, state.messageId, input.turnId, input.turnId)) {
+        throw new Error("本轮请求身份已变化，请在新一轮重新授权。");
+      }
+      state = undefined;
+    }
     if (!state) {
       const plan = currentApprovalPlan(store.db, input);
       const task = approvalTask(input.originalMessage, configuredTurnAutoApprovalDataSources(store.db));
@@ -326,7 +337,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       const allows = wholeTurnScope(input, plan, readOnlyTask);
       if (!allows(input)) throw new LarkApprovalError("blocked");
       const reviewed = { ...input, wholeTask: true };
-      const stillCurrent = () => store.db.open && approverId === approver
+      const stillCurrent = () => store.db.open && approverId === approver && wholeTasks.get(input.turnId)?.identity === identity
         && !options.signal.aborted && (options.stillCurrent?.() ?? true)
         && currentApprovalPlan(store.db, input) === plan;
       const automaticReviewEnabled = () => store.setting("turnAutoApprovalEnabled", "false") === "true";
@@ -343,12 +354,12 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
           options.signal, reviewed, () => {}, stillCurrent);
         return status === "approved" ? { approved: true, source: "manual" } : { approved: false, status };
       });
-      // All callers share the first decision, including a rejection or expiry.
+      // Calls for the same accepted input share its decision, including rejection or expiry.
       void decision.catch(() => {});
-      state = { identity, allows, decision, limitedReadOnly: input.readOnlyWholeTask === true };
+      state = { identity, messageId: input.messageId, senderId: input.senderId, approverId: approver,
+        allows, decision, limitedReadOnly: input.readOnlyWholeTask === true };
       wholeTasks.set(input.turnId, state);
     }
-    if (state.identity !== identity) throw new Error("本轮请求身份已变化，请在新一轮重新授权。");
     const result = await waitForTurnAuthorization(state.decision, options.signal);
     const validate = () => {
       options.assertActive();
