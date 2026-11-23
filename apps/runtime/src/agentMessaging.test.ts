@@ -108,3 +108,71 @@ test("disabled privacy restores direct group outreach without creating review pr
   assert.equal(result?.status,"open");assert.equal(result?.messageId,"om_sent_group");assert.equal(sent.length,1);assert.equal(proposals.length,0);
  }finally{await router.stop();}
 }));
+
+test("a Feishu task waits for one verified direct group reply, scoped to origin and recipient", async () => fixture(async ({ store, bridge }) => {
+  const transport: string[][] = [];
+  const target = { chatId: "oc_builders", recipientId: "ou_peer" };
+  const source = { threadId: a, chatId: "oc_source", senderId: "ou_requester" };
+  const sourceCwd = (await bridge.inspect(a)).cwd;
+  const router = new AgentMessaging(store, {
+    ownerId: () => "ou_owner", groupReviewRequired: () => false, bridge: {
+      async inspect() { throw new Error("group questions do not use Desktop"); },
+      async deliver() { assert.fail("group replies belong to the originating Feishu turn"); },
+    },
+    cli: async args => {
+      transport.push(args);
+      return { data: args[1] === "chats" ? { chat_mode: "group" } : { message_id: "om_question", chat_id: target.chatId } };
+    },
+  });
+  try {
+    const assertActive = () => {};
+    const sent = await router.askGroup({ source, sourceCwd, target, requestKey: "scoped_question", text: "数据同步恢复了吗？", assertActive });
+    const outgoing = transport[1];
+    assert.deepEqual(JSON.parse(outgoing[outgoing.indexOf("--content") + 1]).zh_cn.content[0][0], { tag: "at", user_id: target.recipientId });
+    const signal = new AbortController().signal;
+    await assert.rejects(router.readGroupReply(sent.requestId, { ...source, senderId: "ou_other" }, target, 0, signal, assertActive), /原会话/);
+    await assert.rejects(router.readGroupReply(sent.requestId, { ...source, threadId: b }, target, 0, signal, assertActive), /原会话/);
+    await assert.rejects(router.readGroupReply(sent.requestId, { ...source, chatId: "oc_other" }, target, 0, signal, assertActive), /原会话/);
+    assert.equal((await router.readGroupReply(sent.requestId, source, target, 0, signal, assertActive)).status, "open");
+
+    const event = { message_id: "om_answer", chat_id: target.chatId, chat_type: "group", sender_id: target.recipientId,
+      sender_type: "user", message_type: "text", content: JSON.stringify({ text: "同步已恢复" }), reply_to: sent.messageId };
+    assert.equal(router.ingestEvent(event), false, "injected event is not verified");
+    assert.equal(router.ingestEvent({ ...event, sender_id: "ou_other" }, true), false);
+    assert.equal(router.ingestEvent({ ...event, sender_type: "bot" }, true), false);
+    assert.equal(router.ingestEvent({ ...event, chat_id: "oc_other" }, true), false);
+    assert.equal(router.ingestEvent({ ...event, reply_to: undefined, root_id: sent.messageId }, true), false);
+    assert.equal(router.ingestEvent({ ...event, reply_to: "om_other" }, true), false);
+    const waiting = router.readGroupReply(sent.requestId, source, target, 2, signal, assertActive);
+    assert.equal(router.ingestEvent(event, true), true);
+    assert.equal(router.ingestEvent(event, true), true, "listener replay is idempotent");
+    assert.equal(router.ingestEvent({ ...event, message_id: "om_second" }, true), false, "first accepted reply closes the request");
+    await router.tick();
+    assert.deepEqual(router.claim(a), [], "legacy Desktop consumers cannot claim group question replies");
+    const response = await waiting;
+    assert.equal(response.status, "replied");
+    assert.deepEqual(response.reply, { trust: "third-party-message-data", text: "同步已恢复", messageId: "om_answer", sourceTime: "" });
+    const followUp = await router.readGroupReply(sent.requestId, source, target, 0, signal, assertActive);
+    assert.deepEqual(followUp, response, "origin can retrieve a late or previously received reply again");
+    assert.equal(router.snapshot().replies.length, 1);
+  } finally { await router.stop(); }
+}));
+
+test("failed or cancelled group preflight never dispatches a message", async () => fixture(async ({ store, bridge }) => {
+  let enabled = false;
+  const calls: string[][] = [];
+  const router = new AgentMessaging(store, { ownerId: () => "ou_owner", groupReviewRequired: () => enabled,
+    cli: async args => { calls.push(args); return { data: { chat_mode: "group" } }; } });
+  const sourceCwd = (await bridge.inspect(a)).cwd;
+  let active = true;
+  const input = { source: { threadId: a, chatId: "oc_source", senderId: "ou_requester" }, sourceCwd,
+    target: { chatId: "oc_builders", recipientId: "ou_peer" }, requestKey: "scoped_question", text: "测试",
+    assertActive: () => { if (!active) throw new Error("回合已结束"); active = false; } };
+  try {
+    await assert.rejects(router.askGroup(input), /回合已结束/);
+    enabled = true;
+    await assert.rejects(router.askGroup({ ...input, assertActive: () => {} }), /群隐私/);
+    assert.equal(calls.filter(args => args.includes("+messages-send")).length, 0);
+    assert.equal(router.snapshot().outreaches.length, 0);
+  } finally { await router.stop(); }
+}));

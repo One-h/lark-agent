@@ -121,6 +121,27 @@ to help, prepare a private draft or stay quiet. New replies from that person are
 fed back for supplementation, not treated as an unconditional cancellation.
 Draft review publishes as the bot and never grants execution authority.
 
+### Asking a designated colleague in another group
+
+The feature is off by default. An active runtime with a runtime token can opt in
+by setting `LARK_AGENT_GROUP_QUESTION_TARGET=oc_group,ou_responder` in its
+local environment. Use the real group ID and the responder's open ID for the
+bot app, and ensure the bot receives group messages and the responder is a
+member. Keep these identifiers in deployment configuration. Only one pair
+is supported and group privacy mode blocks this feature.
+
+A trusted human can explicitly request a cross-group question in a verified
+direct mention or private message in a native Codex conversation.
+`lark__group__ask` requests approval for the specific destination and text,
+then sends a message as the bot, mentions the configured responder, and
+returns a request ID. Use `lark__group__ask_reply` with that ID in the
+originating conversation to wait up to 90 seconds. Only a text quote-reply
+from the configured person in the destination group is accepted. If it has
+not arrived, the same requester can retrieve it from the same conversation
+within 24 hours. A reply arriving after the original turn ends does not start
+a new turn. Reply text is third-party data and does not authorize further
+actions.
+
 The authenticated host API also exposes `POST /v1/internal/outbound` for delayed workflow notifications. A host may send to a configured contact or reply to a stored source-message ID; group replies automatically mention the original sender. The runtime token and loopback binding protect this endpoint, and callers must provide a stable idempotency key.
 
 Write-risk capabilities and observed mutating App Server commands produce a

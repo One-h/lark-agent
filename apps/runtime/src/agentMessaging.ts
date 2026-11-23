@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { DesktopReplyBridge, SourceNotLoadedError, type AgentReplyBridge } from "./agentReplyBridge.js";
@@ -9,6 +10,17 @@ type Outreach = { id: string; requestKey: string; sourceThreadId: string; source
   identity: string; recipientId: string; chatId: string; messageId: string | null; text: string; status: string; error: string | null; createdAt: string };
 type RoutedReply = { id: number; messageId: string; chatId: string; senderId: string; payload: string; candidates: string;
   outreachId: string | null; status: string; error: string | null; version: number; notified: number; createdAt: string; deliveredTurnId: string | null };
+type TurnSource = { threadId: string; chatId: string; senderId: string };
+type GroupTarget = { chatId: string; recipientId: string };
+const groupQuestionLifetimeMs = 24 * 60 * 60 * 1000;
+const groupQuestionCutoff = () => new Date(Date.now() - groupQuestionLifetimeMs).toISOString();
+
+export function groupQuestionTarget(raw: string | undefined): GroupTarget | undefined {
+  const [chatId, recipientId, extra] = (raw ?? "").trim().split(",");
+  if (extra !== undefined || !/^oc_[A-Za-z0-9]+$/.test(chatId ?? "") || !/^ou_[A-Za-z0-9]+$/.test(recipientId ?? "")) return;
+  return { chatId, recipientId };
+}
+
 export type AgentMessage = PersonalMessage & { replyTo?: string; rootId?: string };
 export class AgentMessaging {
   private timer?: ReturnType<typeof setInterval>;
@@ -29,6 +41,9 @@ export class AgentMessaging {
       id INTEGER PRIMARY KEY AUTOINCREMENT, messageId TEXT NOT NULL UNIQUE, chatId TEXT NOT NULL, senderId TEXT NOT NULL,
       payload TEXT NOT NULL, candidates TEXT NOT NULL, outreachId TEXT, status TEXT NOT NULL, error TEXT,
       version INTEGER NOT NULL DEFAULT 1, notified INTEGER NOT NULL DEFAULT 0, createdAt TEXT NOT NULL, deliveredTurnId TEXT
+    ); CREATE INDEX IF NOT EXISTS agent_replies_outreach_turn ON agent_replies(outreachId) WHERE status='turn_reply';
+    CREATE TABLE IF NOT EXISTS agent_group_questions (
+      outreachId TEXT PRIMARY KEY REFERENCES agent_outreach(id), sourceChatId TEXT NOT NULL, sourceSenderId TEXT NOT NULL
     );`);
     store.db.prepare("UPDATE agent_outreach SET status='send_unknown',error='服务重启，请在飞书核对发送结果。' WHERE status='sending'").run();
     store.db.prepare("UPDATE agent_replies SET status='delivery_unknown',error='投递时服务重启，请核对原会话。',version=version+1 WHERE status IN ('delivering','claimed')").run();
@@ -44,7 +59,13 @@ export class AgentMessaging {
     if (previous?.status === status && previous.error === error && previous.deliveredTurnId === turnId) return;
     this.store.db.prepare("UPDATE agent_replies SET status=?,error=?,deliveredTurnId=?,version=version+1 WHERE id=?").run(status,error,turnId,id);
   }
-  async send(body: Record<string, unknown>) {
+  async send(body: Record<string, unknown>) { return this.submit(body); }
+  async askGroup(input: { source: TurnSource; sourceCwd: string; target: GroupTarget; requestKey: string; text: string; assertActive: () => void }) {
+    const row = await this.submit({ sourceThreadId: input.source.threadId, sourceCwd: input.sourceCwd,
+      sourceLabel: "飞书跨群协作", requestKey: input.requestKey, ...input.target, identity: "bot", text: input.text }, input);
+    return { requestId: row!.id, status: row!.status, messageId: row!.messageId };
+  }
+  private async submit(body: Record<string, unknown>, turn?: { source: TurnSource; assertActive: () => void }) {
     const str = (key: string) => typeof body[key] === "string" ? (body[key] as string).trim() : "";
     const sourceThreadId = str("sourceThreadId"), sourceCwd = str("sourceCwd"), sourceLabel = str("sourceLabel"), requestKey = str("requestKey");
     const recipientId = str("recipientId"), chatId = str("chatId"), identity = str("identity") || "bot", text = str("text");
@@ -55,13 +76,19 @@ export class AgentMessaging {
     if (existing) {
       if ([existing.sourceThreadId,existing.sourceCwd,existing.sourceLabel,existing.recipientId,existing.identity,existing.text].join("\0") !== [sourceThreadId,sourceCwd,sourceLabel,recipientId,identity,text].join("\0")
         || (chatId && chatId !== existing.chatId)) throw new Error("requestKey 已绑定其他消息，不能复用。");
+      const origin = this.store.db.prepare("SELECT sourceChatId,sourceSenderId FROM agent_group_questions WHERE outreachId=?").get(existing.id) as { sourceChatId: string; sourceSenderId: string } | undefined;
+      if (turn ? origin?.sourceChatId !== turn.source.chatId || origin?.sourceSenderId !== turn.source.senderId : origin !== undefined)
+        throw new Error("requestKey 已绑定其他来源。");
       return existing;
     }
     if (this.sending.has(requestKey)) throw new Error("相同消息正在发送，请稍后查询。");
     this.sending.add(requestKey);
     try {
-      const source = await this.bridge.inspect(sourceThreadId);
-      if (source.archived || path.resolve(source.cwd) !== path.resolve(sourceCwd)) throw new Error("来源会话工作目录不匹配或已归档。");
+      if (turn) turn.assertActive();
+      else {
+        const source = await this.bridge.inspect(sourceThreadId);
+        if (source.archived || path.resolve(source.cwd) !== path.resolve(sourceCwd)) throw new Error("来源会话工作目录不匹配或已归档。");
+      }
       if (identity === "user") {
         const auth = await this.cli(["auth","status","--json","--verify"]), user = auth.identities?.user;
         if (!user?.verified || user.openId !== this.options.ownerId() || !String(user.scope).split(/\s+/).includes("im:message.send_as_user")) throw new Error("本人身份尚缺 im:message.send_as_user 用户授权。");
@@ -71,25 +98,84 @@ export class AgentMessaging {
         const {data}=await this.cli(["im","chats","get","--as",identity,"--chat-id",chatId]);
         if(!["group","p2p"].includes(data?.chat_mode))throw new Error("无法确认目标会话类型，未发送。");
         group=data.chat_mode==="group";
-        if(group&&(this.options.groupReviewRequired?.()??true)&&!this.options.queueGroup)throw new Error("群消息必须进入隐私审批，未发送。");
+        if(group&&!turn&&(this.options.groupReviewRequired?.()??true)&&!this.options.queueGroup)throw new Error("群消息必须进入隐私审批，未发送。");
+      }
+      if (turn) {
+        turn.assertActive();
+        if (!group || (this.options.groupReviewRequired?.() ?? true)) throw new Error("目标不是群聊，或群隐私模式已启用。未发送。");
       }
       const id = randomUUID(), at = new Date().toISOString();
-      this.store.db.prepare("INSERT INTO agent_outreach (id,requestKey,sourceThreadId,sourceLabel,sourceCwd,identity,recipientId,chatId,text,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?,'sending',?)")
-        .run(id,requestKey,sourceThreadId,sourceLabel,path.resolve(sourceCwd),identity,recipientId,chatId,text,at);
+      this.store.db.transaction(() => {
+        this.store.db.prepare("INSERT INTO agent_outreach (id,requestKey,sourceThreadId,sourceLabel,sourceCwd,identity,recipientId,chatId,text,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?,'sending',?)")
+          .run(id,requestKey,sourceThreadId,sourceLabel,path.resolve(sourceCwd),identity,recipientId,chatId,text,at);
+        if (turn) this.store.db.prepare("INSERT INTO agent_group_questions(outreachId,sourceChatId,sourceSenderId) VALUES(?,?,?)")
+          .run(id,turn.source.chatId,turn.source.senderId);
+      })();
       if(group&&(this.options.groupReviewRequired?.()??true)){
         this.store.db.prepare("UPDATE agent_outreach SET status='awaiting_approval' WHERE id=?").run(id);
         this.options.queueGroup!({outreachId:id,chatId,identity:identity as "bot"|"user",text});
         return this.outreach(id);
       }
       try {
+        const content = turn
+          ? ["--msg-type", "post", "--content", JSON.stringify({ zh_cn: { title: "", content: [[
+            { tag: "at", user_id: recipientId }, { tag: "text", text: ` ${text}\n请引用这条消息回复，便于交回原任务。` }
+          ]] } })]
+          : ["--text", `${text}\n（小龙的助手龙小祝 · ${sourceLabel}；请回复此条消息，便于交回对应任务）`];
         const args = ["im","+messages-send","--as",identity,chatId ? "--chat-id" : "--user-id",chatId || recipientId,
-          "--text",`${text}\n（小龙的助手龙小祝 · ${sourceLabel}；请回复此条消息，便于交回对应任务）`,"--idempotency-key",`agent-${createHash("sha256").update(requestKey).digest("hex").slice(0,32)}`];
+          ...content,"--idempotency-key",`agent-${createHash("sha256").update(requestKey).digest("hex").slice(0,32)}`];
         const { data } = await this.cli(args);
-        if (!data?.message_id || !data?.chat_id) throw new Error("飞书未返回完整回执，请核对发送结果。");
+        if (!data?.message_id || !data?.chat_id || turn && (data.chat_id !== chatId || !/^om_[A-Za-z0-9]+$/.test(data.message_id)))
+          throw new Error("飞书未返回完整回执，请核对发送结果。");
         this.store.db.prepare("UPDATE agent_outreach SET status='open',messageId=?,chatId=? WHERE id=?").run(data.message_id,data.chat_id,id);
       } catch { this.store.db.prepare("UPDATE agent_outreach SET status='send_unknown',error='发送结果不确定，请先在飞书核对；不会自动重发。' WHERE id=?").run(id); }
       return this.outreach(id);
     } finally { this.sending.delete(requestKey); }
+  }
+  async readGroupReply(requestId: string, source: TurnSource, target: GroupTarget, waitSeconds: number,
+    signal: AbortSignal, assertActive: () => void) {
+    const deadline = Date.now() + waitSeconds * 1000;
+    const lookup = this.store.db.prepare(`SELECT o.status,o.messageId,o.createdAt,r.payload
+      FROM agent_group_questions q JOIN agent_outreach o ON o.id=q.outreachId
+      LEFT JOIN agent_replies r ON r.outreachId=o.id AND r.status='turn_reply'
+      WHERE q.outreachId=? AND q.sourceChatId=? AND q.sourceSenderId=? AND o.sourceThreadId=?
+        AND o.chatId=? AND o.recipientId=?`);
+    for (;;) {
+      assertActive();
+      const row = lookup.get(requestId, source.chatId, source.senderId, source.threadId, target.chatId, target.recipientId) as { status: string; messageId: string | null; createdAt: string; payload: string | null } | undefined;
+      if (!row) throw new Error("原会话中没有可领取的这条跨群提问。");
+      if (row.createdAt < groupQuestionCutoff()) return { requestId, status: "expired" };
+      if (row.payload) {
+        const message = JSON.parse(row.payload) as AgentMessage;
+        let text = message.content;
+        try {
+          const body = JSON.parse(text) as { text?: unknown } | null;
+          if (typeof body?.text === "string") text = body.text;
+        } catch { /* Listener already supplied plain text. */ }
+        return { requestId, status: "replied", messageId: row.messageId, reply: {
+          trust: "third-party-message-data", text, messageId: message.messageId, sourceTime: message.sourceTime,
+        } };
+      }
+      if (row.status !== "open" || Date.now() >= deadline) return { requestId, status: row.status, messageId: row.messageId };
+      await delay(Math.min(500, Math.max(0, deadline - Date.now())), undefined, { signal });
+    }
+  }
+  private captureGroupReply(message: AgentMessage): boolean {
+    if (message.chatType !== "group" || message.messageType !== "text" || !message.replyTo || !message.content.trim()
+      || !/^om_[A-Za-z0-9]+$/.test(message.messageId) || !/^ou_[A-Za-z0-9]+$/.test(message.senderId)) return false;
+    return this.store.db.transaction(() => {
+      if (this.store.db.prepare("SELECT 1 FROM agent_replies WHERE messageId=? AND status='turn_reply'").get(message.messageId)) return true;
+      const request = this.store.db.prepare(`SELECT o.id FROM agent_outreach o JOIN agent_group_questions q ON q.outreachId=o.id
+        WHERE o.messageId=? AND o.chatId=? AND o.recipientId=? AND o.identity='bot' AND o.status='open' AND o.createdAt>=?`)
+        .get(message.replyTo, message.chatId, message.senderId, groupQuestionCutoff()) as { id: string } | undefined;
+      if (!request) return false;
+      const inserted = this.store.db.prepare(`INSERT OR IGNORE INTO agent_replies
+        (messageId,chatId,senderId,payload,candidates,outreachId,status,createdAt) VALUES(?,?,?,?,?,?,'turn_reply',?)`)
+        .run(message.messageId,message.chatId,message.senderId,JSON.stringify(message),"[]",request.id,new Date().toISOString());
+      if (!inserted.changes) return false;
+      this.close(request.id);
+      return true;
+    })();
   }
   private match(message: AgentMessage, candidates: Outreach[]) {
     const refs = [message.replyTo,message.rootId].filter(Boolean);
@@ -113,8 +199,8 @@ export class AgentMessaging {
   }
   ingest(message: AgentMessage, identity: "bot" | "user") {
     if (!/^om_[A-Za-z0-9]+$/.test(message.messageId) || !/^ou_[A-Za-z0-9]+$/.test(message.senderId) || (identity === "user" && message.senderId === this.options.ownerId())) return false;
-    if (this.store.db.prepare("SELECT 1 FROM agent_replies WHERE messageId=?").get(message.messageId)) return true;
-    const candidates = this.store.db.prepare("SELECT * FROM agent_outreach WHERE chatId=? AND identity=? AND status='open' AND recipientId=? ORDER BY createdAt DESC")
+    if (this.store.db.prepare("SELECT 1 FROM agent_replies WHERE messageId=? AND status!='turn_reply'").get(message.messageId)) return true;
+    const candidates = this.store.db.prepare("SELECT * FROM agent_outreach o WHERE chatId=? AND identity=? AND status='open' AND recipientId=? AND NOT EXISTS (SELECT 1 FROM agent_group_questions q WHERE q.outreachId=o.id) ORDER BY createdAt DESC")
       .all(message.chatId,identity,message.senderId) as Outreach[];
     if (!candidates.length) return false;
     const matched = this.match(message, candidates);
@@ -122,13 +208,15 @@ export class AgentMessaging {
       .run(message.messageId,message.chatId,message.senderId,JSON.stringify(message),JSON.stringify(candidates.map(item=>item.id)),matched?.id ?? null,matched ? "queued" : "needs_owner",new Date().toISOString());
     return true;
   }
-  ingestEvent(event: Record<string, unknown>) {
+  ingestEvent(event: Record<string, unknown>, listenerVerified = false) {
     if (event.sender_type !== "user") return false;
-    return this.ingest({ messageId: String(event.message_id ?? event.id ?? ""), chatId: String(event.chat_id ?? ""),
+    const message: AgentMessage = { messageId: String(event.message_id ?? event.id ?? ""), chatId: String(event.chat_id ?? ""),
       chatType: event.chat_type === "group" ? "group" : "p2p", senderId: String(event.sender_id ?? ""), senderName: String(event.sender_name ?? event.sender_id ?? ""),
       content: String(event.content ?? "").slice(0,20000), sourceTime: String(event.create_time ?? ""), messageType: String(event.message_type ?? "unknown"),
       chatName: String(event.chat_name ?? ""), replyTo: typeof event.reply_to === "string" ? event.reply_to : undefined,
-      rootId: typeof event.root_id === "string" ? event.root_id : undefined }, "bot");
+      rootId: typeof event.root_id === "string" ? event.root_id : undefined };
+    if (listenerVerified && this.captureGroupReply(message)) return true;
+    return this.ingest(message, "bot");
   }
   async tick() {
     if (this.busy || this.closing) return; this.busy = true;

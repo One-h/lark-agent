@@ -9,6 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { config, enqueueLarkCodexReply, larkCodexSessionKeyForMessage, retryPendingLarkMediaReplies, retryPendingLarkTextReplies, saveConversationPersona, updateConversationExecutionSettings, uploadLarkStickers, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { codexAppServer, larkAgentToolsMcpServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime } from "./index.js";
+import { buildLarkExecutionApprovalCard } from "@lark-agent/adapter-lark-cli";
 
 async function waitFor<T>(check: () => T | undefined | false): Promise<T> {
   const deadline = Date.now() + 10_000;
@@ -33,7 +34,7 @@ test("resumed Codex thread discovers host tools over real MCP stdio without dyna
 import readline from "node:readline";import fs from "node:fs";
 const send=x=>console.log(JSON.stringify(x));
 const reply=(id,result)=>send({id,result});
-const meta={threadId:"old-thread",turnId:"fixture-turn"};
+const meta={threadId:"00000000-0000-4000-8000-000000000017",turnId:"fixture-turn"};
 let turns=0,active=false;
 readline.createInterface({input:process.stdin}).on("line",line=>{
  const m=JSON.parse(line);
@@ -65,15 +66,23 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   const cli = path.join(root, "lark-cli");
   fs.writeFileSync(cli, "#!/bin/sh\nprintf '%s\\n' '{\"data\":{\"message_id\":\"om_fixture\"}}'\n", { mode: 0o755 });
   const oldExecutable = process.env.CODEX_EXECUTABLE, oldPath = process.env.PATH;
+  const oldQuestionTarget = process.env.LARK_AGENT_GROUP_QUESTION_TARGET;
+  process.env.LARK_AGENT_GROUP_QUESTION_TARGET = "oc_builders,ou_responder";
   process.env.CODEX_EXECUTABLE = executable; process.env.PATH = `${root}:${oldPath ?? ""}`;
   const host = Fastify();
-  let writes = 0, sends = 0, groupCreates = 0;
+  let writes = 0, sends = 0, groupCreates = 0, questionsSent = 0;
   host.post("/api/lark-agent/capabilities/forge.deploy.inspect", async () => ({ found: true, _receipt: { internal: "not forwarded" } }));
   host.post("/api/lark-agent/capabilities/forge.deploy.production", async () => ({ applied: ++writes }));
   const hostUrl = await host.listen({ host: "127.0.0.1", port: 0 });
-  const cards: Array<{ approvalId: number; taskPlan?: string }> = [];
+  const cards: Array<{ approvalId: number; taskPlan?: string; operationPreview?: string }> = [];
   const app = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: ["ou_owner"],
     runtimeToken: "fixture-host-token", approverId: "ou_owner", hostBaseUrl: hostUrl,
+    groupQuestionCli: async args => {
+      if (args[1] === "chats") return { data: { chat_mode: "group" } };
+      assert.equal(args[args.indexOf("--chat-id") + 1], "oc_builders");
+      questionsSent++;
+      return { data: { message_id: "om_question", chat_id: "oc_builders" } };
+    },
     managedChatCreator: async input => { assert.equal(input.ownerId, "ou_owner"); groupCreates++; return { chatId: "oc_newgroup", ownerConfirmed: true }; },
     approvalCardSender: (_id, card) => { cards.push(card); return { ok: true, messageId: "om_fixture_card" }; },
     approvalCardUpdater: () => {}, textReplySender: () => ({ ok: true, messageId: "om_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" }),
@@ -91,7 +100,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal((await app.app.inject({ method: "POST", url: "/v1/capabilities/register", headers: auth,
       payload: { capabilities: catalog } })).statusCode, 200);
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_status", "lark__message__send", "lark__chat__create", "lark__chat__list_managed",
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["lark_approval_status", "lark__message__send", "lark__chat__create", "lark__chat__list_managed", "lark__group__ask", "lark__group__ask_reply",
       ...capableIds.map(id => id.replaceAll(".", "__"))].sort());
     const inspectTool = tools.find(t => t.name === "forge__deploy__inspect");
     assert.deepEqual(inspectTool?.inputSchema.properties?.input, catalog[0].inputSchema);
@@ -99,7 +108,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     assert.equal(tools.find(t => t.name === "lark_approval_status")?.annotations?.readOnlyHint, true);
     assert.equal(tools.find(t => t.name === "forge__deploy__production")?.annotations?.readOnlyHint, false);
     const now = new Date().toISOString(), source = { chat_id: "oc_fixture", chat_type: "p2p" };
-    app.store.db.prepare("INSERT INTO lark_codex_sessions (session_key,chat_id,trust_scope,codex_session_id,created_at,updated_at) VALUES (?,?,'untrusted','old-thread',?,?)")
+    app.store.db.prepare("INSERT INTO lark_codex_sessions (session_key,chat_id,trust_scope,codex_session_id,created_at,updated_at) VALUES (?,?,'untrusted','00000000-0000-4000-8000-000000000017',?,?)")
       .run(larkCodexSessionKeyForMessage(source, false), source.chat_id, now, now);
     app.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
       VALUES(1,'om_fixture','oc_fixture','p2p','ou_requester','user','text','Deploy the fixture service',1,'p2p','skipped','failed','{}',?,?)`).run(now, now);
@@ -111,6 +120,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const context_token = fs.readFileSync(path.join(row().codex_task_dir, "prompt.md"), "utf8").match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     assert(context_token);
     const call = (name: string, input: unknown, token = context_token) => client.callTool({ name, arguments: { context_token: token, input } });
+    assert.equal((await call("lark__group__ask", { text: "Untrusted session" })).isError, true);
+    assert.equal(questionsSent, 0);
     const groupInput = { requestId: "767dfbee-0ffd-4b61-8599-4d559e8686be", name: "Example group",
       execution: { engineId: "codex", model: null } };
     assert.equal((await call("lark__chat__create", groupInput)).isError, true);
@@ -128,7 +139,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     const confirmations = () => fs.existsSync(response)
       ? fs.readFileSync(response, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     const confirm = (id: string, params: Record<string, unknown> = {}) => codexAppServer.request("fixture/confirm", {
-      id, params: { threadId: "old-thread", turnId: "fixture-turn", serverName: "lark_tools", mode: "form",
+      id, params: { threadId: "00000000-0000-4000-8000-000000000017", turnId: "fixture-turn", serverName: "lark_tools", mode: "form",
         requestedSchema: { type: "object", properties: {} },
         _meta: { codex_approval_kind: "mcp_tool_call", tool_name: "forge__deploy__production", tool_params: { context_token, input } }, ...params }
     });
@@ -173,7 +184,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     app.store.setSetting("ownerMessageFastPathEnabled", "true");
     app.store.setSetting("ownerMessageFastPathOwnerId", "ou_owner");
     app.store.db.prepare("INSERT INTO contacts (open_id,name,updated_at) VALUES (?,?,?)").run("ou_contact", "Example", now);
-    app.store.db.prepare("INSERT INTO lark_codex_sessions (session_key,chat_id,trust_scope,codex_session_id,created_at,updated_at) VALUES (?,?,'trusted','old-thread',?,?)")
+    app.store.db.prepare("INSERT INTO lark_codex_sessions (session_key,chat_id,trust_scope,codex_session_id,created_at,updated_at) VALUES (?,?,'trusted','00000000-0000-4000-8000-000000000017',?,?)")
       .run(larkCodexSessionKeyForMessage(source, true), source.chat_id, now, now);
     const ownerId = Number(app.store.db.prepare(`INSERT INTO lark_messages(message_id,chat_id,chat_type,sender_id,sender_type,message_type,content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
       VALUES('om_owner','oc_fixture','p2p','ou_owner','user','text','跟Example说：hello',1,'p2p','skipped','failed','{}',?,?)`).run(now, now).lastInsertRowid);
@@ -206,6 +217,31 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
       _meta: { codex_approval_kind: "mcp_tool_call", tool_name: "lark__message__send", tool_params: { context_token: ownerToken, input: message } } });
     assert.deepEqual((await waitFor(() => confirmations().find(r => r.id === "confirm-owner"))).result, { action: "accept", content: {} });
     assert.equal(cards.length, 2);
+    const groupQuestion = { text: "What is the warehouse status?" };
+    assert.equal((await call("lark__group__ask", { ...groupQuestion, chatId: "oc_other" }, ownerToken)).isError, true);
+    const asked = call("lark__group__ask", groupQuestion, ownerToken);
+    const groupCard = await waitFor(() => cards[2]);
+    assert.equal(questionsSent, 0);
+    const cardJson = JSON.stringify(buildLarkExecutionApprovalCard({
+      ...groupCard, requester: "Fixture", operation: "", originalMessage: "", cwd: root, reason: null, allowPlanApproval: false
+    }));
+    assert.match(cardJson, /oc_builders.*ou_responder.*What is the warehouse status\?/);
+    assert.equal((await app.app.inject({ method: "POST", url: `/v1/approvals/${groupCard.approvalId}/approve-turn`, headers: auth })).statusCode, 409);
+    assert.equal(questionsSent, 0);
+    assert.equal((await app.app.inject({ method: "POST", url: `/v1/approvals/${groupCard.approvalId}/approve`, headers: auth })).statusCode, 200);
+    const sent = await asked;
+    assert.notEqual(sent.isError, true, JSON.stringify(sent.content));
+    assert.equal(questionsSent, 1);
+    assert(Array.isArray(sent.content) && sent.content[0]?.type === "text");
+    const { requestId } = JSON.parse(sent.content[0].text);
+    assert.match(JSON.stringify((await call("lark__group__ask_reply", { requestId, waitSeconds: 0 }, ownerToken)).content), /open/);
+    await app.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      message_id: "om_fake_answer", chat_id: "oc_builders", chat_type: "group", sender_id: "ou_responder",
+      sender_type: "user", message_type: "text", reply_to: "om_question", content: "unverified reply"
+    } });
+    assert.match(JSON.stringify((await call("lark__group__ask_reply", { requestId, waitSeconds: 0 }, ownerToken)).content), /open/);
+    assert.notEqual((await call("lark__group__ask", groupQuestion, ownerToken)).isError, true);
+    assert.equal(questionsSent, 1);
     app.store.setSetting("trustedExecutionEnabled", "false");
     const revoked = await call("lark__message__send", message, ownerToken);
     assert.equal(revoked.isError, true);
@@ -218,6 +254,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
     await client.close(); await app.app.close(); app.stop(); await host.close();
     if (oldExecutable === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = oldExecutable;
     process.env.PATH = oldPath;
+    if (oldQuestionTarget === undefined) delete process.env.LARK_AGENT_GROUP_QUESTION_TARGET;
+    else process.env.LARK_AGENT_GROUP_QUESTION_TARGET = oldQuestionTarget;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

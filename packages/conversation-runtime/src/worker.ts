@@ -28,8 +28,8 @@ const listeners = {} as Record<ListenerKind, ListenerState>;
 let intentionallyStopped = false;
 let currentBotOpenId: string | undefined;
 let botOpenIdRetryAfterMs = 0;
-let externalMessageHandler: ((event: LarkEvent) => boolean) | null = null;
-export function setExternalMessageHandler(handler: ((event: LarkEvent) => boolean) | null) { externalMessageHandler = handler; }
+let externalMessageHandler: ((event: LarkEvent, fromListener: boolean) => boolean) | null = null;
+export function setExternalMessageHandler(handler: ((event: LarkEvent, fromListener: boolean) => boolean) | null) { externalMessageHandler = handler; }
 
 let additionalApprovalHandler: ((event: LarkEvent) => boolean) | null = null;
 const botOpenIdRetryDelayMs = 5_000;
@@ -304,7 +304,8 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
   const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
     ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
     : resolveReplyContext(messageId, stringValue(event.reply_to));
-  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation }) ?? false;
+  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation },
+    fromListener) ?? false;
   const shouldRespond = !externallyRouted && !topicCommand && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
   const replyTrigger = topicCommand ? "topic_command" : ownerMentioned ? "owner_mention" : topicContinuation ? "topic" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));

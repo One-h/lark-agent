@@ -212,6 +212,7 @@ export type LarkExecutionApprovalDetails = {
   operationCount?: number;
   operationIntents?: readonly (string | null)[];
   operationSummary?: string;
+  operationPreview?: string;
   cwd: string | null;
   reason: string | null;
   taskContext?: string;
@@ -250,6 +251,7 @@ function approvalCardDetails(input: LarkExecutionApprovalDetails): string[] {
     ...(count > 1 ? intents.slice(0, 3).map((intent, index) => `${index + 1}. ${compactCardText(intent?.trim() || missing, 100)}`) : []),
     count > 3 ? `其余 ${count - 3} 项请在本地审批记录核对。` : null,
     input.operationSummary ? `操作范围：${compactCardText(input.operationSummary, 220)}` : null,
+    input.operationPreview ?? null,
     `请求人：${compactCardText(input.requester, 80)}`,
     `原始消息：${compactCardText(input.originalMessage, 180)}`,
     input.taskContext ? `任务背景（历史）：${compactCardText(input.taskContext, 140)}` : null,
