@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { lstatSync, realpathSync } from "node:fs";
+import path from "node:path";
+import WebSocket from "ws";
 import { resolveCodexExecutable } from "./executable.js";
 import { serializeCodexAppServerMessage } from "./unicode.js";
 
@@ -61,6 +64,8 @@ export function codexAppServerArgs(extraConfig: string[] = []): string[] {
 
 export class CodexAppServerClient {
   private process: ChildProcessWithoutNullStreams | null = null;
+  private socket: WebSocket | null = null;
+  private initialized = false;
   private startPromise: Promise<void> | null = null;
   private stdoutBuffer = "";
   private stderrBuffer = "";
@@ -75,12 +80,12 @@ export class CodexAppServerClient {
 
   constructor(
     private readonly cwd: () => string,
-    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv } = {}
+    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv; socketPath?: string } = {}
   ) {}
 
   status(): { running: boolean; pid: number | null; lastError: string | null } {
     return {
-      running: Boolean(this.process && !this.process.killed),
+      running: this.initialized && Boolean(this.socket?.readyState === WebSocket.OPEN || this.process && !this.process.killed),
       pid: this.process?.pid ?? null,
       lastError: this.lastError
     };
@@ -120,25 +125,24 @@ export class CodexAppServerClient {
   }
 
   async requestIfRunning<T>(method: string, params: unknown, timeoutMs = 30_000): Promise<T | null> {
-    if (!this.process || this.process.killed) {
+    if (!this.status().running) {
       return null;
     }
     return this.requestStarted<T>(method, params, timeoutMs);
   }
 
   async start(): Promise<void> {
-    if (this.process && !this.process.killed) {
-      return;
-    }
     if (this.startPromise) {
       return this.startPromise;
     }
+    if (this.status().running) return;
 
-    this.startPromise = this.startProcess();
+    this.startPromise = this.startTransport();
     try {
       await this.startPromise;
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
+      this.stop();
       throw error;
     } finally {
       this.startPromise = null;
@@ -147,6 +151,10 @@ export class CodexAppServerClient {
 
   stop(): void {
     this.stopping = true;
+    this.initialized = false;
+    const socket = this.socket;
+    this.socket = null;
+    socket?.terminate();
     const child = this.process;
     this.process = null;
     if (child && !child.killed) {
@@ -155,27 +163,13 @@ export class CodexAppServerClient {
     this.rejectPending(new Error("Codex app-server stopped"));
   }
 
-  private async startProcess(): Promise<void> {
+  private async startTransport(): Promise<void> {
     this.stopping = false;
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
     this.lastError = null;
-    const child = spawn(resolveCodexExecutable(), codexAppServerArgs(this.launch.config?.() ?? []), {
-      cwd: this.cwd(),
-      env: this.launch.env?.() ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    this.process = child;
-
-    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => this.handleStderr(chunk.toString()));
-    child.on("error", (error) => this.handleExit(child, error));
-    child.on("close", (code, signal) => {
-      this.flushStderrBuffer();
-      const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-      this.handleExit(child, new Error(`Codex app-server exited with ${detail}`));
-    });
-
+    if (this.launch.socketPath) await this.connectSocket(this.launch.socketPath);
+    else this.spawnProcess();
     await this.requestStarted("initialize", {
       clientInfo: {
         name: "lark_agent",
@@ -187,6 +181,68 @@ export class CodexAppServerClient {
       }
     });
     this.write({ method: "initialized", params: {} });
+    this.initialized = true;
+  }
+
+  private spawnProcess(): void {
+    const child = spawn(resolveCodexExecutable(), codexAppServerArgs(this.launch.config?.() ?? []), {
+      cwd: this.cwd(),
+      env: this.launch.env?.() ?? process.env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    this.process = child;
+
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      if (this.process === child) this.handleStdout(chunk);
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      if (this.process === child) this.handleStderr(chunk);
+    });
+    child.on("error", (error) => this.handleExit(child, error));
+    child.on("close", (code, signal) => {
+      if (this.process === child) this.flushStderrBuffer();
+      const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+      this.handleExit(child, new Error(`Codex app-server exited with ${detail}`));
+    });
+
+  }
+
+  private async connectSocket(socketPath: string): Promise<void> {
+    if (!path.isAbsolute(socketPath) || /[:?#%]/.test(socketPath)) throw new Error("Invalid Codex App Server socket path");
+    const uid = process.getuid?.();
+    const privateDirectory = (candidate: string) => {
+      const directory = lstatSync(candidate);
+      return uid !== undefined && directory.isDirectory() && directory.uid === uid && (directory.mode & 0o077) === 0;
+    };
+    const target = realpathSync(socketPath);
+    const endpoint = lstatSync(target);
+    // Codex can use an alias to keep the actual Unix socket path short.
+    if (!privateDirectory(path.dirname(socketPath)) || lstatSync(socketPath).uid !== uid
+      || /[:?#%]/.test(target) || !privateDirectory(path.dirname(target)) || !endpoint.isSocket() || endpoint.uid !== uid) {
+      throw new Error("Codex App Server socket must be in a private user-owned directory");
+    }
+    const socket = new WebSocket(`ws+unix://${target}:/`, { handshakeTimeout: 5_000, maxPayload: 32 * 1024 * 1024 });
+    this.socket = socket;
+    const disconnect = (error: Error) => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      this.handleDisconnect(error);
+    };
+    socket.on("error", disconnect);
+    socket.on("close", () => disconnect(new Error("Codex App Server socket closed")));
+    socket.on("message", (data, binary) => {
+      if (this.socket !== socket) return;
+      if (binary) {
+        socket.terminate();
+        return;
+      }
+      this.handleJson(data.toString());
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+      socket.once("close", () => reject(new Error("Codex App Server socket closed before initialization")));
+    });
   }
 
   private requestStarted<T>(method: string, params: unknown, timeoutMs = 30_000): Promise<T> {
@@ -217,6 +273,10 @@ export class CodexAppServerClient {
   }
 
   private write(message: unknown): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(serializeCodexAppServerMessage(message));
+      return;
+    }
     const child = this.process;
     if (!child || child.killed || !child.stdin.writable) {
       throw new Error("Codex app-server is not running");
@@ -233,11 +293,15 @@ export class CodexAppServerClient {
       if (!trimmed) {
         continue;
       }
-      try {
-        this.handleMessage(JSON.parse(trimmed) as RpcResponse | CodexAppServerRequest | CodexAppServerNotification);
-      } catch (error) {
-        this.lastError = `Invalid Codex app-server JSON: ${error instanceof Error ? error.message : String(error)}`;
-      }
+      this.handleJson(trimmed);
+    }
+  }
+
+  private handleJson(json: string): void {
+    try {
+      this.handleMessage(JSON.parse(json) as RpcResponse | CodexAppServerRequest | CodexAppServerNotification);
+    } catch (error) {
+      this.lastError = `Invalid Codex app-server JSON: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
@@ -302,6 +366,11 @@ export class CodexAppServerClient {
       return;
     }
     this.process = null;
+    this.handleDisconnect(error);
+  }
+
+  private handleDisconnect(error: Error): void {
+    this.initialized = false;
     this.lastError = error.message;
     this.rejectPending(error);
     if (!this.stopping) {
