@@ -14,7 +14,8 @@ import { sanitizeLarkReply } from "./replySanitization.js";
 import { hasLarkManualTurnApproval, LarkApprovalError, notifyLarkTurnEnded } from "./approvalLifecycle.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { postHostJson } from "./hostHttp.js";
-import { finishLarkProgressCard, queueLarkProgressUpdate, rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
+import { rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
+import { publishLarkTurnObservation } from "./turnObservations.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -2254,8 +2255,9 @@ function finishRun(
     reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
   }
   updateRunMembers(run, finalStatus, finalError);
-  finishLarkProgressCard(run.progressId, !sendReply ? "interrupted" : finalStatus === "failed"
-    ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed");
+  publishLarkTurnObservation(db, { kind: "turn.finished", runId: run.progressId, turnId: run.turnId,
+    threadId: run.threadId, sourceMessageId: target.row.id, outcome: !sendReply ? "interrupted" : finalStatus === "failed"
+      ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed" });
   if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
   if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0 && ownerAssistPublicAllowed(target.row.id)) {
     queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
@@ -2501,8 +2503,8 @@ function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
     run.pendingInterim = null;
     return;
   }
-  queueLarkProgressUpdate({ progressId: run.progressId, turnId: run.turnId, threadId: run.threadId,
-    source: target.row, eventId: candidate.id, text: reply });
+  publishLarkTurnObservation(db, { kind: "turn.progress", runId: run.progressId, turnId: run.turnId, threadId: run.threadId,
+    sourceMessageId: target.row.id, progressKey: candidate.id, summary: reply.trim().replace(/\s+/g, " ").slice(0, 180) });
   run.pendingInterim = null;
   updateCodexState(target.row.id, { status: "running", reply, sessionId: run.threadId });
 }
@@ -4571,7 +4573,8 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   externalTopicTurns.set(key, run);
   const showProgress = (eventId: string, text: string) => {
     if (run.accepting && !controller.signal.aborted)
-      queueLarkProgressUpdate({ progressId, turnId: progressId, threadId: session.id, source: message, eventId, text });
+      publishLarkTurnObservation(db, { kind: "turn.progress", runId: progressId, turnId: progressId, threadId: session.id,
+        sourceMessageId: message.id, progressKey: eventId, summary: text });
   };
   const workDueAt = Date.now() + Math.min(externalWorkProgressDelayMs, config.larkCodexInterimReplyDelayMs);
   let workTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4620,11 +4623,12 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
         && !groupPrivacyBlocks(mcp.source.id) && configuredLarkStickerUsageMode(message.chat_id) !== "off"
         ? applySelectedSticker(answer, mcp.stickers, { threadId: session.id, turnId: progressId, messageId: mcp.source.id }) ?? undefined
         : undefined;
-      finishLarkProgressCard(progressId, cancelled ? "cancelled" : result ? "completed" : "failed");
       for (const member of run.members.values()) {
         finishExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
           status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined);
       }
+      publishLarkTurnObservation(db, { kind: "turn.finished", runId: progressId, turnId: progressId, threadId: session.id,
+        sourceMessageId: message.id, outcome: cancelled ? "cancelled" : result ? "completed" : "failed" });
     } finally { externalTopicTurns.delete(key); }
   })();
   void run.done.catch(() => console.warn("lark_external_topic_finish_failed"));

@@ -6,7 +6,8 @@ import { setImmediate as immediate } from "node:timers/promises";
 import test from "node:test";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { config, configureConversationRuntime, setAppSettingValue } from "./context.js";
-import { drainLarkProgressCards } from "./progressCards.js";
+import { drainLarkProgressCards, observeLarkProgressCards } from "./progressCards.js";
+import { onLarkTurnObservation, type LarkTurnObservation } from "./turnObservations.js";
 import type { LarkProgressContent } from "@lark-agent/adapter-lark-cli";
 import { codexAppServer } from "./codexRuntime.js";
 import { enqueueLarkCodexReply, reconcileLarkCodexStartupWaits, reconcilePendingLarkThreadArchives, retryPendingLarkTextReplies, stopLarkCodexResponder } from "./responder.js";
@@ -74,6 +75,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
       if (failDelivery) return {ok: false, error: "fixture transport failure"};
       delivered.push(text); return {ok: true, messageId: `om_out_${delivered.length}`, chatId: "oc_fixture", messageAt: null, messageType: "text"};
     }});
+  const stopProgressObserver = observeLarkProgressCards(store.db);
   for (const [key, value] of Object.entries({stickerUsageMode: "off", executionReceiptsEnabled: "false", interimRepliesEnabled: "false"})) setAppSettingValue(key, value);
   const row = () => store.db.prepare("SELECT * FROM lark_messages WHERE id=1").get() as any;
   const records = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -96,7 +98,7 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
         {method: "turn/completed", params: {threadId: "thread-fixture", turn: {id: turnId, status: "completed"}}}]);
       await until(() => row().codex_status === "answered");
     },
-    async close() { stopLarkCodexResponder(); await drainLarkProgressCards(); await immediate(); store.close(); if (previous === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previous; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; fs.rmSync(root, {recursive: true, force: true}); }
+    async close() { stopLarkCodexResponder(); await drainLarkProgressCards(); stopProgressObserver(); await immediate(); store.close(); if (previous === undefined) delete process.env.CODEX_EXECUTABLE; else process.env.CODEX_EXECUTABLE = previous; if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; fs.rmSync(root, {recursive: true, force: true}); }
   };
 }
 
@@ -573,15 +575,25 @@ test("long tasks and steer keep one progress card, then send the final answer on
 
 test("progress delivery failure never blocks or duplicates final text", async () => {
   const f = fixture(), delay = config.larkCodexInterimReplyDelayMs;
+  let stalled = false;
+  const hanging = onLarkTurnObservation(f.store.db, () => {
+    stalled = true;
+    return new Promise<void>(() => {});
+  });
+  const observed: LarkTurnObservation[] = [];
+  const recorder = onLarkTurnObservation(f.store.db, event => { observed.push(event); });
   try {
     config.larkCodexInterimReplyDelayMs = 0; f.failProgress(true);
     setAppSettingValue("interimRepliesEnabled", "true"); await f.ready();
     await f.emit([{method:"item/started",params:{threadId:"thread-fixture",turnId:f.row().codex_turn_id,item:{id:"work",type:"commandExecution"}}}]);
-    await drainLarkProgressCards(); await f.complete(); await drainLarkProgressCards();
+    await drainLarkProgressCards(); await f.complete(); await drainLarkProgressCards(); await recorder.drain();
     assert.deepEqual(f.delivered, ["fixture done"]); assert.equal(f.row().reply_status, "sent");
     const card = f.store.db.prepare("SELECT state,last_error FROM lark_progress_cards").get() as any;
     assert.equal(card.state, "completed"); assert.match(card.last_error, /fixture progress failed/);
-  } finally { config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
+    assert(stalled);
+    assert.deepEqual(observed.map(event => event.kind), ["turn.progress", "turn.finished"]);
+    assert.equal(observed[0].runId, observed[1].runId);
+  } finally { hanging.close(); recorder.close(); config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
 });
 
 test("an isolated progress storage failure cannot prevent the native task from completing and replying", async () => {

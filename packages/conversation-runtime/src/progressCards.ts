@@ -2,11 +2,13 @@ import type Database from "better-sqlite3";
 import { larkReplyIdempotencyKey, type LarkProgressContent, type LarkProgressEntry, type LarkProgressState } from "@lark-agent/adapter-lark-cli";
 import { config, db, getAppSettings, larkProgressSender, larkProgressUpdater, nowIso, recordOutboundLarkMessage, type LarkMessageRow } from "./context.js";
 import { ownerAssistMayExecute } from "./ownerMentionAssist.js";
+import { onLarkTurnObservation } from "./turnObservations.js";
 
 type ProgressRow = { progress_id: string; native_turn_id: string; thread_id: string; lark_message_id: number; message_id: string;
   card_message_id: string | null; entries_json: string; state: LarkProgressState; version: number; delivered_version: number;
   pending: number; create_attempted: number; attempts: number; next_attempt_at: string };
 const inFlight = new WeakMap<Database.Database, Map<string, Promise<void>>>();
+const subscriptions = new WeakMap<Database.Database, ReturnType<typeof onLarkTurnObservation>>();
 const updateIntervalMs = 10_000;
 const maxAttempts = 5;
 function tasks(database = db) {
@@ -17,7 +19,30 @@ function tasks(database = db) {
 function row(database: Database.Database, id: string) { return database.prepare("SELECT * FROM lark_progress_cards WHERE progress_id=?").get(id) as ProgressRow | undefined; }
 function textOf(entries: LarkProgressEntry[], state: LarkProgressState) { return `[任务进度 · ${state}]\n${entries.map(e => e.text).join("\n")}`; }
 
-export function queueLarkProgressUpdate(input: { progressId: string; turnId: string; threadId: string; source: LarkMessageRow; eventId: string; text: string }): boolean {
+type ProgressSource = Pick<LarkMessageRow, "id" | "message_id" | "sender_type" | "chat_type">;
+
+export function observeLarkProgressCards(database: Database.Database): () => void {
+  subscriptions.get(database)?.close();
+  const subscription = onLarkTurnObservation(database, event => {
+    if (!database.open || database !== db) return;
+    if (event.kind === "turn.finished") {
+      finishLarkProgressCard(event.runId, event.outcome);
+      return;
+    }
+    const source = database.prepare(`SELECT m.id,m.message_id,m.sender_type,m.chat_type
+      FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id
+      WHERE m.id=? AND COALESCE(e.turn_id,m.codex_turn_id)=?`).get(event.sourceMessageId, event.turnId) as ProgressSource | undefined;
+    if (source) queueLarkProgressUpdate({ progressId: event.runId, turnId: event.turnId, threadId: event.threadId,
+      source, eventId: event.progressKey, text: event.summary });
+  });
+  subscriptions.set(database, subscription);
+  return () => {
+    subscription.close();
+    if (subscriptions.get(database) === subscription) subscriptions.delete(database);
+  };
+}
+
+export function queueLarkProgressUpdate(input: { progressId: string; turnId: string; threadId: string; source: ProgressSource; eventId: string; text: string }): boolean {
   try {
   if (config.runtimeMode !== "active" || !getAppSettings().larkCodexInterimRepliesEnabled || input.source.sender_type === "bot" || !ownerAssistMayExecute(input.source.id)
     || config.groupPrivacyEnforced && input.source.chat_type !== "p2p" || !input.source.message_id) return false;
@@ -126,6 +151,7 @@ export async function retryPendingLarkProgressCards(): Promise<void> {
 }
 
 export async function drainLarkProgressCards(): Promise<void> {
+  await subscriptions.get(db)?.drain();
   await retryPendingLarkProgressCards();
   await Promise.all([...tasks().values()]);
 }

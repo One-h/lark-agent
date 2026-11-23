@@ -104,6 +104,9 @@ Approval plans and registered host capabilities use the separate
 [`lark_tools` stdio MCP](docs/shared-tool-mcp.md). Resumed Codex threads and
 supported local engine adapters use the same runtime authorization checks.
 
+Native Codex and ACP share [internal turn observations](docs/turn-observations.md)
+for progress cards. They are distinct from approval and delivery receipts.
+
 Final replies use [Markdown posts and data cards](docs/rich-replies.md).
 Optional [native topic conversations](docs/native-topics.md) continue an explicitly
 joined topic without repeated mentions, using compact incremental input. This

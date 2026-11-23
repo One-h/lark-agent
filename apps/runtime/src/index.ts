@@ -26,7 +26,7 @@ import { parseLarkExecutionConfigs } from "@lark-agent/conversation-runtime";
 import { configuredTrustedExecutionEnabled, isTrustedLarkSender } from "@lark-agent/conversation-runtime";
 import { configuredLarkStickerUsageMode, groupMessageReactionChatIds, groupSpontaneousChatIds, groupSpontaneousReplyCooldownMs, groupSpontaneousReplyRate } from "@lark-agent/conversation-runtime";
 import { retryPendingLarkCompletionReactions } from "@lark-agent/conversation-runtime";
-import { drainLarkProgressCards, retryPendingLarkProgressCards, type LarkProgressSender, type LarkProgressUpdater } from "@lark-agent/conversation-runtime";
+import { drainLarkProgressCards, observeLarkProgressCards, retryPendingLarkProgressCards, type LarkProgressSender, type LarkProgressUpdater } from "@lark-agent/conversation-runtime";
 import { runLarkAttachmentMcpTool } from "@lark-agent/conversation-runtime";
 import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNativeTurn, getLarkMcpToolContext, larkMcpHostCapabilityId,
   boundedReadApprovalPlan, listLarkMcpTools, setExternalNativeApprovalHandler, setWholeTurnNativeApprovalHandler, submitLarkMcpApprovalPlan,
@@ -179,6 +179,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   if (!storedTrusted) store.setSetting("trustedSenderIds", JSON.stringify([...trustedSenderIds]));
   if (!storedApprover && approverId) store.setSetting("approverId", approverId);
   configureConversationRuntime({ database: store.db, groupPrivacyEnforced: store.setting("groupPrivacy.enabled", "false") === "true", mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, mcpToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender, progressSender: config.progressSender, progressUpdater: config.progressUpdater });
+  const stopProgressObserver = observeLarkProgressCards(store.db);
   configureTurnApprovalReviewer(config.turnApprovalReviewer);
   configureOwnerMentionAssist({ membershipProbe: config.ownerMentionAssistMembershipProbe, privateSender: config.proactiveMessageSender, delayMs: config.ownerMentionAssistDelayMs, reviewAvailable: Boolean(config.runtimeToken) });
   configureAutoApprovalNotificationSender(config.autoApprovalNotificationSender);
@@ -498,6 +499,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     while (activeCapabilityCalls > 0) await new Promise(resolve => setTimeout(resolve, 20));
     stopLarkCodexResponder();
     await drainLarkProgressCards();
+    stopProgressObserver();
     await drainOwnerAssistNotifications();
     removeTurnListener();
   });
@@ -1240,7 +1242,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     }
     return allSettings();
   });
-  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); removeTurnListener(); store.close(); } };
+  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {

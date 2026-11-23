@@ -7,7 +7,7 @@ import test from "node:test";
 import { claimLarkCodexReply, config, isNativeTopicConversation, larkCodexAppServerStatus, recordOutboundLarkMessage, saveConversationPersona, setAppSettingValue, setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import { codexAppServer } from "../../../packages/conversation-runtime/src/codexRuntime.js";
 import { createRuntime, type RuntimeConfig } from "./index.js";
-import { configuredNativeAcpEngines, createNativeAcpExecutionEngine, larkExecutionPolicy, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
+import { configuredNativeAcpEngines, createNativeAcpExecutionEngine, larkExecutionPolicy, onLarkTurnObservation, reconcileLarkProgressCards, type ExecutionEngine, type ExecutionTurnResult, type LarkExecutionPolicy, type LarkTurnObservation } from "@lark-agent/conversation-runtime";
 
 const originalCodexExecutable = process.env.CODEX_EXECUTABLE;
 // Each fixture installs its own peer. No late callback should start the real CLI.
@@ -505,6 +505,8 @@ createInterface({input:process.stdin}).on('line',line=>{
   const engines = configuredNativeAcpEngines(env, id => assert.fail(`unexpected invalid launcher for ${id}`));
   assert.deepEqual(engines.map(e => [e.descriptor.id, e.descriptor.models]), ids.map(id => [id, ["fixture-model"]]));
   const f = fixture(engines);
+  const observations: LarkTurnObservation[] = [];
+  const observer = onLarkTurnObservation(f.runtime().store.db, event => { observations.push(event); });
   const delay = config.larkCodexInterimReplyDelayMs;
   const oldToken = process.env.LARK_AGENT_RUNTIME_TOKEN;
   process.env.LARK_AGENT_RUNTIME_TOKEN = "host-token-not-for-engine";
@@ -533,8 +535,15 @@ createInterface({input:process.stdin}).on('line',line=>{
       assert.equal(methods(id).filter(row => row.method === "session/prompt").length, 1);
       fs.writeFileSync(path.join(launcherRoot, `${id}-finish`), "");
       await until(() => follow.row().reply_status === "sent");
+      await observer.drain();
       assert.equal(progress(first.row().id)?.state, "completed");
       assert.equal(progress(follow.row().id), undefined);
+      const firstEvents = observations.filter(event => event.sourceMessageId === first.row().id);
+      assert.equal(firstEvents[0]?.kind, "turn.progress");
+      const terminal = firstEvents.at(-1);
+      assert(terminal?.kind === "turn.finished" && terminal.outcome === "completed");
+      assert(firstEvents.every(event => event.runId === terminal.runId));
+      assert.deepEqual(observations.filter(event => event.sourceMessageId === follow.row().id).map(event => event.kind), ["turn.finished"]);
       assert.equal(first.row().codex_reply, "| Value | Count |\n| --- | --- |\n| Fixture | 2 |");
       assert.equal(JSON.parse(first.row().reply_delivery_payload).msgType, "interactive");
       assert.equal(follow.row().codex_reply, "**Short answer**");
@@ -553,6 +562,7 @@ createInterface({input:process.stdin}).on('line',line=>{
       assert(!events.some(row => row.method === "_session/steering"));
     }
   } finally {
+    observer.close();
     config.larkCodexInterimReplyDelayMs = delay;
     if (oldToken === undefined) delete process.env.LARK_AGENT_RUNTIME_TOKEN;
     else process.env.LARK_AGENT_RUNTIME_TOKEN = oldToken;
