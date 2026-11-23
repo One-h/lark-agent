@@ -5,6 +5,7 @@ import path from "node:path";
 import { unicodeSafePrefix, type CodexAppServerNotification, type CodexAppServerRequest } from "@lark-agent/adapter-codex-app-server";
 import { larkAtTag, larkReplyIdempotencyKey, sendLarkExecutionApprovalCard, sendLarkExecutionReceiptCard, sendLarkImagePostReply, sendLarkMediaReply, updateLarkExecutionApprovalCard, updatePendingLarkExecutionApprovalCard, type LarkExecutionReceiptEntry } from "@lark-agent/adapter-lark-cli";
 import { renderLarkReply, parseLarkReplyPresentation, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
+import { readLarkReplyReceipt } from "@lark-agent/adapter-lark-cli";
 import { codexAppServer, codexAppServerActiveTurnCount, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, larkExternalStickerMcpServer, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
 import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, configuredLarkStickerUsageMode, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
 import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection, stripLarkStickerSelection } from "./stickers.js";
@@ -35,7 +36,7 @@ import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecuti
 import { conversationCodexModelSettings } from "./context.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions, retryPendingLarkCompletionReactions } from "./completionReactions.js";
-import { quarantineLarkExecution, reconcileInterruptedNativeTurns, reconcileLarkCrash } from "./crashRecovery.js";
+import { quarantineLarkExecution, reconcileInterruptedNativeTurns, reconcileLarkCrash, uncertainDelivery } from "./crashRecovery.js";
 import { decideOwnerMentionAssist, deferOwnerAssistDelivery, ensureOwnerMentionAssist, finishOwnerMentionAssist, markOwnerAssistSent,
   ownerAssistMayExecute, ownerAssistPrompt, ownerAssistPublicAllowed, ownerAssistRow, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
 import { attachmentDigest, attachmentToolPrompt, createReplyMarkdownAttachment, matchingAttachmentState, registerReplyAttachments, registeredReplyMedia, resolveReplyAttachment, validateRegisteredAttachment,
@@ -1076,10 +1077,12 @@ function deliverQueuedLarkTextReply(id: number): boolean {
     return false;
   }
   let delivered: ReturnType<typeof larkTextReplySender>;
-  db.prepare("UPDATE lark_messages SET reply_send_stage='attempted' WHERE id=?").run(id);
+  db.prepare("UPDATE lark_messages SET reply_send_stage='attempted',reply_send_attempted_at=COALESCE(reply_send_attempted_at,?) WHERE id=?").run(nowIso(), id);
   try { delivered = larkTextReplySender(message.message_id, message.reply_delivery_text, message.reply_delivery_key, presentation); }
   catch { delivered = { ok: false, error: "Reply transport failed" }; }
-  const sent: ReturnType<typeof larkTextReplySender> = (presentation || message.reply_trigger === "owner_mention") && delivered.ok && !delivered.messageId
+  const requiresReceipt = presentation || message.reply_trigger === "owner_mention"
+    || message.codex_dispatch_phase === "finalized" && message.codex_recovery_engine_status === "completed";
+  const sent: ReturnType<typeof larkTextReplySender> = requiresReceipt && delivered.ok && !delivered.messageId
     ? { ok: false as const, error: "Reply returned no delivery receipt" } : delivered;
   if (sent.ok) {
     db.transaction(() => {
@@ -1099,8 +1102,9 @@ function deliverQueuedLarkTextReply(id: number): boolean {
   const attempts = message.reply_delivery_attempts + 1;
   const nextAt = new Date(Date.now() + retryDelayMs(attempts)).toISOString();
   const stage = sent.notSent === true && message.reply_send_stage === "queued" ? "queued" : "attempted";
-  db.prepare(`UPDATE lark_messages SET reply_status=?, reply_error=?, reply_delivery_attempts=?, reply_next_attempt_at=?,reply_send_stage=? WHERE id=?`)
-    .run(attempts >= 8 ? "failed" : "pending", sent.error, attempts, attempts >= 8 ? null : nextAt, stage, id);
+  db.prepare(`UPDATE lark_messages SET reply_status=?, reply_error=?, reply_delivery_attempts=?, reply_next_attempt_at=?,reply_send_stage=?,
+    reply_send_attempted_at=CASE WHEN ?='queued' THEN NULL ELSE reply_send_attempted_at END WHERE id=?`)
+    .run(attempts >= 8 ? "failed" : "pending", sent.error, attempts, attempts >= 8 ? null : nextAt, stage, stage, id);
   if (attempts >= 8) deferOwnerAssistDelivery(id, "群回复投递多次失败，已保留草稿；请核对实际投递结果后决定是否重发。");
   return false;
 }
@@ -1124,7 +1128,8 @@ function queueLarkTextReply(message: LarkMessageRow, text: string, idempotencyKe
   db.transaction(() => {
     db.prepare(`UPDATE lark_messages
       SET reply_status='pending',reply_error=NULL,reply_delivery_key=?,reply_delivery_text=?,reply_delivery_payload=?,
-        reply_send_stage='queued',reply_delivery_attempts=0,reply_next_attempt_at=?,reply_sent_at=NULL WHERE id=?`)
+        reply_send_stage='queued',reply_send_attempted_at=NULL,reply_recovery_attempts=0,reply_recovery_checked_at=NULL,
+        reply_delivery_attempts=0,reply_next_attempt_at=?,reply_sent_at=NULL WHERE id=?`)
       .run(idempotencyKey, text, presentation ? JSON.stringify(presentation) : null, nowIso(), message.id);
     if (overflow && rich) {
       const payload: LarkDeliveryPayload = { messageId: message.message_id!, taskDir: rich.taskDir, paths: [overflow.relativePath],
@@ -1892,6 +1897,9 @@ export function claimLarkCodexReply(larkMessageId: number): boolean {
         codex_runner_generation = NULL,
         codex_dispatch_phase = 'queued',
         codex_dispatch_context = ?,
+        codex_recovery_readonly = 0,
+        codex_recovery_checks = 0,
+        codex_recovery_checked_at = NULL,
         codex_recovery_engine_status = NULL
     WHERE id = ?
       AND codex_status IN ('skipped', 'failed', 'timeout')
@@ -1976,6 +1984,9 @@ function writeSessionArtifact(
 }
 
 function recordAcceptedExecutionConfig(prepared: PreparedLarkCodexMessage, snapshot: LarkExecutionConfig): void {
+  db.prepare("UPDATE lark_messages SET codex_recovery_readonly=? WHERE id=? AND codex_session_id=? AND codex_turn_id=?").run(
+    snapshot.sandbox === "read-only" && snapshot.trustScope === "untrusted" && snapshot.approvalPolicy === "on-request" ? 1 : 0,
+    prepared.row.id, snapshot.threadId, snapshot.turnId);
   recordLarkExecutionConfig(prepared.taskDir, snapshot);
   prepared.executionConfig = snapshot;
   appendPreparedLog(prepared, { method: "turn/execution-config", params: snapshot });
@@ -4806,6 +4817,55 @@ export function resumeQueuedLarkCodexReplies(): void {
   for (const id of rows) scheduleLarkCodexReply(id);
 }
 
+const safeRecoveryItems = new Set(["userMessage", "agentMessage", "reasoning", "plan"]);
+
+function restoreInterruptedNativeReply(row: { id: number; threadId: string; turnId: string }, status: string,
+  items: Record<string, unknown>[]): boolean {
+  const message = canDispatchLarkReply(row.id);
+  if (!message || message.message_type !== "text" || !["mention", "p2p", "topic"].includes(message.reply_trigger)
+    || message.codex_dispatch_context !== dispatchContext(message) || message.reply_delivery_key !== null
+    || message.codex_session_id !== row.threadId || message.codex_turn_id !== row.turnId
+    || items.some(item => !safeRecoveryItems.has(String(item.type)))) return false;
+  const inputs = items.filter(item => item.type === "userMessage");
+  if (inputs.length !== 1 || inputs[0].clientId !== message.message_id) return false;
+  const originalOnly = db.prepare(`SELECT
+    (SELECT COUNT(*) FROM lark_messages WHERE codex_session_id=? AND codex_turn_id=?)=1
+    AND NOT EXISTS(SELECT 1 FROM lark_capability_invocations WHERE turn_id=?)
+    AND NOT EXISTS(SELECT 1 FROM lark_execution_approvals WHERE turn_id=?)
+    AND NOT EXISTS(SELECT 1 FROM lark_capability_approvals WHERE turn_id=?)
+    AND NOT EXISTS(SELECT 1 FROM lark_observed_operations WHERE turn_id=?)
+    AND NOT EXISTS(SELECT 1 FROM lark_delivery_outbox WHERE lark_message_id=?) AS safe`)
+    .pluck().get(row.threadId, row.turnId, row.turnId, row.turnId, row.turnId, row.turnId, row.id);
+  if (originalOnly !== 1) return false;
+  if (status === "completed") {
+    const finals = items.filter(item => item.type === "agentMessage" && item.phase === "final_answer");
+    if (finals.length !== 1 || typeof finals[0].text !== "string" || finals[0].text.length > 2500
+      || /<\/?(?:lark-(?!no-reply\b)|file|image|audio|video)|(?:sandbox:|file:\/\/)/i.test(finals[0].text)) return false;
+    const noReply = isLarkNoReplyDecision(finals[0].text);
+    const reply = noReply ? null : sanitizeLarkCodexReply(finals[0].text, isTrustedSender(message.sender_id));
+    if (!noReply && !reply) return false;
+    if (reply) queueLarkTextReply(message, formatLarkFinalReply(message, reply, { mentionDirectBot: true }),
+      larkReplyIdempotencyKey("codexfinal", `${row.turnId}:${message.message_id}`), undefined, true);
+    db.prepare(`UPDATE lark_messages SET codex_status=?,codex_dispatch_phase='finalized',codex_reply=?,codex_error=NULL,
+      reply_status=CASE WHEN ? THEN 'skipped' ELSE reply_status END,
+      reply_error=CASE WHEN ? THEN NULL ELSE reply_error END WHERE id=?`)
+      .run(noReply ? "no_reply" : "answered", reply, noReply ? 1 : 0, noReply ? 1 : 0, row.id);
+    return true;
+  }
+  if ((status === "failed" || status === "interrupted") && !isTrustedSender(message.sender_id)
+    && message.codex_recovery_readonly === 1 && message.codex_recovery_replays === 0 && !db.prepare(`SELECT 1 FROM lark_messages
+      WHERE chat_id IS ? AND thread_id IS ? AND id>? AND codex_status IN ('queued','running','answered','no_reply') LIMIT 1`)
+      .get(message.chat_id, message.thread_id, row.id)) {
+    db.prepare(`UPDATE lark_messages SET codex_status='queued',codex_dispatch_phase='queued',codex_recovery_replays=1,
+      codex_recovery_engine_status=NULL,codex_recovery_readonly=0,codex_recovery_checks=0,codex_recovery_checked_at=NULL,
+      codex_session_id=NULL,codex_turn_id=NULL,codex_last_heartbeat_at=NULL,
+      codex_runner_generation=NULL,codex_started_at=NULL,codex_finished_at=NULL,codex_error=NULL,codex_reply=NULL,
+      reply_status='pending',reply_error=NULL WHERE id=?`).run(row.id);
+    return true;
+  }
+  return false;
+}
+
 export function inspectInterruptedLarkTurns(signal?: AbortSignal): Promise<void> {
   if (config.runtimeMode !== "active" || signal?.aborted) return Promise.resolve();
   const database = db;
@@ -4813,7 +4873,55 @@ export function inspectInterruptedLarkTurns(signal?: AbortSignal): Promise<void>
     signal?.throwIfAborted();
     if (!database.open || database !== db) throw new Error("Recovery runtime closed");
     return codexAppServer.request(method, params, 3_000);
-  });
+  }, (row, status, items) => !signal?.aborted && db === database && restoreInterruptedNativeReply(row, status, items));
+}
+
+const deliveryReadbacks = new WeakSet<object>();
+
+export async function inspectInterruptedLarkReplies(signal?: AbortSignal, readback = readLarkReplyReceipt): Promise<void> {
+  const database = db;
+  if (config.runtimeMode !== "active" || signal?.aborted || deliveryReadbacks.has(database)) return;
+  deliveryReadbacks.add(database);
+  try {
+    const messages = database.prepare(`SELECT * FROM lark_messages WHERE reply_status='failed' AND reply_error=?
+      AND reply_delivery_key IS NOT NULL AND reply_delivery_text IS NOT NULL AND reply_send_attempted_at IS NOT NULL
+      AND chat_id IS NOT NULL AND message_id IS NOT NULL AND reply_trigger IS NOT 'owner_mention'
+      AND (?=0 OR chat_type='p2p')
+      AND reply_recovery_attempts<3 AND (reply_recovery_checked_at IS NULL OR reply_recovery_checked_at<=?)
+      ORDER BY id LIMIT 10`).all(uncertainDelivery, config.groupPrivacyEnforced ? 1 : 0, new Date(Date.now()-20_000).toISOString()) as LarkMessageRow[];
+    for (const message of messages) {
+      if (signal?.aborted || !database.open || db !== database) return;
+      if (!message.chat_id || !message.message_id || groupPrivacyBlocks(message.id) || !ownerAssistPublicAllowed(message.id)) continue;
+      database.prepare(`UPDATE lark_messages SET reply_recovery_attempts=reply_recovery_attempts+1,reply_recovery_checked_at=? WHERE id=?`).run(nowIso(),message.id);
+      let receipt: Awaited<ReturnType<typeof readLarkReplyReceipt>>;
+      try {
+        const presentation = typeof message.reply_delivery_payload === "string" ? parseLarkReplyPresentation(message.reply_delivery_payload) : undefined;
+        receipt = await readback({ chatId: message.chat_id, threadId: message.thread_id,
+          replyTo: message.message_id, attemptedAt: String(message.reply_send_attempted_at),
+          msgType: presentation?.msgType ?? "text", content: presentation?.content ?? { text: message.reply_delivery_text } }, signal);
+      } catch {}
+      if (signal?.aborted || !database.open || db !== database) return;
+      if (groupPrivacyBlocks(message.id) || !ownerAssistPublicAllowed(message.id)) continue;
+      if (!receipt) {
+        database.prepare(`UPDATE lark_messages SET reply_error='系统未在飞书找到可确认的投递回执，未重复发送。'
+          WHERE id=? AND reply_status='failed' AND reply_error=? AND reply_delivery_key=? AND reply_recovery_attempts>=3`)
+          .run(message.id,uncertainDelivery,message.reply_delivery_key);
+        continue;
+      }
+      database.transaction(() => {
+        const updated = database.prepare(`UPDATE lark_messages SET reply_status='sent',reply_error=NULL,reply_sent_at=?
+          WHERE id=? AND reply_status='failed' AND reply_error=? AND reply_delivery_key=? AND reply_send_attempted_at=?`)
+          .run(receipt.sentAt,message.id,uncertainDelivery,message.reply_delivery_key,message.reply_send_attempted_at);
+        if (updated.changes) {
+          const presentation = typeof message.reply_delivery_payload === "string" ? parseLarkReplyPresentation(message.reply_delivery_payload) : undefined;
+          recordOutboundLarkMessage({ messageId: receipt.messageId, chatId: message.chat_id, chatType: message.chat_type,
+            recipientId: message.sender_id, content: message.reply_delivery_text!, replyToMessageId: message.message_id,
+            messageAt: receipt.sentAt, messageType: presentation?.msgType ?? "text", source: "reply" });
+          markOwnerAssistSent(message.id);
+        }
+      })();
+    }
+  } finally { deliveryReadbacks.delete(database); }
 }
 
 export async function larkCodexNativeRuntime(refresh = false): Promise<LarkCodexNativeRuntime> {

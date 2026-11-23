@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import test from "node:test";
-import { claimLarkCodexReply, deliverLarkOutboxRow, resumeQueuedLarkCodexReplies, retryPendingLarkTextReplies, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { claimLarkCodexReply, deliverLarkOutboxRow, inspectInterruptedLarkReplies, inspectInterruptedLarkTurns,
+  resumeQueuedLarkCodexReplies, retryPendingLarkTextReplies, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { reconcileInterruptedNativeTurns } from "../../../packages/conversation-runtime/src/crashRecovery.js";
 import { createRuntime } from "./index.js";
 
@@ -161,6 +162,17 @@ test("crash recovery survives process loss before engine result and before local
           assert.equal(row.codex_reply,"confirmed answer");
           assert.equal(row.reply_status,"failed");
           assert.equal(row.reply_send_stage,"attempted");
+          let probes = 0;
+          await inspectInterruptedLarkReplies(undefined, async input => {
+            probes++;
+            assert.equal(input.replyTo,"om_fixture");
+            assert.equal(input.chatId,"oc_fixture");
+            assert.match(JSON.stringify(input.content),/confirmed answer/);
+            return { messageId:"om_remote_receipt", sentAt:input.attemptedAt };
+          });
+          assert.equal(probes,1);
+          assert.equal(runtime.store.db.prepare("SELECT reply_status FROM lark_messages WHERE message_id='om_fixture'").pluck().get(),"sent");
+          assert.equal(runtime.store.db.prepare("SELECT reply_to_message_id FROM lark_messages WHERE message_id='om_remote_receipt'").pluck().get(),"om_fixture");
         }
         resumeQueuedLarkCodexReplies();
         assert.equal(retryPendingLarkTextReplies(),0);
@@ -168,5 +180,78 @@ test("crash recovery survives process loss before engine result and before local
         assert.equal(fs.readFileSync(path.join(root,"trace"),"utf8"),phase==="engine"?"engine\n":"engine\ntransport\n");
       } finally { await runtime.app.close();runtime.stop(); }
     } finally { fs.rmSync(root,{recursive:true,force:true}); }
+  }
+});
+
+test("automatic recovery delivers a confirmed Codex result and reruns only a proven no-tool interrupted turn", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),"lark-auto-recovery-"));
+  const executable = path.join(root,"codex.mjs"), trace = path.join(root,"trace"), completion = path.join(root,"old-completed");
+  const prior = process.env.CODEX_EXECUTABLE;
+  fs.writeFileSync(executable,`#!${process.execPath}
+import fs from "node:fs"; import readline from "node:readline";
+const log=method=>fs.appendFileSync(${JSON.stringify(trace)},method+"\\n");
+const send=x=>process.stdout.write(JSON.stringify(x)+"\\n");
+readline.createInterface({input:process.stdin}).on("line",line=>{
+  const req=JSON.parse(line), p=req.params??{}, thread=p.threadId??"new-thread";
+  log(req.method??"response");
+  const ret=result=>send({id:req.id,result});
+  const input="om_"+thread.replace(/^old-/,"");
+  const live=thread==="old-live"&&!fs.existsSync(${JSON.stringify(completion)});
+  if(req.method==="thread/read")ret({thread:{id:thread,status:{type:live?"active":"idle"}}});
+  else if(req.method==="thread/turns/list")ret({data:[{id:"old-turn",status:live?"inProgress":["old-done","old-live"].includes(thread)?"completed":"interrupted"}]});
+  else if(req.method==="thread/items/list"){
+    const typed=[{type:"userMessage",clientId:input}];
+    if(["old-done","old-live"].includes(thread))typed.push({type:"agentMessage",phase:"final_answer",text:"restored result"});
+    if(thread==="old-tool")typed.push({type:"commandExecution",status:"completed"});
+    ret({nextCursor:thread==="old-partial"?"more":null,data:typed.map(item=>({turnId:"old-turn",item}))});
+  }
+  else if(req.method==="thread/start")ret({thread:{id:"new-thread"}});
+  else if(req.method==="turn/start"){
+    ret({turn:{id:"new-turn",status:"inProgress"}});
+    setTimeout(()=>{
+      const params={threadId:"new-thread",turnId:"new-turn"};
+      const item={type:"agentMessage",id:"result",phase:"final_answer",text:"retry result"};
+      send({method:"item/completed",params:{...params,item}});
+      send({method:"turn/completed",params:{...params,turn:{id:"new-turn",status:"completed",items:[item]}}});
+    },20);
+  }else if(req.method)ret({});
+});`,{mode:0o700});
+  process.env.CODEX_EXECUTABLE = executable;
+  const sent: Array<{ anchor: string; text: string }> = [];
+  const setup=()=>createRuntime({...options(root),reactionSender:()=>({ok:true}),textReplySender:(anchor,text)=>{
+    sent.push({anchor,text});return {ok:true,messageId:`om_answer${sent.length}`,chatId:null,messageAt:null,messageType:"text"};
+  }});
+  let runtime=setup();
+  try {
+    for(const [id,key] of [[1,"done"],[2,"retry"],[3,"tool"],[4,"partial"],[5,"budget"],[6,"live"]] as const) {
+      runtime.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,
+        mentioned,reply_trigger,reply_status,codex_status,content,raw_json,received_at,created_at)
+        VALUES(?, ?, ?, 'p2p','ou_requester','user','text',1,'p2p','pending','skipped',?,'{}','2026-11-23','2026-11-23')`).run(id,"om_"+key,"oc_"+key,key);
+      assert(claimLarkCodexReply(id));
+      runtime.store.db.prepare(`UPDATE lark_messages SET codex_status='running',codex_dispatch_phase='submitted',
+        codex_recovery_readonly=1,codex_recovery_replays=?,codex_session_id=?,codex_turn_id='old-turn' WHERE id=?`).run(key==="budget"?1:0,"old-"+key,id);
+    }
+    await runtime.app.close();runtime.stop();runtime=setup();
+    await inspectInterruptedLarkTurns();
+    const row=(id:number)=>runtime.store.db.prepare("SELECT * FROM lark_messages WHERE id=?").get(id) as Record<string,unknown>;
+    assert.equal(row(1).codex_status,"answered");assert.equal(row(1).reply_status,"pending");
+    assert.equal(row(2).codex_status,"queued");assert.equal(row(2).codex_recovery_replays,1);
+    assert.equal(row(3).codex_dispatch_phase,"needs_review");
+    assert.equal(row(4).codex_dispatch_phase,"needs_review");
+    assert.equal(row(5).codex_dispatch_phase,"needs_review");
+    assert.equal(row(6).codex_recovery_engine_status,"active");
+    assert.equal(row(6).codex_dispatch_phase,"needs_review");
+    fs.writeFileSync(completion,"yes");
+    runtime.store.db.prepare("UPDATE lark_messages SET codex_recovery_checked_at='1970-01-01' WHERE id=6").run();
+    await inspectInterruptedLarkTurns();
+    assert.equal(row(6).codex_status,"answered");
+    assert.equal(retryPendingLarkTextReplies(),2);
+    resumeQueuedLarkCodexReplies();resumeQueuedLarkCodexReplies();
+    await waitFor(()=>row(2).reply_status==="sent");
+    assert.deepEqual(sent,[{anchor:"om_done",text:"restored result"},{anchor:"om_live",text:"restored result"},{anchor:"om_retry",text:"retry result"}]);
+    assert.equal(fs.readFileSync(trace,"utf8").split("\n").filter(rpc=>rpc==="turn/start").length,1);
+  } finally {
+    await runtime.app.close();runtime.stop();fs.rmSync(root,{recursive:true,force:true});
+    if(prior===undefined)delete process.env.CODEX_EXECUTABLE;else process.env.CODEX_EXECUTABLE=prior;
   }
 });

@@ -15,7 +15,7 @@ import { createGroupNameCache } from "./groupNames.js";
 import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
 import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import { registerPersonaRoutes } from "./personaRoutes.js";
-import { inspectInterruptedLarkTurns, resumeQueuedLarkCodexReplies } from "@lark-agent/conversation-runtime";
+import { inspectInterruptedLarkReplies, inspectInterruptedLarkTurns, resumeQueuedLarkCodexReplies } from "@lark-agent/conversation-runtime";
 import { registerTopicExecutionRoutes } from "./topicExecutionRoutes.js";
 import { configuredNativeAcpEngines, configureTopicExecutionEngines, hasExternalExecutionRoute, topicExecutionPreviouslyDispatched, type ExecutionEngine } from "@lark-agent/conversation-runtime";
 import { registerApprovalHistoryRoutes } from "./approvalHistory.js";
@@ -1273,6 +1273,7 @@ if (process.argv[1]?.endsWith("index.ts")) {
     if (!recoveryLifetime.signal.aborted) {
       resumeQueuedLarkCodexReplies();
       void inspectInterruptedLarkTurns(recoveryLifetime.signal).catch(() => console.warn("lark_execution_recovery_readback_failed"));
+      void inspectInterruptedLarkReplies(recoveryLifetime.signal).catch(() => console.warn("lark_reply_recovery_readback_failed"));
     }
     void retryPendingLarkProgressCards();
     retryOwnerAssistNotifications();

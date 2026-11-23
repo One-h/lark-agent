@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
-import { readNativeTurnState } from "./nativeTurnState.js";
+import { readNativeTurnState, type NativeTurnState } from "./nativeTurnState.js";
 
-export const larkUncertainExecution = "运行时中断，无法确认本轮操作结果；请先核对实际结果，不会自动重跑。";
-const uncertainDelivery = "运行时中断，未能确认飞书投递结果；请核对原会话，不会自动重发。";
+export const larkUncertainExecution = "运行时中断，系统将按引擎和操作凭证尝试恢复；不重跑未证实安全的操作。";
+export const uncertainDelivery = "运行时中断，未能确认飞书投递结果；系统将核对已有回复，不重发未证实安全的投递。";
 const interruptedApproval = "运行时已重启，原审批请求已失效；不代表人工拒绝。";
 
 export function quarantineLarkExecution(database: Database.Database, id: number, at: string): number {
@@ -62,26 +62,52 @@ export function reconcileLarkCrash(database: Database.Database, at: string): voi
 }
 
 const probes = new WeakSet<Database.Database>();
+type InterruptedTurn = { id: number; threadId: string; turnId: string };
+type Request = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
-export async function reconcileInterruptedNativeTurns(database: Database.Database,
-  request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Promise<void> {
+async function readCompleteTurnItems(request: Request, row: InterruptedTurn): Promise<Record<string, unknown>[] | undefined> {
+  const result = await request("thread/items/list", { threadId: row.threadId, turnId: row.turnId, sortDirection: "asc", limit: 50 }) as {
+    data?: Array<{ turnId?: string; item?: Record<string, unknown> }>; nextCursor?: string | null
+  } | null;
+  if (result?.nextCursor !== null || !Array.isArray(result.data) || !result.data.length
+    || result.data.some(entry => !entry || entry.turnId !== row.turnId || !entry.item || typeof entry.item.type !== "string")) return;
+  return result.data.map(entry => entry.item!);
+}
+
+export async function reconcileInterruptedNativeTurns(database: Database.Database, request: Request,
+  restore?: (row: InterruptedTurn, status: NativeTurnState["status"], items: Record<string, unknown>[]) => boolean): Promise<void> {
   if (probes.has(database)) return;
   probes.add(database);
   try {
     const rows = database.prepare(`SELECT id,codex_session_id threadId,codex_turn_id turnId FROM lark_messages
       WHERE codex_dispatch_phase='needs_review' AND codex_dispatch_context IS NOT NULL
-        AND codex_recovery_engine_status IS NULL AND codex_session_id IS NOT NULL AND codex_turn_id IS NOT NULL
+        AND (codex_recovery_engine_status IS NULL OR codex_recovery_engine_status IN ('active','unknown'))
+        AND codex_recovery_checks<6 AND (codex_recovery_checked_at IS NULL OR codex_recovery_checked_at<=?)
+        AND codex_session_id IS NOT NULL AND codex_turn_id IS NOT NULL
         AND NOT EXISTS(SELECT 1 FROM lark_topic_engine_runs WHERE lark_message_id=lark_messages.id)
-      ORDER BY id LIMIT 20`).all() as Array<{ id: number; threadId: string; turnId: string }>;
+      ORDER BY id LIMIT 20`).all(new Date(Date.now()-20_000).toISOString()) as InterruptedTurn[];
     for (const row of rows) {
-      // A fresh App Server can read the old turn, but does not own its live callbacks.
-      // Readback cannot certify business effects or reconstruct our delivery plan.
-      let status = "unknown";
-      try { status = (await readNativeTurnState(request, row.threadId, row.turnId)).status; } catch {}
+      let status: NativeTurnState["status"] = "unknown";
+      let items: Record<string, unknown>[] | undefined;
+      try {
+        status = (await readNativeTurnState(request, row.threadId, row.turnId)).status;
+        if (restore && ["completed", "failed", "interrupted"].includes(status)) items = await readCompleteTurnItems(request, row);
+      } catch {}
       if (!database.open) return;
-      database.prepare(`UPDATE lark_messages SET codex_recovery_engine_status=?
+      database.transaction(() => {
+        const updated = database.prepare(`UPDATE lark_messages SET codex_recovery_engine_status=?,
+          codex_recovery_checks=codex_recovery_checks+1,codex_recovery_checked_at=?
         WHERE id=? AND codex_dispatch_phase='needs_review' AND codex_session_id=? AND codex_turn_id=?`)
-        .run(status, row.id, row.threadId, row.turnId);
+          .run(status, new Date().toISOString(), row.id, row.threadId, row.turnId);
+        if (!updated.changes) return;
+        if (items && restore?.(row, status, items)) return;
+        database.prepare("UPDATE lark_messages SET codex_error=? WHERE id=? AND codex_dispatch_phase='needs_review'").run(
+          status === "active" ? "引擎证实原回合仍活动，但当前连接不能接管原回合与审批，未重启任务。" :
+            items?.some(item => /(?:Execution|ToolCall|Change)/.test(String(item.type)))
+              ? "系统查到原回合有命令或工具记录，但没有可验证的下游完成凭证，未重复执行原操作。"
+              : !items ? "系统未取得可以绑定到原回合的完整引擎记录，未重复执行原操作。"
+              : "系统已读到原回合记录，但不满足安全续交付或限次重试的条件，未重复执行原操作。", row.id);
+      })();
     }
   } finally { probes.delete(database); }
 }
