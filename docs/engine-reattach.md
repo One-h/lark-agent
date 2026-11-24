@@ -4,6 +4,11 @@ This mode is disabled by default. The existing stdio paths are unchanged unless
 an operator selects a private independent engine host. Only one Lark runtime
 may open the database. Keep the engine host running across Lark restarts.
 
+Send SIGTERM only to the verified Lark runtime process for a graceful handoff.
+Its shutdown drains local turns and in-flight submissions, but detaches
+already journaled turns owned by an independent engine. Do not restart the
+engine hosts or stop the whole process tree during a hot handoff.
+
 - The Codex adapter can connect to an operator-owned App Server over its Unix
   WebSocket instead of spawning a stdio child. Closing the socket client does
   not stop the App Server. Both the configured and resolved socket directories
@@ -70,3 +75,7 @@ one final result. Runtime tests use a disposable SQLite database and a fake
 Feishu transport, exercising the existing Lark card handler for all five
 engine routes. The tests do not send live messages, replay real commands or
 enable these settings on a running bot. OpenCode uses ACP in this mode.
+
+Hosted ACP turns publish the same progress and terminal observer events as
+other turns. Early work is remembered until the progress delay is reached,
+and a short turn still does not create a progress card.

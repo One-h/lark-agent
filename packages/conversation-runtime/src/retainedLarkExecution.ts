@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { ExecutionEngineEvent, ExecutionNativeApproval, ExecutionTurnResult } from "./executionEngines.js";
+import type { ExecutionNativeApproval, ExecutionTurnResult, ExecutionWorkStage } from "./executionEngines.js";
 import { RetainedExecutionClient, RetainedHostError, type RetainedHostConfig, type RetainedTurnSnapshot } from "./retainedExecutionClient.js";
 
 type Binding = { message_id: number; turn_id: string; generation: string; session_key: string;
   engine_id: string; trusted: number; deadline: string; finalized: number };
-type Local = { controller: AbortController; requests: Set<string>; pending: Set<string>; sequence: number };
+type Local = { controller: AbortController; requests: Set<string>; pending: Set<string>; sequence: number;
+  stage?: ExecutionWorkStage; observed?: string };
 type Source = { messageId: number; engineId: string; sessionKey: string; trusted: boolean };
 type Operation = Parameters<ExecutionNativeApproval>[0];
 type Hooks = {
@@ -14,9 +15,9 @@ type Hooks = {
   current(binding: Binding): boolean;
   acceptSession(binding: Binding, sessionId: string): void;
   authorize(binding: Binding, requestId: string, operation: Operation, signal: AbortSignal, stillCurrent: () => boolean): Promise<boolean>;
-  observe(binding: Binding, event: ExecutionEngineEvent): void;
+  observe(binding: Binding, sessionId: string, stage?: ExecutionWorkStage): boolean;
   finish(binding: Binding, result: ExecutionTurnResult | null): (() => void) | undefined;
-  ended(binding: Binding): void;
+  ended(binding: Binding, result: ExecutionTurnResult | null): void;
 };
 
 export class RetainedLarkExecution {
@@ -161,7 +162,11 @@ export class RetainedLarkExecution {
     if (owned.controller.signal.aborted) return;
     owned.sequence = snapshot.sequence;
     owned.pending = new Set(snapshot.approvals.map(request => request.id));
-    for (const event of snapshot.events) this.hooks.observe(binding, event.event);
+    for (const { event } of snapshot.events) if (event.type === "work") owned.stage = event.stage;
+    const progressKey = owned.stage ?? "start";
+    if (owned.observed !== progressKey && this.hooks.observe(binding, snapshot.status.sessionId, owned.stage)) {
+      owned.observed = progressKey;
+    }
     for (const request of snapshot.approvals) {
       if (owned.requests.has(request.id) || request.operation.engineId !== binding.engine_id) continue;
       owned.requests.add(request.id);
@@ -178,11 +183,12 @@ export class RetainedLarkExecution {
   private finish(binding: Binding, result: ExecutionTurnResult | null): void {
     this.active.get(binding.turn_id)?.controller.abort();
     this.active.delete(binding.turn_id);
-    const deliver = this.db.transaction(() => {
+    const commit = this.db.transaction(() => {
       if (!this.db.prepare(`UPDATE lark_retained_turns SET finalized=1 WHERE turn_id=? AND finalized=0`).run(binding.turn_id).changes) return;
-      return this.hooks.finish(binding, result);
+      return { deliver: this.hooks.finish(binding, result) };
     })();
-    this.hooks.ended(binding);
-    deliver?.();
+    if (!commit) return;
+    this.hooks.ended(binding, result);
+    commit.deliver?.();
   }
 }

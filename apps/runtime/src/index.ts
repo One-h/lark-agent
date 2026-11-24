@@ -14,6 +14,7 @@ import { config as conversationConfig, configuredLarkCodexModel, configuredLarkC
 import { registerHostOutboundRoutes } from "./outbound.js";
 import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
+import { registerLarkSignalShutdown } from "./shutdown.js";
 import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
 import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import { registerPersonaRoutes } from "./personaRoutes.js";
@@ -1341,18 +1342,5 @@ if (process.argv[1]?.endsWith("index.ts")) {
     void retryPendingAutoApprovalNotifications().catch((error) => console.warn(`Auto-approval notification retry failed: ${error instanceof Error ? error.message : String(error)}`));
     void reconcilePendingLarkThreadArchives().catch((error) => console.warn(`Lark thread archive reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)); }, 2_000).unref();
   if (process.env.LARK_AGENT_LISTEN !== "false") runtime.startListener();
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    recoveryLifetime.abort();
-    stopLarkMessageWorker();
-    // Drain, never replay or force-kill a possibly paid/external operation.
-    while (larkCodexAppServerStatus().activeTurns > 0) await new Promise(resolve => setTimeout(resolve, 500));
-    await runtime.app.close();
-    runtime.stop();
-    process.exit(0);
-  };
-  process.once("SIGTERM", () => { void shutdown(); });
-  process.once("SIGINT", () => { void shutdown(); });
+  registerLarkSignalShutdown(runtime, () => recoveryLifetime.abort());
 }

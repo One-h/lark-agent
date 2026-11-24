@@ -4553,14 +4553,13 @@ export function configureRetainedLarkExecution(options?: RetainedHostConfig): vo
     authorize(binding, requestId, operation, signal, stillCurrent) {
       return externalNativeApprovalHandler?.(binding.message_id, binding.turn_id, operation, signal, stillCurrent, requestId) ?? Promise.resolve(false);
     },
-    observe(binding, event) {
-      if (event.type !== "work") return;
-      const row = db.prepare("SELECT codex_session_id,codex_started_at FROM lark_messages WHERE id=?").get(binding.message_id) as
-        { codex_session_id: string; codex_started_at: string };
-      if (Date.now() - Date.parse(row.codex_started_at) >= config.larkCodexInterimReplyDelayMs)
-        publishLarkTurnObservation(db, { kind: "turn.progress", runId: binding.turn_id, turnId: binding.turn_id,
-          threadId: row.codex_session_id, sourceMessageId: binding.message_id, progressKey: `work:${event.stage}`,
-          summary: externalWorkProgressText[event.stage] });
+    observe(binding, sessionId, stage) {
+      const started = db.prepare("SELECT codex_started_at FROM lark_messages WHERE id=?").pluck().get(binding.message_id) as string;
+      if (Date.now() - Date.parse(started) < config.larkCodexInterimReplyDelayMs) return false;
+      publishLarkTurnObservation(db, { kind: "turn.progress", runId: binding.turn_id, turnId: binding.turn_id,
+        threadId: sessionId, sourceMessageId: binding.message_id, progressKey: stage ? `work:${stage}` : "start",
+        summary: stage ? externalWorkProgressText[stage] : "正在处理。" });
+      return true;
     },
     finish(binding, result) {
       const row = db.prepare("SELECT * FROM lark_messages WHERE id=?").get(binding.message_id) as LarkMessageRow | undefined;
@@ -4576,10 +4575,16 @@ export function configureRetainedLarkExecution(options?: RetainedHostConfig): vo
         result.status === "cancelled" ? "Retained engine turn cancelled" : undefined,
         answer ? { turnId: binding.turn_id, trusted: Boolean(binding.trusted) } : undefined);
     },
-    ended(binding) {
+    ended(binding, result) {
       finishLarkTurnAutoApproval(binding.turn_id);
       notifyLarkTurnEnded(db, binding.turn_id);
-      reconcileLarkProgressCards();
+      const row = db.prepare("SELECT codex_session_id,codex_dispatch_phase FROM lark_messages WHERE id=? AND codex_turn_id=?")
+        .get(binding.message_id, binding.turn_id) as { codex_session_id: string | null; codex_dispatch_phase: string } | undefined;
+      if (row?.codex_session_id) publishLarkTurnObservation(db, { kind: "turn.finished", runId: binding.turn_id,
+        turnId: binding.turn_id, threadId: row.codex_session_id, sourceMessageId: binding.message_id,
+        outcome: !result || row.codex_dispatch_phase === "needs_review" ? "interrupted"
+          : result.status === "cancelled" ? "cancelled" : "completed" });
+      else reconcileLarkProgressCards();
     }
   }) : undefined;
 }
@@ -5273,6 +5278,11 @@ export function larkCodexAppServerStatus(): { running: boolean; pid: number | nu
     ...codexAppServer.status(),
     activeTurns: activeLarkCodexRuns.size + preparingLarkMessages.size + externalTopicTurns.size + (retainedLark?.bindings().length ?? 0)
   };
+}
+
+export function larkShutdownBlockingTurnCount(): number {
+  const localCodex = [...activeLarkCodexRuns.values()].filter(run => !run.socketRecovery).length;
+  return localCodex + externalTopicTurns.size + preparingLarkMessages.size;
 }
 
 export function reconcileLarkCodexResponder(): void {

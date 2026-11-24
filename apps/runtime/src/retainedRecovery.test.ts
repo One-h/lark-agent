@@ -10,7 +10,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { promisify } from "node:util";
 import { WebSocketServer } from "ws";
-import { enqueueLarkCodexReply, listenRetainedExecutionHost, retryPendingLarkTextReplies, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+import { config as conversationConfig, enqueueLarkCodexReply, larkCodexAppServerStatus, larkShutdownBlockingTurnCount, listenRetainedExecutionHost,
+  onLarkTurnObservation, retryPendingLarkTextReplies, type ExecutionEngine, type LarkTurnObservation } from "@lark-agent/conversation-runtime";
 import { createRuntime } from "./index.js";
 
 async function until(predicate: () => boolean) {
@@ -30,13 +31,15 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
     let runs = 0, effects = 0;
     const cards: number[] = [];
     const replies: string[] = [];
+    const observations: LarkTurnObservation[] = [];
     const engine: ExecutionEngine = {
       descriptor: { id, label: id, models: [] }, supportsNativeApproval: true, supportsPolicy: () => true,
       async open({ authorizeNative }) {
         return {
           id: "session-" + id,
-          async run(_text, signal) {
+          async run(_text, signal, observe) {
             runs++;
+            observe?.({ type: "work", stage: "read" });
             const allowed = await authorizeNative!({ engineId: id, cwd: root, text: "fixture_read" }, signal, () => !signal.aborted);
             if (allowed) effects++;
             return { status: "completed", text: allowed ? "confirmed reply" : "no operation" };
@@ -47,7 +50,8 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
     };
     function startHost() { return listenRetainedExecutionHost({ socketPath, token, workspace: root, engines: [engine] }); }
     let host = await startHost();
-    const setup = () => createRuntime({
+    const setup = () => {
+      const runtime = createRuntime({
       databasePath: path.join(root, "runtime.sqlite"), mode: "active", workspaceRoot: root, trustedSenderIds: [],
       runtimeToken: "fixture-auth", approverId: "ou_owner", executionEngines: [engine],
       retainedEngineHost: { socketPath, token, engineIds: [id] },
@@ -63,7 +67,13 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
         replies.push(text);
         return { ok: true, messageId: "om_out_" + replies.length, chatId: "oc_fixture", messageAt: null, messageType: "text" };
       }
-    });
+      });
+      const subscription = onLarkTurnObservation(runtime.store.db, event => { observations.push(event); });
+      runtime.app.addHook("onClose", async () => { await subscription.drain(); subscription.close(); });
+      return runtime;
+    };
+    const previousDelay = conversationConfig.larkCodexInterimReplyDelayMs;
+    conversationConfig.larkCodexInterimReplyDelayMs = 900;
     let runtime = setup();
     const closeRuntime = async () => { await runtime.app.close(); runtime.stop(); };
     const row = (number: number) => runtime.store.db.prepare("SELECT * FROM lark_messages WHERE id=?").get(number) as
@@ -85,6 +95,9 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
       const originalTurn = row(2).codex_turn_id;
       const original = cards[0]!;
       assert.equal(effects, 0);
+      assert.equal(larkCodexAppServerStatus().activeTurns, 1);
+      assert.equal(larkShutdownBlockingTurnCount(), 0);
+      await until(() => observations.some(event => event.kind === "turn.progress" && event.turnId === originalTurn && event.progressKey === "work:read"));
       await closeRuntime();
       runtime = setup();
       assert.equal(runtime.store.approval(original)?.status, "pending");
@@ -103,6 +116,8 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
       assert.equal(row(2).codex_turn_id, originalTurn);
       assert.deepEqual(cards,[original]);
       assert.deepEqual(replies,["confirmed reply"]);
+      await until(() => observations.some(event => event.kind === "turn.finished" && event.turnId === originalTurn));
+      assert.deepEqual(observations.flatMap(event => event.kind === "turn.finished" && event.turnId === originalTurn ? [event.outcome] : []), ["completed"]);
       await closeRuntime();
       runtime = setup();
       assert.equal(retryPendingLarkTextReplies(),0);
@@ -140,6 +155,7 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
         assert.deepEqual(replies,["confirmed reply","confirmed reply"]);
       }
     } finally {
+      conversationConfig.larkCodexInterimReplyDelayMs = previousDelay;
       await runtime.app.close();
       if (runtime.store.db.open) runtime.stop();
       await host.close();
