@@ -4,6 +4,8 @@ import { setExternalMessageHandler } from "@lark-agent/conversation-runtime";
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { createHash } from "node:crypto";
 import { randomBytes } from "node:crypto";
+import { configureNativeLarkRecovery, configureRetainedLarkExecution, confirmRetainedLarkRequest, hasRetainedLarkBinding, startRetainedLarkRecovery, stopRetainedLarkRecovery,
+  type RetainedHostConfig } from "@lark-agent/conversation-runtime";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
@@ -46,7 +48,7 @@ import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, fo
   LarkApprovalError, loadApprovalDirectQuote, type LarkApprovalStatus } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
-type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"] };
+type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"]; retainedEngineHost?: RetainedHostConfig; codexSocket?: string };
 const groupAskCapability = "lark.group.ask";
 const groupReplyCapability = "lark.group.ask_reply";
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
@@ -208,6 +210,8 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     codexModels: config.mode === "active" ? async () => (await listLarkCodexModels()).map(model => model.id) : undefined,
     reportError: phase => app.log.warn({ phase }, "managed_lark_chat_unconfirmed")
   });
+  configureRetainedLarkExecution(config.retainedEngineHost);
+  configureNativeLarkRecovery(config.codexSocket);
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
@@ -286,19 +290,53 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     }
     return true;
   };
+  const retainedApproval = (id: number) => store.db.prepare("SELECT request_id FROM lark_retained_approval_links WHERE approval_id=?")
+    .pluck().get(id) as string | undefined;
   const awaitApproval = async (input: { messageId: number; turnId: string; capabilityId?: string; operation: string },
     signal: AbortSignal, planInput: TurnApprovalInput, planApplied: PendingApproval["planApplied"], stillCurrent?: () => boolean, exactManualOnly = false): Promise<LarkApprovalStatus> => {
     if (!approverId || signal.aborted || !liveTurn(input.messageId, input.turnId)) return "failed";
-    const approvalId = store.createApproval({ larkMessageId: input.messageId, turnId: input.turnId, capabilityId: input.capabilityId, operation: input.operation, approverId, expiresAt: new Date(Date.now() + 600000).toISOString() });
     const plan = exactManualOnly ? undefined : currentApprovalPlan(store.db, planInput);
     const requiresPlan = !exactManualOnly && !planInput.wholeTask && store.setting("turnAutoApprovalEnabled", "false") === "true";
+    const retainedRequest = planInput.retainedRequestId;
+    const policyHash = createHash("sha256").update(JSON.stringify([plan ?? null, requiresPlan, exactManualOnly,
+      Boolean(planInput.wholeTask), Boolean(planInput.readOnlyWholeTask), planInput.cwd])).digest("hex");
+    const old = retainedRequest ? store.db.prepare("SELECT approval_id,policy_hash FROM lark_retained_approval_links WHERE turn_id=? AND request_id=?")
+      .get(input.turnId, retainedRequest) as { approval_id: number; policy_hash: string } | undefined : undefined;
+    const previous = old && store.approval(old.approval_id);
+    if (old && (!previous || old.policy_hash !== policyHash || previous.approver_id !== approverId
+      || previous.lark_message_id !== input.messageId || previous.operation !== input.operation
+      || previous.capability_id !== (input.capabilityId ?? null) || !previous.card_message_id
+      || !approvalIdentityMatches(previous))) return "failed";
+    if (previous && Date.parse(previous.expires_at) <= Date.now()) {
+      settleApproval(previous.id, "expired");
+      return "expired";
+    }
+    if (previous && previous.status !== "pending") {
+      if (previous.status === "approved" && planInput.wholeTask && previous.approval_scope !== "turn") return "failed";
+      return previous.status === "approved" || previous.status === "rejected" || previous.status === "expired" ? previous.status : "failed";
+    }
+    const approvalId = previous?.id ?? store.db.transaction(() => {
+      const id = store.createApproval({ larkMessageId: input.messageId, turnId: input.turnId, capabilityId: input.capabilityId,
+        operation: input.operation, approverId: approverId!, expiresAt: new Date(Date.now() + 600000).toISOString() });
+      if (retainedRequest) store.db.prepare("INSERT INTO lark_retained_approval_links(turn_id,request_id,approval_id,policy_hash) VALUES(?,?,?,?)")
+        .run(input.turnId, retainedRequest, id, policyHash);
+      return id;
+    })();
     const result = new Promise<LarkApprovalStatus>(resolve => {
-      const abort = () => settleApproval(approvalId, "failed", "once", "会话已结束或调用已断开，操作未执行。");
-      const timer = setTimeout(() => settleApproval(approvalId, "expired"), 600000);
+      const abort = () => {
+        if (retainedRequest && runtimeClosing.signal.aborted) {
+          const pending = pendingApprovals.get(approvalId);
+          if (pending) { clearTimeout(pending.timer); pending.cleanup(); pendingApprovals.delete(approvalId); }
+          resolve("failed");
+        } else settleApproval(approvalId, "failed", "once", "会话已结束或调用已断开，操作未执行。");
+      };
+      const timer = setTimeout(() => settleApproval(approvalId, "expired"),
+        previous ? Math.max(0, Date.parse(previous.expires_at) - Date.now()) : 600000);
       signal.addEventListener("abort", abort, { once: true });
       pendingApprovals.set(approvalId, { resolve, timer, cleanup: () => signal.removeEventListener("abort", abort),
         plan, requiresPlan, exactManualOnly, planInput, planApplied, stillCurrent, wholeTask: planInput.wholeTask });
     });
+    if (previous) return result;
     try {
       const shownPlan = planInput.readOnlyWholeTask ? boundedReadApprovalPlan(plan) : plan;
       const card = (config.approvalCardSender ?? sendApprovalCard)(approverId, { approvalId, ...approvalDetails(input.messageId, input.operation, input.capabilityId),
@@ -344,7 +382,9 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       const automaticReviewEnabled = () => store.setting("turnAutoApprovalEnabled", "false") === "true";
       const decision = Promise.resolve().then(async (): Promise<WholeTaskDecision> => {
         if (!stillCurrent()) return { approved: false, status: "failed" };
-        if (options.allowModelReview && automaticReviewEnabled()) {
+        const hasOriginalCard = input.retainedRequestId && store.db.prepare(
+          "SELECT 1 FROM lark_retained_approval_links WHERE turn_id=? AND request_id=?").get(input.turnId, input.retainedRequestId);
+        if (!hasOriginalCard && options.allowModelReview && automaticReviewEnabled()) {
           const result = await waitForTurnAuthorization(reviewLarkTurnAutoApproval(reviewed), options.signal);
           options.assertActive();
           if (!stillCurrent()) return { approved: false, status: "failed" };
@@ -442,7 +482,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       }
     };
   };
-  const removeExternalNativeApprovalHandler = setExternalNativeApprovalHandler(async (messageId, turnId, operation, signal, stillCurrent) => {
+  const removeExternalNativeApprovalHandler = setExternalNativeApprovalHandler(async (messageId, turnId, operation, signal, stillCurrent, retainedRequestId) => {
     const source = store.db.prepare("SELECT sender_id, content, codex_session_id FROM lark_messages WHERE id=?").get(messageId) as
       { sender_id: string | null; content: string; codex_session_id: string | null } | undefined;
     if (!source?.sender_id || !approverId || isTrustedLarkSender(source.sender_id)) return false;
@@ -456,7 +496,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     };
     assertActive();
     const input: TurnApprovalInput = { messageId, turnId, senderId: source.sender_id, originalMessage: source.content ?? "",
-      operation: operation.text, operationKind: "capability", cwd: operation.cwd };
+      operation: operation.text, operationKind: "capability", cwd: operation.cwd, retainedRequestId };
     const approval = await authorizeTurnOperation(input, { required: true, allowModelReview: true, nativePermission: true,
       display: operation.text, sessionId: source.codex_session_id, signal, assertActive, stillCurrent });
     assertActive();
@@ -469,6 +509,11 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     for (const row of rows) {
       if (!row) continue;
       const pending = pendingApprovals.get(row.id);
+      if (!pending && row.turn_id && retainedApproval(row.id) && hasRetainedLarkBinding(row.lark_message_id, row.turn_id)
+        && liveTurn(row.lark_message_id, row.turn_id) && approvalIdentityMatches(row) && row.approver_id === approverId) {
+        if (Date.parse(row.expires_at) <= Date.now()) settleApproval(row.id, "expired");
+        continue;
+      }
       if (!pending || pending.stillCurrent && !pending.stillCurrent() || !liveTurn(row.lark_message_id, row.turn_id ?? "")
         || !approvalIdentityMatches(row) || row.approver_id !== approverId)
         settleApproval(row.id, "failed", "once", "对应会话或审批等待已结束，操作未执行。");
@@ -483,7 +528,15 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   const decide = async (id: number, decision: "approve" | "approve-turn" | "reject", actorId?: string, messageId?: string) => {
     const row = store.approval(id);
     if (!row || row.status !== "pending" || (actorId && (actorId !== row.approver_id || messageId !== row.card_message_id))) return { ok: false };
-    if (!await confirmTurn(row.lark_message_id, row.turn_id ?? "")) {
+    const retainedRequest = retainedApproval(id);
+    if (retainedRequest && row.turn_id && hasRetainedLarkBinding(row.lark_message_id, row.turn_id)) {
+      const deadline = Date.now() + 1_500;
+      while (!pendingApprovals.has(id) && Date.now() < deadline && !runtimeClosing.signal.aborted) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (runtimeClosing.signal.aborted || !pendingApprovals.has(id)
+        || !await confirmRetainedLarkRequest(row.lark_message_id, row.turn_id, retainedRequest)) return { ok: false };
+    } else if (!await confirmTurn(row.lark_message_id, row.turn_id ?? "")) {
       settleApproval(id, "failed", "once", "无法确认原生会话仍在执行，操作未执行。"); return { ok: false };
     }
     const pending = pendingApprovals.get(id);
@@ -502,6 +555,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   });
   app.addHook("preClose", async () => {
     runtimeClosing.abort();
+    stopRetainedLarkRecovery();
     stopListener();
     removeExternalNativeApprovalHandler();
     removeWholeTurnHandler();
@@ -524,6 +578,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     void decideApprovalFromCard(event);
     return true;
   });
+  startRetainedLarkRecovery();
   const invokeHost = async (capability: StoredCapability, input: unknown, context: Record<string, unknown>): Promise<unknown> => {
     if (capability.id === "lark.chat.create") return groupManagement.create(input);
     if (capability.id === "lark.chat.list_managed") return groupManagement.list(input);
@@ -1257,15 +1312,21 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     }
     return allSettings();
   });
-  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); store.close(); } };
+  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { runtimeClosing.abort(); stopRetainedLarkRecovery(); stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {
   const port = Number(process.env.PORT ?? 4780);
+  const retainedEngineHost = process.env.LARK_AGENT_ENGINE_HOST_SOCKET ? {
+    socketPath: process.env.LARK_AGENT_ENGINE_HOST_SOCKET,
+    token: process.env.LARK_AGENT_ENGINE_HOST_TOKEN ?? "",
+    engineIds: (process.env.LARK_AGENT_ENGINE_HOST_ENGINES ?? "").split(",").map(id => id.trim()).filter(Boolean)
+  } : undefined;
+  delete process.env.LARK_AGENT_ENGINE_HOST_TOKEN;
   // The old pilot launcher must never be promoted to native workspace access implicitly.
   const executionEngines = configuredNativeAcpEngines(process.env, id =>
     console.warn(`Native ACP engine ${id} is unavailable: check the configured launcher`));
-  const runtime = createRuntime({ executionEngines, wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
+  const runtime = createRuntime({ executionEngines, retainedEngineHost, codexSocket: process.env.LARK_AGENT_CODEX_APP_SERVER_SOCKET, wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
   await runtime.app.listen({ host: "127.0.0.1", port });
   const recoveryLifetime = new AbortController();
   resumeQueuedLarkCodexReplies();

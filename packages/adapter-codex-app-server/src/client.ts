@@ -80,7 +80,7 @@ export class CodexAppServerClient {
 
   constructor(
     private readonly cwd: () => string,
-    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv; socketPath?: string } = {}
+    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv; socketPath?: string | (() => string | undefined) } = {}
   ) {}
 
   status(): { running: boolean; pid: number | null; lastError: string | null } {
@@ -168,7 +168,8 @@ export class CodexAppServerClient {
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
     this.lastError = null;
-    if (this.launch.socketPath) await this.connectSocket(this.launch.socketPath);
+    const socketPath = typeof this.launch.socketPath === "function" ? this.launch.socketPath() : this.launch.socketPath;
+    if (socketPath) await this.connectSocket(socketPath);
     else this.spawnProcess();
     await this.requestStarted("initialize", {
       clientInfo: {

@@ -18,13 +18,20 @@ export function quarantineLarkExecution(database: Database.Database, id: number,
     WHERE id=? AND codex_status IN ('queued','running')`).run(larkUncertainExecution, at, larkUncertainExecution, id).changes;
 }
 
-export function reconcileLarkCrash(database: Database.Database, at: string): void {
+export function reconcileLarkCrash(database: Database.Database, at: string, retainHostTurns = false, retainNativeTurns = false): void {
   database.transaction(() => {
     // A stale card can never approve a request in a different runtime.
     database.prepare(`UPDATE lark_execution_approvals SET status='failed',card_error=?,decided_at=?
       WHERE status='pending'`).run(interruptedApproval, at);
     database.prepare(`UPDATE lark_capability_approvals SET status='failed',error=?,decided_at=?
-      WHERE status='pending'`).run(interruptedApproval, at);
+      WHERE status='pending' AND NOT EXISTS (
+        SELECT 1 FROM lark_retained_approval_links link WHERE link.approval_id=lark_capability_approvals.id
+          AND link.turn_id=lark_capability_approvals.turn_id AND (
+            (?=1 AND EXISTS(SELECT 1 FROM lark_retained_turns turn WHERE turn.turn_id=link.turn_id AND turn.finalized=0
+              AND turn.message_id=lark_capability_approvals.lark_message_id))
+            OR (?=1 AND EXISTS(SELECT 1 FROM lark_native_socket_turns turn WHERE turn.turn_id=link.turn_id
+              AND turn.message_id=lark_capability_approvals.lark_message_id)))
+      )`).run(interruptedApproval, at, Number(retainHostTurns), Number(retainNativeTurns));
     const inFlightCalls = database.prepare("SELECT DISTINCT lark_message_id FROM lark_capability_invocations WHERE status='running'")
       .pluck().all() as number[];
     for (const id of inFlightCalls) quarantineLarkExecution(database, id, at);
@@ -32,7 +39,13 @@ export function reconcileLarkCrash(database: Database.Database, at: string): voi
       WHERE status='running'`).run(larkUncertainExecution, at);
 
     const messages = database.prepare(`SELECT id,codex_dispatch_phase phase,codex_dispatch_context context,reply_trigger
-      FROM lark_messages WHERE codex_status IN ('queued','running')`).all() as Array<{ id: number; phase: string | null; context: string | null; reply_trigger: string }>;
+      FROM lark_messages WHERE codex_status IN ('queued','running') AND (?=0 OR NOT EXISTS (
+        SELECT 1 FROM lark_retained_turns turn WHERE turn.message_id=lark_messages.id AND turn.turn_id=lark_messages.codex_turn_id
+        AND turn.finalized=0 AND lark_messages.codex_dispatch_phase='submitted'
+      )) AND (?=0 OR NOT EXISTS (
+        SELECT 1 FROM lark_native_socket_turns turn WHERE turn.message_id=lark_messages.id AND turn.turn_id=lark_messages.codex_turn_id
+        AND turn.thread_id=lark_messages.codex_session_id AND lark_messages.codex_dispatch_phase='submitted'
+      ))`).all(Number(retainHostTurns), Number(retainNativeTurns)) as Array<{ id: number; phase: string | null; context: string | null; reply_trigger: string }>;
     const requeue = database.prepare(`UPDATE lark_messages SET codex_status='queued',codex_dispatch_phase='queued',
       codex_reply=NULL,codex_error=NULL,codex_started_at=NULL,codex_finished_at=NULL,
       codex_last_heartbeat_at=NULL,codex_runner_generation=NULL,codex_turn_id=NULL,codex_session_id=NULL
@@ -65,7 +78,7 @@ const probes = new WeakSet<Database.Database>();
 type InterruptedTurn = { id: number; threadId: string; turnId: string };
 type Request = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
-async function readCompleteTurnItems(request: Request, row: InterruptedTurn): Promise<Record<string, unknown>[] | undefined> {
+export async function readCompleteTurnItems(request: Request, row: Pick<InterruptedTurn, "threadId" | "turnId">): Promise<Record<string, unknown>[] | undefined> {
   const result = await request("thread/items/list", { threadId: row.threadId, turnId: row.turnId, sortDirection: "asc", limit: 50 }) as {
     data?: Array<{ turnId?: string; item?: Record<string, unknown> }>; nextCursor?: string | null
   } | null;

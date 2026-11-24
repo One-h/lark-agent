@@ -50,10 +50,14 @@ export function larkMcpCodexConfig(): string[] {
   ] : [])];
 }
 
+export let larkCodexSocket: string | undefined;
+export function configureLarkCodexSocket(socketPath?: string): void { larkCodexSocket = socketPath; }
+
 export const codexAppServer = new CodexAppServerClient(
   () => config.workspaceRoot || process.cwd(),
   {
     config: larkMcpCodexConfig,
+    socketPath: () => larkCodexSocket,
     env: () => ({
       ...process.env,
       LARK_AGENT_RUNTIME_URL: config.larkAgentRuntimeUrl,

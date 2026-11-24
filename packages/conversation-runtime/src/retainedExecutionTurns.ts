@@ -29,7 +29,7 @@ export class RetainedExecutionTurns {
 
   constructor(private readonly limits = { turns: 64, eventsPerTurn: 512, rememberedIds: 16_384 }) {}
 
-  start(id: string, engine: ExecutionEngine, options: OpenOptions, text: string): void {
+  start(id: string, engine: ExecutionEngine, options: OpenOptions, text: string, duration?: number): void {
     if (this.stopping) throw new Error("Execution host is stopping");
     if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id) || this.turns.has(id)) throw new Error("Invalid or existing execution turn ID");
     if (this.turns.size >= this.limits.rememberedIds
@@ -41,7 +41,8 @@ export class RetainedExecutionTurns {
       events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), done: Promise.resolve()
     };
     this.turns.set(id, turn);
-    turn.done = this.run(turn, engine, options, text);
+    const timer = duration === undefined ? undefined : setTimeout(() => turn.controller.abort(), duration).unref();
+    turn.done = this.run(turn, engine, options, text).finally(() => clearTimeout(timer));
   }
 
   attach(id: string, afterSequence = 0) {
@@ -66,7 +67,13 @@ export class RetainedExecutionTurns {
 
   cancel(id: string): boolean {
     const turn = this.turns.get(id);
-    if (!turn || turn.status.state !== "active" && turn.status.state !== "starting") return false;
+    if (!turn) {
+      if (this.turns.size >= this.limits.rememberedIds) return false;
+      this.turns.set(id, { engineId: "", status: { state: "acknowledged", sessionId: null }, controller: new AbortController(),
+        events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), done: Promise.resolve() });
+      return true;
+    }
+    if (turn.status.state !== "active" && turn.status.state !== "starting") return false;
     turn.controller.abort();
     return true;
   }
@@ -93,6 +100,10 @@ export class RetainedExecutionTurns {
   private async run(turn: Turn, engine: ExecutionEngine, options: OpenOptions, text: string): Promise<void> {
     let session: Awaited<ReturnType<ExecutionEngine["open"]>> | undefined;
     let sessionKey: string | undefined;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    let closing: Promise<void> | undefined;
+    const closeSession = () => closing ??= Promise.resolve().then(() => session?.close()).catch(() => {});
+    const closeOnAbort = () => { closeTimer = setTimeout(() => { void closeSession(); }, 5_000).unref(); };
     const bindSession = (sessionId: string) => {
       const key = JSON.stringify([engine.descriptor.id, sessionId]);
       if (this.boundSessions.has(key)) throw new Error("Execution engine session is already active");
@@ -131,6 +142,7 @@ export class RetainedExecutionTurns {
       if (options.sessionId === null) bindSession(session.id);
       else if (options.sessionId !== session.id) throw new Error("Execution engine returned a different session");
       turn.status = { state: "active", sessionId: session.id };
+      turn.controller.signal.addEventListener("abort", closeOnAbort, { once: true });
       const result = await session.run(text, turn.controller.signal, event => {
         turn.events.push({ sequence: ++turn.sequence, event });
         if (event.type === "text-delta") turn.retainedTextChars += event.text.length;
@@ -143,8 +155,10 @@ export class RetainedExecutionTurns {
     } catch {
       turn.status = { state: "failed", sessionId: session?.id ?? null };
     } finally {
+      turn.controller.signal.removeEventListener("abort", closeOnAbort);
+      clearTimeout(closeTimer);
       turn.controller.abort();
-      await Promise.resolve().then(() => session?.close()).catch(() => {});
+      await closeSession();
       if (sessionKey) this.boundSessions.delete(sessionKey);
     }
   }

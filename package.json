@@ -18,7 +18,8 @@
     "test:sticker-mcp-resume": "tsx scripts/verify-sticker-mcp-resume.ts",
     "test:rapid-session-reuse": "tsx scripts/verify-rapid-session-reuse.ts",
     "import:forge-history": "tsx scripts/import-forge-history.ts",
-    "serve": "tsx apps/runtime/src/index.ts"
+    "serve": "tsx apps/runtime/src/index.ts",
+    "serve:engine-host": "tsx apps/runtime/src/engineHost.ts"
   },
   "workspaces": ["apps/*", "packages/*"],
   "dependencies": {

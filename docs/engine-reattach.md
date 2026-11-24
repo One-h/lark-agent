@@ -1,7 +1,8 @@
-# Engine reattachment components
+# Opt-in Lark engine reattachment
 
-These components do not change how a running Lark Agent owns turns or handles
-startup. Do not enable a different engine launch mode based on this document.
+This mode is disabled by default. The existing stdio paths are unchanged unless
+an operator selects a private independent engine host. Only one Lark runtime
+may open the database. Keep the engine host running across Lark restarts.
 
 - The Codex adapter can connect to an operator-owned App Server over its Unix
   WebSocket instead of spawning a stdio child. Closing the socket client does
@@ -22,23 +23,42 @@ startup. Do not enable a different engine launch mode based on this document.
   is not evidence that a previous turn never ran. Do not automatically replay
   against a replacement host, including when the start response was lost.
 
-## Required before enabling in Lark
+## Lark recovery
 
-Persist the Lark source message, trust policy, engine generation, native
-session/turn or host turn ID, approval correlation and event cursor. Record the
-submission boundary before calling an engine. During startup, attach to the
-original turn before existing orphan cleanup can invalidate its card. Apply the
-same requester, approver, expiry and in-flight policy checks to any reattached
-approval. Do not infer authority from a host request ID alone. Commit the final
-result and current delivery intent before acknowledging it to the engine host.
-If terminal delivery is uncertain, use the existing readback rules rather than
-resending.
+The runtime journals the source message and the submission boundary. ACP
+binds to the host generation and turn ID; Codex binds to the socket identity,
+accepted thread and turn. A bound card is kept only when it can be correlated
+to the original live permission request, source, actor and deadline. If the
+host changed or the operation cannot be confirmed, no approval is granted and
+the prompt is not resubmitted.
 
-Exercise end-to-end recovery against a disposable database and Lark sender:
-original card after runtime restart, rejection and expiration, cancellation,
-event cursor gaps, lost submit response, ambiguous reply delivery, and
-independent host death. The test should assert that no second native prompt is
-started for an uncertain original turn.
+Final answers and pending delivery intents are committed together. The ACP
+result is acknowledged only after that commit. An uncertain remote send uses
+the existing readback rules rather than an unconditional resend.
+
+### Configure in an isolated trial
+
+- Codex: run a dedicated Codex App Server with `--listen unix://<private-socket>`.
+  Set `LARK_AGENT_CODEX_APP_SERVER_SOCKET` on Lark. Do not share the socket
+  with the desktop app or another controller. The normal workspace, model,
+  and thread approval settings remain in effect; native approvals recover
+  through the whole-turn approval path.
+- ACP: run `npm run serve:engine-host` independently with the same configured
+  ACP launchers, models, and `LARK_AGENT_WORKSPACE_ROOT`. Set
+  `LARK_AGENT_ENGINE_HOST_SOCKET` and the same private
+  `LARK_AGENT_ENGINE_HOST_TOKEN` in both processes. The socket's parent
+  directory must be user-owned with no group or other access. Select hosted
+  engine IDs on Lark with `LARK_AGENT_ENGINE_HOST_ENGINES` (comma-separated).
+  A hosted engine never falls back to a different launcher to bypass its policy.
+
+This initial mode covers single-input text turns with native permission
+callbacks. It serializes inputs rather than steering an in-flight turn. Hosted
+ACP does not mount Lark MCP tools. In-flight Lark MCP callbacks, transient
+attachment or sticker state, and legacy Codex per-operation cards are not
+reattached. The engine host itself cannot be hot restarted.
+
+To return to stdio, drain hosted turns and verify pending replies before
+removing the opt-in settings. Never drop the recovery rows to force a replay.
 
 ## Existing verification
 
@@ -46,5 +66,7 @@ The adapter suite covers Codex socket reconnect and a local ACP protocol
 fixture through each of the Claude, DSH, OpenCode and AGY adapters. The ACP
 tests stop the first socket client, reconnect with another process, verify
 the exact permission ID, reject duplicate and mismatched decisions, and read
-one final result. OpenCode uses the ACP path in these tests; its separate
-native HTTP API is not covered.
+one final result. Runtime tests use a disposable SQLite database and a fake
+Feishu transport, exercising the existing Lark card handler for all five
+engine routes. The tests do not send live messages, replay real commands or
+enable these settings on a running bot. OpenCode uses ACP in this mode.

@@ -14,7 +14,7 @@ const calls = z.discriminatedUnion("method", [
   z.strictObject({
     method: z.literal("start"), generation, id, engineId: id, text: z.string().min(1).max(24_000),
     sessionId: z.string().min(1).max(256).nullable(), model: z.string().min(1).max(256).nullable(),
-    trusted: z.boolean()
+    trusted: z.boolean(), deadline: z.iso.datetime().optional()
   }),
   z.strictObject({ method: z.literal("attach"), generation, id, afterSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) }),
   z.strictObject({ method: z.literal("answerApproval"), generation, id, requestId: z.uuid(), allow: z.boolean() }),
@@ -70,7 +70,7 @@ export async function listenRetainedExecutionHost(options: {
     try {
       const call = await parseRequest(req);
       if (!call) return send(400, { error: "invalid request" });
-      if (call.method === "status") return send(200, { generation: hostGeneration });
+      if (call.method === "status") return send(200, { generation: hostGeneration, workspace: options.workspace });
       if (call.generation !== hostGeneration) return send(409, { error: "execution host generation changed" });
       if (call.method === "attach") return send(200, turns.attach(call.id, call.afterSequence));
       if (call.method === "answerApproval") return send(200, { accepted: turns.answerApproval(call.id, call.requestId, call.allow) });
@@ -81,7 +81,9 @@ export async function listenRetainedExecutionHost(options: {
       if (!engine || !engine.supportsPolicy(policy) || call.model !== null && !engine.descriptor.models.includes(call.model)) {
         return send(422, { error: "engine cannot enforce requested execution policy" });
       }
-      turns.start(call.id, engine, { model: call.model, sessionId: call.sessionId, policy, mcpServers: options.mcpServers }, call.text);
+      const duration = call.deadline ? Date.parse(call.deadline) - Date.now() : undefined;
+      if (duration !== undefined && (duration <= 0 || duration > 600_000)) return send(422, { error: "invalid execution deadline" });
+      turns.start(call.id, engine, { model: call.model, sessionId: call.sessionId, policy, mcpServers: options.mcpServers }, call.text, duration);
       send(202, { started: true });
     } catch {
       if (!res.headersSent) send(409, { error: "execution host cannot apply request" });

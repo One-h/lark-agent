@@ -28,6 +28,7 @@ export function configuredTurnAutoApprovalDataSources(database: Database.Databas
 }
 export type ApprovalTask = { type: "pr_review" | "data_query" | "deployment" | "deployment_query"; target: string };
 export type TurnApprovalInput = {
+  retainedRequestId?: string;
   messageId: number; turnId: string; senderId: string | null;
   originalMessage: string; operation: string; cwd: string | null;
   operationIntent?: string | null;

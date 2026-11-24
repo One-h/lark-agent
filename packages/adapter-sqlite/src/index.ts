@@ -172,6 +172,19 @@ export class SqliteAgentStore {
       );
       CREATE TABLE IF NOT EXISTS lark_codex_sessions (session_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, trust_scope TEXT NOT NULL, codex_session_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS lark_topic_engine_runs (lark_message_id INTEGER PRIMARY KEY, engine_id TEXT NOT NULL, model TEXT, session_id TEXT, turn_id TEXT);
+      CREATE TABLE IF NOT EXISTS lark_retained_turns (
+        message_id INTEGER PRIMARY KEY, turn_id TEXT NOT NULL UNIQUE, generation TEXT NOT NULL,
+        session_key TEXT NOT NULL, engine_id TEXT NOT NULL, trusted INTEGER NOT NULL,
+        deadline TEXT NOT NULL, finalized INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS lark_retained_approval_links (
+        turn_id TEXT NOT NULL, request_id TEXT NOT NULL, approval_id INTEGER NOT NULL UNIQUE, policy_hash TEXT NOT NULL,
+        PRIMARY KEY (turn_id, request_id)
+      );
+      CREATE TABLE IF NOT EXISTS lark_native_socket_turns (
+        message_id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL UNIQUE,
+        socket_identity TEXT NOT NULL, execution_config TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS lark_codex_archive_queue (thread_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, activity_version INTEGER NOT NULL, token TEXT NOT NULL, due_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_lark_codex_archive_queue_due ON lark_codex_archive_queue(due_at);
       CREATE TABLE IF NOT EXISTS lark_owner_mention_assists (
