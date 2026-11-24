@@ -57,6 +57,8 @@ async function handle({id, method, params}) {
   if (method === "session/prompt") {
     const context = params.prompt[0].text.match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
     assert(context);
+    assert.match(params.prompt[0].text, /自行判断是否下派/);
+    assert.doesNotMatch(params.prompt[0].text, /仅在明确委派/);
     assert.equal(params.sessionId, "original-native-session");
     fs.appendFileSync(${JSON.stringify(marker("prompts"))}, ${JSON.stringify("prompt\n")});
     assert((await tools.listTools()).tools.some(tool => tool.name === "lark_task_orchestration"));

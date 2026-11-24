@@ -1,5 +1,11 @@
 import { createHmac } from "node:crypto";
 
+export const larkTaskDispatchGuidance =
+  "根据用户目标、当前上下文和可用引擎，自行判断是否下派。" +
+  "能在当前会话直接完成的就直接做；当独立分工、并行推进或换用更合适的引擎能明显改善结果时，可在原任务范围内下派。" +
+  "用户指定执行引擎或要求不下派时，按用户要求处理；未指定引擎时选已知可用且适合的引擎。" +
+  "已有任务的补充交给原 Worker。下派不意味着额外加验收或扩大授权。";
+
 // Neither the MCP server nor the native agent receives the host control key.
 // Distinct derivations keep catalog authentication separate from turn authority.
 export function retainedForegroundMcpBearer(controlKey: string): string {
@@ -19,5 +25,5 @@ export function larkMcpToolsInstruction(token?: string, trusted = false): string
 
 export function retainedForegroundMcpPrompt(text: string, controlKey: string, generation: string, turnId: string, trusted: boolean): string {
   const token = retainedForegroundMcpContextToken(controlKey, generation, turnId);
-  return `${text}\n\n${larkMcpToolsInstruction(token, trusted)}\n若目录提供 lark_task_orchestration，仅在明确委派或跟进已委派任务时使用该工具。`;
+  return `${text}\n\n${larkMcpToolsInstruction(token, trusted)}\n若目录提供 lark_task_orchestration：${larkTaskDispatchGuidance}`;
 }

@@ -44,7 +44,7 @@ import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { TaskOrchestration, taskCommand, taskInputSchema, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
 import { TaskArtifacts } from "./plugins/taskArtifacts.js";
 import { RetainedExecutionClient } from "@lark-agent/conversation-runtime";
-import { confirmRetainedLarkMcpTurn, hasRetainedLarkForegroundBinding,
+import { confirmRetainedLarkMcpTurn, hasRetainedLarkForegroundBinding, larkTaskDispatchGuidance,
   resolveLarkMcpToolContext, retainedForegroundMcpBearer } from "@lark-agent/conversation-runtime";
 import { readLarkReplyReceipt, sendLarkFileReply, uploadLarkReplyFile } from "@lark-agent/adapter-lark-cli";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
@@ -1204,7 +1204,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   app.get("/v1/internal/mcp/tools", async (request, reply) => {
     if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
     return { tools: [...listLarkMcpTools(Boolean(config.runtimeToken) && !retainedMcp(request)), ...(taskOrchestration ? [{
-      name: "lark_task_orchestration", description: "Only for explicit delegation or follow-up of a delegated task. Do not use for ordinary questions. " +
+      name: "lark_task_orchestration", description: larkTaskDispatchGuidance + " " +
         "Dispatch records the goal, constraints, deliverables, resources and Worker; the existing skill controls worktree use. " +
         "Read list for the current revision before an update. Follow up with the original Worker; reserve rework for an explicit agent decision " +
         "within an unused preauthorized allowance. Only use accept or amend_review for the requester's explicit instruction. " +

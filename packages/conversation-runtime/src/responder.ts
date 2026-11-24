@@ -16,7 +16,7 @@ import { hasLarkManualTurnApproval, LarkApprovalError, larkNativeSocketReconnect
 import { RetainedLarkExecution } from "./retainedLarkExecution.js";
 import type { RetainedHostConfig } from "./retainedExecutionClient.js";
 import { larkMcpToolsInstruction } from "./retainedForegroundMcp.js";
-export { retainedForegroundMcpBearer, retainedForegroundMcpPrompt } from "./retainedForegroundMcp.js";
+export { larkTaskDispatchGuidance, retainedForegroundMcpBearer, retainedForegroundMcpPrompt } from "./retainedForegroundMcp.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { postHostJson } from "./hostHttp.js";
 import { rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";

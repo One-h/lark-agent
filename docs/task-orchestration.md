@@ -1,6 +1,6 @@
 # Delegated Tasks
 
-The optional task-orchestration plugin adds an authenticated `lark_task_orchestration` tool to the existing Lark MCP catalog. Ordinary conversations keep their current route. Use the tool only when the user explicitly delegates a task or follows up on one.
+The optional task-orchestration plugin adds an authenticated `lark_task_orchestration` tool to the existing Lark MCP catalog. The current agent decides whether to answer directly or delegate within the user's request, based on the benefit of independent work, parallelism, or a more suitable available engine. Explicit engine assignments and requests not to delegate take precedence. Follow-ups go to the original Worker. The scheduler does not classify requests or relax permissions.
 
 ## Pilot Setup
 

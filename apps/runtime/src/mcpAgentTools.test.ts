@@ -383,7 +383,9 @@ test("delegation MCP uses the source identity and does not start before the orig
     assert(token && secret);
     const headers = { authorization: `Bearer ${secret}` };
     const catalog = await runtime.app.inject({ url: "/v1/internal/mcp/tools", headers });
-    assert(catalog.json().tools.some((tool: { name: string }) => tool.name === "lark_task_orchestration"));
+    const taskTool = catalog.json().tools.find((tool: { name: string }) => tool.name === "lark_task_orchestration");
+    assert.match(taskTool?.description ?? "", /自行判断是否下派/);
+    assert.match(taskTool.description, /用户指定执行引擎或要求不下派时，按用户要求处理/);
     const payload = { tool: "lark_task_orchestration", contextToken: token,
       input: { action: "dispatch", goal: "Research the fixture", worker: { engine: "claude" } } };
     const call = runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call", headers, payload });
