@@ -79,12 +79,29 @@ type InterruptedTurn = { id: number; threadId: string; turnId: string };
 type Request = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
 export async function readCompleteTurnItems(request: Request, row: Pick<InterruptedTurn, "threadId" | "turnId">): Promise<Record<string, unknown>[] | undefined> {
-  const result = await request("thread/items/list", { threadId: row.threadId, turnId: row.turnId, sortDirection: "asc", limit: 50 }) as {
-    data?: Array<{ turnId?: string; item?: Record<string, unknown> }>; nextCursor?: string | null
-  } | null;
-  if (result?.nextCursor !== null || !Array.isArray(result.data) || !result.data.length
-    || result.data.some(entry => !entry || entry.turnId !== row.turnId || !entry.item || typeof entry.item.type !== "string")) return;
-  return result.data.map(entry => entry.item!);
+  const items: Record<string, unknown>[] = [];
+  const cursors = new Set<string>();
+  const seenIds = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const result = await request("thread/items/list", {
+      threadId: row.threadId, turnId: row.turnId, sortDirection: "asc", limit: 10, ...(cursor ? { cursor } : {})
+    }) as { data?: Array<{ turnId?: string; item?: Record<string, unknown> }>; nextCursor?: string | null } | null;
+    if (!Array.isArray(result?.data) || !result.data.length || result.data.length > 10) return;
+    for (const entry of result.data) {
+      if (!entry?.item || entry.turnId !== row.turnId || typeof entry.item.type !== "string") return;
+      const id = entry.item.id;
+      if (typeof id === "string") {
+        if (seenIds.has(id)) return;
+        seenIds.add(id);
+      }
+      items.push(entry.item);
+    }
+    if (result.nextCursor === null) return items;
+    if (typeof result.nextCursor !== "string" || !result.nextCursor || cursors.has(result.nextCursor)) return;
+    cursor = result.nextCursor;
+    cursors.add(cursor);
+  }
 }
 
 export async function reconcileInterruptedNativeTurns(database: Database.Database, request: Request,

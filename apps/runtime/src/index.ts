@@ -15,6 +15,7 @@ import { registerHostOutboundRoutes } from "./outbound.js";
 import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerLarkSignalShutdown } from "./shutdown.js";
+import { larkNativeSocketReconnecting, onLarkNativeTurnDetached } from "@lark-agent/conversation-runtime";
 import { registerLarkRuntimePlugin, registerLarkRouteBroker, type LarkRuntimePlugin } from "@lark-agent/conversation-runtime";
 import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
 import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
@@ -51,7 +52,7 @@ import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, fo
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"];
-  retainedEngineHost?: RetainedHostConfig; codexSocket?: string; plugins?: readonly LarkRuntimePlugin[] };
+  retainedEngineHost?: RetainedHostConfig; codexSocket?: string; codexSocketMaxPayloadMiB?: number; plugins?: readonly LarkRuntimePlugin[] };
 const groupAskCapability = "lark.group.ask";
 const groupReplyCapability = "lark.group.ask_reply";
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
@@ -214,7 +215,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     reportError: phase => app.log.warn({ phase }, "managed_lark_chat_unconfirmed")
   });
   configureRetainedLarkExecution(config.retainedEngineHost);
-  configureNativeLarkRecovery(config.codexSocket);
+  configureNativeLarkRecovery(config.codexSocket, config.codexSocketMaxPayloadMiB);
   reconcileLarkCodexResponder();
   reconcileOwnerMentionAssists();
   const pendingApprovals = new Map<number, PendingApproval>();
@@ -327,7 +328,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     })();
     const result = new Promise<LarkApprovalStatus>(resolve => {
       const abort = () => {
-        if (retainedRequest && runtimeClosing.signal.aborted) {
+        if (retainedRequest && (runtimeClosing.signal.aborted || signal.reason === larkNativeSocketReconnecting)) {
           const pending = pendingApprovals.get(approvalId);
           if (pending) { clearTimeout(pending.timer); pending.cleanup(); pendingApprovals.delete(approvalId); }
           resolve("failed");
@@ -552,10 +553,12 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     if (ok && decision === "approve-turn") expirePendingApprovals();
     return { ok };
   };
-  const removeTurnListener = onLarkTurnEnded(store.db, turnId => {
+  const clearLocalAuthorization = (turnId: string) => {
     wholeTasks.delete(turnId);
     for (const call of authorizations) if (call.turnId === turnId && !call.started) call.controller.abort();
-  });
+  };
+  const removeTurnListener = onLarkTurnEnded(store.db, clearLocalAuthorization);
+  const removeDetachListener = onLarkNativeTurnDetached(store.db, clearLocalAuthorization);
   app.addHook("preClose", async () => {
     runtimeClosing.abort();
     stopRetainedLarkRecovery();
@@ -571,6 +574,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     stopProgressObserver();
     await drainOwnerAssistNotifications();
     removeTurnListener();
+    removeDetachListener();
   });
   const decideApprovalFromCard = (event: Record<string, unknown>) => {
     const action = capabilityApprovalAction(event);
@@ -1326,7 +1330,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     }
     return allSettings();
   });
-  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { runtimeClosing.abort(); stopRetainedLarkRecovery(); stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); store.close(); } };
+  return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener, stop: () => { runtimeClosing.abort(); stopRetainedLarkRecovery(); stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); removeDetachListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {
@@ -1340,7 +1344,10 @@ if (process.argv[1]?.endsWith("index.ts")) {
   // The old pilot launcher must never be promoted to native workspace access implicitly.
   const executionEngines = configuredNativeAcpEngines(process.env, id =>
     console.warn(`Native ACP engine ${id} is unavailable: check the configured launcher`));
-  const runtime = createRuntime({ executionEngines, retainedEngineHost, codexSocket: process.env.LARK_AGENT_CODEX_APP_SERVER_SOCKET, wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
+  const configuredPayload = process.env.LARK_AGENT_CODEX_SOCKET_MAX_PAYLOAD_MIB;
+  const runtime = createRuntime({ executionEngines, retainedEngineHost, codexSocket: process.env.LARK_AGENT_CODEX_APP_SERVER_SOCKET,
+    codexSocketMaxPayloadMiB: configuredPayload === undefined ? undefined : Number(configuredPayload),
+    wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });
   await runtime.app.listen({ host: "127.0.0.1", port });
   const recoveryLifetime = new AbortController();
   resumeQueuedLarkCodexReplies();

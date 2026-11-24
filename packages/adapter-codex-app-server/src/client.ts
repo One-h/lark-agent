@@ -5,6 +5,17 @@ import WebSocket from "ws";
 import { resolveCodexExecutable } from "./executable.js";
 import { serializeCodexAppServerMessage } from "./unicode.js";
 
+export const codexSocketDefaultMaxPayloadMiB = 128;
+export function codexSocketMaxPayloadBytes(value = codexSocketDefaultMaxPayloadMiB): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 512) {
+    throw new Error("Codex socket maximum payload must be an integer from 1 to 512 MiB");
+  }
+  return value * 1024 * 1024;
+}
+
+type Transport = "socket" | "stdio";
+type ExitListener = (error: Error, transport: Transport) => void;
+
 export type CodexAppServerNotification = {
   method: string;
   params?: unknown;
@@ -73,14 +84,15 @@ export class CodexAppServerClient {
   private readonly pending = new Map<number, PendingRequest>();
   private readonly notificationListeners = new Set<(notification: CodexAppServerNotification) => void>();
   private readonly requestListeners = new Set<(request: CodexAppServerRequest) => boolean>();
-  private readonly exitListeners = new Set<(error: Error) => void>();
+  private readonly exitListeners = new Set<ExitListener>();
   private readonly stderrListeners = new Set<(text: string) => void>();
   private lastError: string | null = null;
   private stopping = false;
 
   constructor(
     private readonly cwd: () => string,
-    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv; socketPath?: string | (() => string | undefined) } = {}
+    private readonly launch: { config?: () => string[]; env?: () => NodeJS.ProcessEnv;
+      socketPath?: string | (() => string | undefined); socketMaxPayloadMiB?: () => number | undefined } = {}
   ) {}
 
   status(): { running: boolean; pid: number | null; lastError: string | null } {
@@ -109,7 +121,7 @@ export class CodexAppServerClient {
     this.write({ id, error: { code, message } });
   }
 
-  onExit(listener: (error: Error) => void): () => void {
+  onExit(listener: ExitListener): () => void {
     this.exitListeners.add(listener);
     return () => this.exitListeners.delete(listener);
   }
@@ -222,14 +234,19 @@ export class CodexAppServerClient {
       || /[:?#%]/.test(target) || !privateDirectory(path.dirname(target)) || !endpoint.isSocket() || endpoint.uid !== uid) {
       throw new Error("Codex App Server socket must be in a private user-owned directory");
     }
-    const socket = new WebSocket(`ws+unix://${target}:/`, { handshakeTimeout: 5_000, maxPayload: 32 * 1024 * 1024 });
+    const socket = new WebSocket(`ws+unix://${target}:/`, {
+      handshakeTimeout: 5_000, maxPayload: codexSocketMaxPayloadBytes(this.launch.socketMaxPayloadMiB?.())
+    });
     this.socket = socket;
     const disconnect = (error: Error) => {
       if (this.socket !== socket) return;
       this.socket = null;
-      this.handleDisconnect(error);
+      this.handleDisconnect(error, "socket");
     };
-    socket.on("error", disconnect);
+    socket.on("error", error => {
+      disconnect(error);
+      socket.terminate();
+    });
     socket.on("close", () => disconnect(new Error("Codex App Server socket closed")));
     socket.on("message", (data, binary) => {
       if (this.socket !== socket) return;
@@ -367,16 +384,16 @@ export class CodexAppServerClient {
       return;
     }
     this.process = null;
-    this.handleDisconnect(error);
+    this.handleDisconnect(error, "stdio");
   }
 
-  private handleDisconnect(error: Error): void {
+  private handleDisconnect(error: Error, transport: Transport): void {
     this.initialized = false;
     this.lastError = error.message;
     this.rejectPending(error);
     if (!this.stopping) {
       for (const listener of this.exitListeners) {
-        listener(error);
+        listener(error, transport);
       }
     }
   }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readNativeTurnState } from "./nativeTurnState.js";
+import { readCompleteTurnItems } from "./crashRecovery.js";
 import { isLarkModelCapacityError } from "./capacityRecovery.js";
 
 test("native startup state requires the exact turn and active runtime, not merely a responding server", async () => {
@@ -13,7 +14,7 @@ test("native startup state requires the exact turn and active runtime, not merel
     }, "thread", "target");
     assert.equal(result.status, threadStatus === "active" ? "active" : "unknown");
     assert.deepEqual(calls, [
-      {method: "thread/read", params: {threadId: "thread"}},
+      {method: "thread/read", params: {threadId: "thread", includeTurns: false}},
       {method: "thread/turns/list", params: {threadId: "thread", limit: 10, sortDirection: "desc", itemsView: "summary"}}
     ]);
   }
@@ -54,4 +55,14 @@ test("missing, malformed, foreign and unknown native state cannot justify interr
     assert.equal(result.status, "unknown");
     assert.equal(count, 1);
   }
+});
+
+test("terminal item paging rejects repeated cursors and foreign turn evidence", async () => {
+  const turn = { threadId: "thread", turnId: "target" };
+  const page = (turnId: string, id: string, nextCursor: string | null) =>
+    ({ data: [{ turnId, item: { id, type: "agentMessage" } }], nextCursor });
+  assert.equal(await readCompleteTurnItems(async (_method, params) => params.cursor
+    ? page("other", "second", null) : page("target", "first", "cursor"), turn), undefined);
+  assert.equal(await readCompleteTurnItems(async (_method, params) => params.cursor
+    ? page("target", "second", "cursor") : page("target", "first", "cursor"), turn), undefined);
 });

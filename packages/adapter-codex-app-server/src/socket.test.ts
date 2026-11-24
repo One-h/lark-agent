@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import test from "node:test";
 import { WebSocketServer } from "ws";
-import { CodexAppServerClient } from "./client.js";
+import { CodexAppServerClient, codexSocketMaxPayloadBytes } from "./client.js";
 
 test("Codex socket transport can replace a client without terminating the owner", { timeout: 10_000 }, async () => {
   // Unix-domain socket paths have a small kernel limit.
@@ -63,5 +63,33 @@ test("Codex socket transport can replace a client without terminating the owner"
       new Promise<void>(resolve => server.close(() => resolve()))]);
     rmSync(root, { recursive: true, force: true });
     rmSync(aliasRoot, { recursive: true, force: true });
+  }
+});
+
+test("default receive limit accepts a reply larger than 32 MiB and configured limits stay bounded", { timeout: 15_000 }, async () => {
+  assert.equal(codexSocketMaxPayloadBytes(),128 * 1024 * 1024);
+  for (const invalid of [0, 0.5, 513, Number.NaN]) assert.throws(() => codexSocketMaxPayloadBytes(invalid));
+  const root = mkdtempSync("/tmp/lark-payload-test-");
+  const socketPath = path.join(root, "c.sock");
+  const server = http.createServer();
+  const websocket = new WebSocketServer({ server });
+  const client = new CodexAppServerClient(() => root,{ socketPath });
+  const chars = 33 * 1024 * 1024;
+  websocket.on("connection", peer => peer.on("message", data => {
+    const call = JSON.parse(data.toString());
+    if (call.method === "initialize") peer.send(JSON.stringify({ id: call.id, result: {} }));
+    if (call.method === "fixture/large") peer.send(JSON.stringify({ id: call.id, result: { text: "x".repeat(chars) } }));
+  }));
+  try {
+    server.listen(socketPath);
+    await once(server,"listening");
+    assert.equal((await client.request<{ text: string }>("fixture/large",{},10_000)).text.length, chars);
+    assert(client.status().running);
+  } finally {
+    client.stop();
+    for (const peer of websocket.clients) peer.terminate();
+    await Promise.all([new Promise<void>(resolve => websocket.close(() => resolve())),
+      new Promise<void>(resolve => server.close(() => resolve()))]);
+    rmSync(root,{recursive:true,force:true});
   }
 });

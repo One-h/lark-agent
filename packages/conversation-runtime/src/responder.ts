@@ -6,13 +6,13 @@ import { unicodeSafePrefix, type CodexAppServerNotification, type CodexAppServer
 import { larkAtTag, larkReplyIdempotencyKey, sendLarkExecutionApprovalCard, sendLarkExecutionReceiptCard, sendLarkImagePostReply, sendLarkMediaReply, updateLarkExecutionApprovalCard, updatePendingLarkExecutionApprovalCard, type LarkExecutionReceiptEntry } from "@lark-agent/adapter-lark-cli";
 import { renderLarkReply, parseLarkReplyPresentation, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
 import { readLarkReplyReceipt } from "@lark-agent/adapter-lark-cli";
-import { codexAppServer, codexAppServerActiveTurnCount, configureLarkCodexSocket, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, larkCodexSocket, larkExternalStickerMcpServer, registerCodexAppServerTurn, unregisterCodexAppServerTurn } from "./codexRuntime.js";
+import { codexAppServer, codexAppServerActiveTurnCount, configureLarkCodexSocket, isCodexAppServerTurnRegistered, larkAgentToolsMcpServer, larkCodexSocket, larkExternalStickerMcpServer, registerCodexAppServerTurn, requestLarkCodexSocketReadback, stopLarkCodexSocketReadback, unregisterCodexAppServerTurn } from "./codexRuntime.js";
 import { addLocalAuditEvent, appSettingValue, config, configuredLarkCodexModel, configuredLarkCodexReasoningEffort, configuredLarkStickerUsageMode, db, getAppSettings, isTrustedLarkSender, larkSenderReplyProfile, larkTextReplySender, larkMediaReplySender, nowIso, recordOutboundLarkMessage, setAppSettingValue, type LarkCodexSessionRow, type LarkExecutionApprovalRow, type LarkMessageRow } from "./context.js";
 import { ensureLarkStickerSelection, larkStickerPrompt, recordLarkStickerSend, stageLarkStickerSelection, stripLarkStickerSelection } from "./stickers.js";
 import { captureConversationStyle, type ConversationStyle } from "./persona.js";
 import { PromptInstructionCache, type PromptInstructionSnapshot } from "./promptInstructionCache.js";
 import { sanitizeLarkReply } from "./replySanitization.js";
-import { hasLarkManualTurnApproval, LarkApprovalError, notifyLarkTurnEnded } from "./approvalLifecycle.js";
+import { hasLarkManualTurnApproval, LarkApprovalError, larkNativeSocketReconnecting, notifyLarkNativeTurnDetached, notifyLarkTurnEnded } from "./approvalLifecycle.js";
 import { RetainedLarkExecution } from "./retainedLarkExecution.js";
 import type { RetainedHostConfig } from "./retainedExecutionClient.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
@@ -320,7 +320,8 @@ export async function confirmLarkNativeTurnActive(threadId: string, turnId: stri
   const run = [...activeLarkCodexRuns.values()].find(row => row.threadId === threadId && row.turnId === turnId && !row.settled);
   if (!run || !codexAppServer.status().running) return false;
   try {
-    const state = await readNativeTurnState((method, params) => codexAppServer.requestIfRunning(method, params, 10_000), threadId, turnId);
+    const state = await readNativeTurnState(run.socketRecovery ? requestLarkCodexSocketReadback
+      : (method, params) => codexAppServer.requestIfRunning(method, params, 10_000), threadId, turnId);
     if (!run.settled && run.turnId === turnId && ["completed", "failed", "interrupted"].includes(state.status)) {
       for (const item of state.items ?? []) {
         if (item.type === "agentMessage") handleRunNotification(run, { method: "item/completed", params: { threadId, turnId, item } });
@@ -854,6 +855,7 @@ export function buildLarkCodexThreadParams(trustedSender: boolean, lifecycle: "n
   return {
     cwd,
     model: model || null,
+    ...(lifecycle === "resume" ? { excludeTurns: true } : {}),
     approvalPolicy,
     approvalsReviewer: "user",
     sandbox,
@@ -2773,9 +2775,14 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
     if (socket?.restored && socket.terminalRead !== "complete" && !run.finalAgentMessage) {
       if (socket.terminalRead === "pending") return;
       socket.terminalRead = "pending";
-      const request = (method: string, params: Record<string, unknown>) => codexAppServer.request(method, params, 4_000);
-      void restoreNativeSocketTerminal(responseRunMember(run), run.executionConfig, request, run)
-        .catch(() => { if (!run.settled) detachNativeLarkRun(run); });
+      const recoverySignal = nativeSocketLifetime.signal;
+      void restoreNativeSocketTerminal(responseRunMember(run), run.executionConfig, requestLarkCodexSocketReadback, run)
+        .then(restored => { if (!restored && !recoverySignal.aborted) deferNativeSocketRecovery(run.turnId); })
+        .catch(() => {
+          if (recoverySignal.aborted) return;
+          if (!run.settled) detachNativeLarkRun(run, true);
+          deferNativeSocketRecovery(run.turnId);
+        });
       return;
     }
     const params = notification.params as {
@@ -4172,13 +4179,25 @@ function failPendingExecutionApprovals(error: string): void {
   pendingExecutionApprovals.clear();
 }
 
-codexAppServer.onExit((error) => {
+codexAppServer.onExit((error, transport) => {
   promptInstructionCache.clear();
   loadedLarkThreadParameters.clear();
+  pendingTurnNotifications.clear();
   failPendingExecutionApprovals(error.message);
+  let recovering = 0;
   for (const run of [...activeLarkCodexRuns.values()]) {
+    if (transport === "socket" && run.socketRecovery && db.open && db.prepare(
+      "SELECT 1 FROM lark_native_socket_turns WHERE thread_id=? AND turn_id=?"
+    ).get(run.threadId, run.turnId)) {
+      detachNativeLarkRun(run, true);
+      recovering++;
+      continue;
+    }
     finishRun(run, "failed", run.finalAgentMessage ?? run.lastAgentMessage, error.message);
   }
+  if (transport === "socket") console.warn("lark_codex_socket_disconnected", {
+    recovering, reason: (error as NodeJS.ErrnoException).code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH" ? "payload_limit" : "connection_lost"
+  });
 });
 
 function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: LarkPromptMode, threadId?: string): void {
@@ -4645,12 +4664,13 @@ let nativeSocketLifetime = new AbortController();
 let nativeSocketTimer: ReturnType<typeof setInterval> | undefined;
 let nativeSocketPolling = false;
 
-export function configureNativeLarkRecovery(socket?: string): void {
+export function configureNativeLarkRecovery(socket?: string, maxPayloadMiB?: number): void {
   nativeSocketLifetime.abort();
   clearInterval(nativeSocketTimer);
   nativeSocketTimer = undefined;
   nativeSocketLifetime = new AbortController();
-  configureLarkCodexSocket(config.runtimeMode === "active" ? socket : undefined);
+  nativeRecoveryRetry.clear();
+  configureLarkCodexSocket(config.runtimeMode === "active" ? socket : undefined, maxPayloadMiB);
 }
 
 function nativeSocketIdentity(): string | undefined {
@@ -4670,15 +4690,22 @@ function nativeSocketContextCurrent(messageId: number, turnId: string): boolean 
     .get(messageId, turnId, identity);
 }
 
-function detachNativeLarkRun(run: ActiveLarkCodexRun): void {
+function detachNativeLarkRun(run: ActiveLarkCodexRun, reconnecting = false): void {
   run.settled = true;
   clearInterval(run.timer);
   if (run.capacityRetryTimer) clearTimeout(run.capacityRetryTimer);
   run.cancelCapacityWait?.();
-  for (const call of run.hostToolCalls) call.abort();
+  if (reconnecting) notifyLarkNativeTurnDetached(db, run.turnId);
+  for (const call of run.hostToolCalls) call.abort(reconnecting ? larkNativeSocketReconnecting : undefined);
   activeLarkCodexRuns.delete(run.sessionKey);
   unregisterCodexAppServerTurn(run.turnId);
   run.resolveDone();
+}
+
+const nativeRecoveryRetry = new Map<string, { attempts: number; nextAt: number }>();
+function deferNativeSocketRecovery(turnId: string): void {
+  const attempts = (nativeRecoveryRetry.get(turnId)?.attempts ?? 0) + 1;
+  nativeRecoveryRetry.set(turnId, { attempts, nextAt: Date.now() + Math.min(30_000, 1000 * 2 ** Math.min(attempts - 1, 5)) });
 }
 
 async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
@@ -4691,6 +4718,7 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
       }>;
     for (const entry of entries) {
       if (signal.aborted) return;
+      if ((nativeRecoveryRetry.get(entry.turn_id)?.nextAt ?? 0) > Date.now()) continue;
       if ([...activeLarkCodexRuns.values()].some(run => run.turnId === entry.turn_id)) continue;
       const row = canDispatchLarkReply(entry.message_id);
       const identity = nativeSocketIdentity();
@@ -4698,10 +4726,7 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
       if (!row?.message_id || row.codex_dispatch_context !== dispatchContext(row) || row.codex_turn_id !== entry.turn_id
         || row.codex_session_id !== entry.thread_id || stored.threadId !== entry.thread_id || stored.turnId !== entry.turn_id
         || identity && identity !== entry.socket_identity) {
-        db.transaction(() => {
-          quarantineLarkExecution(db, entry.message_id, nowIso());
-          db.prepare("DELETE FROM lark_native_socket_turns WHERE message_id=?").run(entry.message_id);
-        })();
+        abandonNativeSocketTurn(entry.message_id, entry.turn_id);
         continue;
       }
       const recoveryExpired = Date.now() - Date.parse(row.codex_last_heartbeat_at ?? row.codex_started_at ?? "") > 600_000;
@@ -4712,12 +4737,13 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
       const trustedSender = stored.trustScope === "trusted";
       const sessionKey = preparedSessionKey(row, trustedSender);
       if (activeLarkCodexRuns.has(sessionKey)) continue;
-      const request = (method: string, params: Record<string, unknown>) => codexAppServer.request(method, params, 4_000);
+      const request = requestLarkCodexSocketReadback;
       try {
         const state = await readNativeTurnState(request, entry.thread_id, entry.turn_id);
         if (signal.aborted || nativeSocketIdentity() !== identity) return;
         if (state.status === "unknown") {
           if (recoveryExpired) abandonNativeSocketTurn(row.id, entry.turn_id);
+          else deferNativeSocketRecovery(entry.turn_id);
           continue;
         }
         const { taskDir, sessionDir } = larkCodexTaskPaths(row, trustedSender);
@@ -4731,27 +4757,41 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
         };
         const current = canDispatchLarkReply(row.id);
         if (!current || current.codex_dispatch_context !== dispatchContext(current)) continue;
-        if (state.status !== "active") { await restoreNativeSocketTerminal(prepared, stored, request); continue; }
+        if (state.status !== "active") {
+          if (!await restoreNativeSocketTerminal(prepared, stored, request)) deferNativeSocketRecovery(entry.turn_id);
+          continue;
+        }
         const run = registerLarkRun(prepared, stored, { requests: new Set(), restored: true });
         try {
           const params = buildLarkCodexThreadParams(trustedSender, "resume", stored.model ?? undefined);
-          const resumed = await request("thread/resume", { ...params, threadId: entry.thread_id }) as ThreadResponse;
+          const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", { ...params, threadId: entry.thread_id }, 4_000);
           if (resumed.thread.id !== entry.thread_id) throw new Error("Recovered different Codex thread");
-          if (signal.aborted || run.settled) continue;
           loadedLarkThreadParameters.set(entry.thread_id, params);
+        } catch {
+          if (signal.aborted) return;
+          if (!run.settled) detachNativeLarkRun(run, true);
+          if (recoveryExpired) abandonNativeSocketTurn(row.id, entry.turn_id);
+          else deferNativeSocketRecovery(entry.turn_id);
+          continue;
+        }
+        if (signal.aborted || run.settled) continue;
+        nativeRecoveryRetry.delete(entry.turn_id);
+        try {
           const refreshed = await readNativeTurnState(request, entry.thread_id, entry.turn_id);
           if (!signal.aborted && !run.settled && refreshed.status !== "active" && refreshed.status !== "unknown")
             await restoreNativeSocketTerminal(prepared, stored, request, run);
-        } catch { if (!signal.aborted && !run.settled) detachNativeLarkRun(run); }
+        } catch { /* The notification subscription is valid even if readback failed. */ }
       } catch {
         // Retry the read, not the operation. A permanently unavailable engine must not block the inbox.
         if (!signal.aborted && recoveryExpired) abandonNativeSocketTurn(row.id, entry.turn_id);
+        else if (!signal.aborted) deferNativeSocketRecovery(entry.turn_id);
       }
     }
   } finally { nativeSocketPolling = false; }
 }
 
 function abandonNativeSocketTurn(messageId: number, turnId: string): void {
+  nativeRecoveryRetry.delete(turnId);
   db.transaction(() => {
     quarantineLarkExecution(db, messageId, nowIso());
     db.prepare("DELETE FROM lark_native_socket_turns WHERE message_id=? AND turn_id=?").run(messageId, turnId);
@@ -4760,27 +4800,31 @@ function abandonNativeSocketTurn(messageId: number, turnId: string): void {
 }
 
 async function restoreNativeSocketTerminal(prepared: PreparedLarkCodexMessage, stored: LarkExecutionConfig,
-  request: (method: string, params: Record<string, unknown>) => Promise<unknown>, existing?: ActiveLarkCodexRun): Promise<void> {
+  request: (method: string, params: Record<string, unknown>) => Promise<unknown>, existing?: ActiveLarkCodexRun): Promise<boolean> {
   const signal = nativeSocketLifetime.signal;
   const items = await readCompleteTurnItems(request, stored);
-  if (signal.aborted || existing?.settled) return;
+  if (signal.aborted || existing?.settled) return true;
   const state = await readNativeTurnState(request, stored.threadId, stored.turnId);
-  if (signal.aborted || existing?.settled) return;
+  if (signal.aborted || existing?.settled) return true;
   if (state.status === "active" || state.status === "unknown") {
     if (existing) detachNativeLarkRun(existing);
-    return;
+    return false;
   }
   const row = canDispatchLarkReply(prepared.row.id);
   if (!row || row.codex_dispatch_context !== dispatchContext(row) || !items) {
     if (existing) detachNativeLarkRun(existing);
-    if (Date.now() - Date.parse(prepared.row.codex_last_heartbeat_at ?? prepared.row.codex_started_at ?? "") > 600_000)
+    if (Date.now() - Date.parse(prepared.row.codex_last_heartbeat_at ?? prepared.row.codex_started_at ?? "") > 600_000) {
       abandonNativeSocketTurn(prepared.row.id, stored.turnId);
-    return;
+      return true;
+    }
+    return false;
   }
   const run = existing ?? registerLarkRun(prepared, stored, { requests: new Set(), restored: true });
   if (run.socketRecovery) run.socketRecovery.terminalRead = "complete";
   for (const item of items) handleRunNotification(run, { method: "item/completed", params: { threadId: stored.threadId, turnId: stored.turnId, item } });
   handleRunNotification(run, { method: "turn/completed", params: { threadId: stored.threadId, turn: { id: stored.turnId, status: state.status, error: state.error } } });
+  nativeRecoveryRetry.delete(stored.turnId);
+  return true;
 }
 
 export function startRetainedLarkRecovery(): void {
@@ -4797,8 +4841,10 @@ export function stopRetainedLarkRecovery(): void {
   nativeSocketLifetime.abort();
   clearInterval(nativeSocketTimer);
   nativeSocketTimer = undefined;
+  nativeRecoveryRetry.clear();
   for (const run of [...activeLarkCodexRuns.values()]) if (run.socketRecovery) detachNativeLarkRun(run);
   if (larkCodexSocket) codexAppServer.stop();
+  stopLarkCodexSocketReadback();
 }
 export function hasRetainedLarkBinding(messageId: number, turnId: string): boolean {
   return Boolean(retainedLark?.get(messageId)?.turn_id === turnId || larkCodexSocket && db.prepare(
@@ -5249,6 +5295,7 @@ export function inspectInterruptedLarkTurns(signal?: AbortSignal): Promise<void>
   return reconcileInterruptedNativeTurns(database, async (method, params) => {
     signal?.throwIfAborted();
     if (!database.open || database !== db) throw new Error("Recovery runtime closed");
+    if (larkCodexSocket) return requestLarkCodexSocketReadback(method, params, 3_000);
     return codexAppServer.request(method, params, 3_000);
   }, (row, status, items) => !signal?.aborted && db === database && restoreInterruptedNativeReply(row, status, items));
 }
@@ -5356,9 +5403,12 @@ export async function larkCodexNativeRuntime(refresh = false): Promise<LarkCodex
 }
 
 export function larkCodexAppServerStatus(): { running: boolean; pid: number | null; lastError: string | null; activeTurns: number } {
+  const detached = larkCodexSocket && db?.open ? (db.prepare(`SELECT n.turn_id FROM lark_native_socket_turns n
+    JOIN lark_messages m ON m.id=n.message_id WHERE m.codex_status='running' AND m.codex_dispatch_phase='submitted'`).pluck().all() as string[])
+    .filter(turnId => !isCodexAppServerTurnRegistered(turnId)).length : 0;
   return {
     ...codexAppServer.status(),
-    activeTurns: activeLarkCodexRuns.size + preparingLarkMessages.size + externalTopicTurns.size + (retainedLark?.bindings().length ?? 0)
+    activeTurns: activeLarkCodexRuns.size + detached + preparingLarkMessages.size + externalTopicTurns.size + (retainedLark?.bindings().length ?? 0)
   };
 }
 

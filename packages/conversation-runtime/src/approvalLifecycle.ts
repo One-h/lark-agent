@@ -1,6 +1,9 @@
 import type Database from "better-sqlite3";
 
-const listeners = new WeakMap<Database.Database, Set<(turnId: string) => void>>();
+type TurnListener = (turnId: string) => void;
+const listeners = new WeakMap<Database.Database, Set<TurnListener>>();
+const detachListeners = new WeakMap<Database.Database, Set<TurnListener>>();
+export const larkNativeSocketReconnecting = Symbol("Lark native socket reconnecting");
 
 export type LarkApprovalStatus = "approved" | "rejected" | "expired" | "failed";
 
@@ -24,11 +27,25 @@ export function waitForTurnAuthorization<T>(result: Promise<T>, signal: AbortSig
   });
 }
 
-export function onLarkTurnEnded(database: Database.Database, listener: (turnId: string) => void): () => void {
-  let current = listeners.get(database);
-  if (!current) { current = new Set(); listeners.set(database, current); }
+function subscribe(registry: typeof listeners, database: Database.Database, listener: TurnListener): () => void {
+  let current = registry.get(database);
+  if (!current) { current = new Set(); registry.set(database, current); }
   current.add(listener);
   return () => { current.delete(listener); };
+}
+
+export function onLarkTurnEnded(database: Database.Database, listener: TurnListener): () => void {
+  return subscribe(listeners, database, listener);
+}
+
+export function onLarkNativeTurnDetached(database: Database.Database, listener: TurnListener): () => void {
+  return subscribe(detachListeners, database, listener);
+}
+
+export function notifyLarkNativeTurnDetached(database: Database.Database, turnId: string): void {
+  for (const listener of detachListeners.get(database) ?? []) {
+    try { listener(turnId); } catch { console.warn("lark_turn_detach_cleanup_failed"); }
+  }
 }
 
 export function notifyLarkTurnEnded(database: Database.Database, turnId: string): void {

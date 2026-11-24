@@ -1,4 +1,4 @@
-import { CodexAppServerClient } from "@lark-agent/adapter-codex-app-server";
+import { CodexAppServerClient, codexSocketMaxPayloadBytes } from "@lark-agent/adapter-codex-app-server";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./context.js";
@@ -51,13 +51,20 @@ export function larkMcpCodexConfig(): string[] {
 }
 
 export let larkCodexSocket: string | undefined;
-export function configureLarkCodexSocket(socketPath?: string): void { larkCodexSocket = socketPath; }
+let larkCodexSocketMaxPayloadMiB: number | undefined;
+export function configureLarkCodexSocket(socketPath?: string, maxPayloadMiB?: number): void {
+  codexSocketMaxPayloadBytes(maxPayloadMiB);
+  stopLarkCodexSocketReadback();
+  larkCodexSocket = socketPath;
+  larkCodexSocketMaxPayloadMiB = maxPayloadMiB;
+}
 
 export const codexAppServer = new CodexAppServerClient(
   () => config.workspaceRoot || process.cwd(),
   {
     config: larkMcpCodexConfig,
     socketPath: () => larkCodexSocket,
+    socketMaxPayloadMiB: () => larkCodexSocketMaxPayloadMiB,
     env: () => ({
       ...process.env,
       LARK_AGENT_RUNTIME_URL: config.larkAgentRuntimeUrl,
@@ -66,6 +73,23 @@ export const codexAppServer = new CodexAppServerClient(
     })
   }
 );
+
+// History/readback can itself exceed the receive limit. Keep it off the
+// connection that owns live notifications and approval responses.
+const socketReadback = new CodexAppServerClient(() => config.workspaceRoot || process.cwd(), {
+  socketPath: () => larkCodexSocket,
+  socketMaxPayloadMiB: () => larkCodexSocketMaxPayloadMiB
+});
+socketReadback.onRequest(() => true);
+
+export function requestLarkCodexSocketReadback(method: string, params: Record<string, unknown>, timeoutMs = 4_000): Promise<unknown> {
+  if (!larkCodexSocket || !["thread/read", "thread/turns/list", "thread/items/list"].includes(method)) {
+    throw new Error("Unsupported Codex socket readback request");
+  }
+  return socketReadback.request(method, params, timeoutMs);
+}
+
+export function stopLarkCodexSocketReadback(): void { socketReadback.stop(); }
 
 const activeTurnIds = new Set<string>();
 

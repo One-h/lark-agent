@@ -11,7 +11,7 @@ export type NativeTurnState = {
 export async function readNativeTurnState(
   request: (method: string, params: RecordValue) => Promise<unknown>, threadId: string, turnId: string
 ): Promise<NativeTurnState> {
-  const response = object(await request("thread/read", { threadId }));
+  const response = object(await request("thread/read", { threadId, includeTurns: false }));
   const thread = object(response?.thread);
   const rawStatus = object(thread?.status)?.type;
   const threadStatus = typeof rawStatus === "string" ? rawStatus : null;

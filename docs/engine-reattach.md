@@ -41,6 +41,17 @@ Final answers and pending delivery intents are committed together. The ACP
 result is acknowledged only after that commit. An uncertain remote send uses
 the existing readback rules rather than an unconditional resend.
 
+The Codex socket's default inbound message limit is 128 MiB. Operators can
+set `LARK_AGENT_CODEX_SOCKET_MAX_PAYLOAD_MIB` to an integer between 1 and 512
+for a different bounded limit. An oversize message or socket disconnection
+detaches journaled turns instead of declaring them failed. The runtime checks
+the original thread, turn and socket identity before reattaching, and does not
+submit the input again. Terminal history is read in bounded pages on a
+separate connection; a read that still exceeds the limit is deferred for
+that turn. An expired or unverifiable turn remains subject to the existing
+uncertain-outcome handling. No change is made to the legacy stdio failure
+contract.
+
 ### Configure in an isolated trial
 
 - Codex: run a dedicated Codex App Server with `--listen unix://<private-socket>`.
