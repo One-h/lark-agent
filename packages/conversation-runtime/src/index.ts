@@ -20,6 +20,7 @@ export * from "./progressCards.js";
 export { onLarkTurnObservation, type LarkTurnObservation } from "./turnObservations.js";
 export { registerLarkRuntimePlugin, registerLarkRouteBroker, type LarkRuntimePlugin, type LarkRouteInput, type LarkPrepareInput } from "./runtimeHooks.js";
 export { readLarkDeliveryConfirmations } from "./deliveryConfirmations.js";
+export { bindLarkBuiltinPlugins, resolveLarkBuiltinPlugins, larkBuiltinPluginEnabled, larkBuiltinCapabilityEnabled, type LarkBuiltinPluginId } from "./builtinPlugins.js";
 export * from "./ownerMentionAssist.js";
 export * from "./topicNativeMode.js";
 export * from "./approvalPlan.js";

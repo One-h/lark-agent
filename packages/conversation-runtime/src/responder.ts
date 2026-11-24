@@ -20,6 +20,7 @@ import { postHostJson } from "./hostHttp.js";
 import { rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
 import { publishLarkTurnObservation } from "./turnObservations.js";
 import { collectLarkTurnContext } from "./runtimeHooks.js";
+import { larkBuiltinCapabilityEnabled, larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 import { recordLarkDeliveryConfirmation, publishLarkDeliveryConfirmation } from "./deliveryConfirmations.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -122,6 +123,7 @@ function registeredLarkHostCapabilities(): LarkHostCapability[] {
   const rows = db.prepare("SELECT id, title, description, input_schema, risk FROM capabilities ORDER BY id").all() as
     Array<Omit<LarkHostCapability, "inputSchema"> & { input_schema: string }>;
   return rows.flatMap((row) => {
+    if (!larkBuiltinCapabilityEnabled(db, row.id)) return [];
     try {
       return [{ id: row.id, title: row.title, description: row.description, risk: row.risk, inputSchema: JSON.parse(row.input_schema) as Record<string, unknown> }];
     } catch {
@@ -1176,6 +1178,7 @@ function deliverStagedLarkReply(textMessageId: number | undefined, mediaIds: num
 }
 
 export function retryPendingLarkTextReplies(limit = 10): number {
+  if (config.runtimeMode !== "active") return 0;
   const rows = db.prepare(`
     SELECT id FROM lark_messages
     WHERE reply_status = 'pending' AND reply_delivery_text IS NOT NULL
@@ -1277,6 +1280,7 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
   if (current?.status !== "pending") return { ok: false, sentCount: 0, error: "Delivery is not pending" };
   let payload: LarkDeliveryPayload;
   try { payload = JSON.parse(row.payload) as LarkDeliveryPayload; } catch { payload = { messageId: "", taskDir: "", paths: [] }; }
+  if (!larkBuiltinPluginEnabled(db, "stickers") && payload.stickerIds?.length) return { ok: true, sentCount: 0 };
   if (!payload.messageId || !payload.taskDir || payload.paths.length === 0) {
     db.prepare("UPDATE lark_delivery_outbox SET status='failed', attempts=attempts+1, last_error='Invalid delivery payload', next_attempt_at=? WHERE id=?").run(nowIso(), row.id);
     return { ok: false, sentCount: 0, error: "Invalid delivery payload" };
@@ -1349,7 +1353,11 @@ function stageLarkMediaDelivery(larkMessageId: number, kind: LarkDeliveryOutboxR
 }
 
 export function retryPendingLarkMediaReplies(limit = 10): number {
-  const rows = db.prepare("SELECT id, lark_message_id, kind, payload, idempotency_key, attempts FROM lark_delivery_outbox WHERE kind IN ('media','image-post') AND status='pending' AND next_attempt_at <= ? ORDER BY next_attempt_at, id LIMIT ?").all(nowIso(), limit) as LarkDeliveryOutboxRow[];
+  if (config.runtimeMode !== "active") return 0;
+  const rows = db.prepare(`SELECT id, lark_message_id, kind, payload, idempotency_key, attempts
+    FROM lark_delivery_outbox WHERE kind IN ('media','image-post') AND status='pending' AND next_attempt_at <= ?
+    AND (? OR CASE WHEN json_valid(payload) THEN coalesce(json_array_length(payload, '$.stickerIds'), 0) ELSE 0 END=0)
+    ORDER BY next_attempt_at, id LIMIT ?`).all(nowIso(), Number(larkBuiltinPluginEnabled(db, "stickers")), limit) as LarkDeliveryOutboxRow[];
   for (const row of rows) deliverLarkOutboxRow(row);
   for (const id of new Set(rows.map(row => row.lark_message_id))) markAttachmentOnlyReplyDelivered(id);
   return rows.length;
@@ -2204,6 +2212,7 @@ export function recordExecutionReceipt(larkMessageId: number, turnId: string): v
 }
 
 export function retryPendingLarkExecutionReceipts(limit = 10): number {
+  if (config.runtimeMode !== "active") return 0;
   if (!getAppSettings().larkExecutionReceiptsEnabled) {
     suppressPendingLarkExecutionReceipts();
     return 0;

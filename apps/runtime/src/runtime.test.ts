@@ -289,7 +289,7 @@ test("queued text replies create one idempotent outbound message row", async () 
   const sentAt = "2026-09-03T01:02:03.000Z";
   const runtime = createRuntime({
     databasePath: file,
-    mode: "shadow",
+    mode: "active",
     trustedSenderIds: [],
     textReplySender: () => ({ ok: true, messageId: "om_reply_out", chatId: "oc_reply", messageAt: sentAt, messageType: "text" })
   });
@@ -308,7 +308,7 @@ test("reply delivery does not retry after a platform success when outbound recor
   let sends = 0;
   const runtime = createRuntime({
     databasePath: file,
-    mode: "shadow",
+    mode: "active",
     trustedSenderIds: [],
     textReplySender: () => {
       sends += 1;
@@ -333,7 +333,7 @@ test("reply delivery preserves success without a platform message id and retries
   let shouldFail = false;
   const runtime = createRuntime({
     databasePath: file,
-    mode: "shadow",
+    mode: "active",
     trustedSenderIds: [],
     textReplySender: () => shouldFail
       ? { ok: false, error: "simulated send failure" }

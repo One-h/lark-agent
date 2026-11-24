@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { larkReplyIdempotencyKey, type LarkProgressContent, type LarkProgressEntry, type LarkProgressState } from "@lark-agent/adapter-lark-cli";
+import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 import { config, db, getAppSettings, larkProgressSender, larkProgressUpdater, nowIso, recordOutboundLarkMessage, type LarkMessageRow } from "./context.js";
 import { ownerAssistMayExecute } from "./ownerMentionAssist.js";
 import { onLarkTurnObservation } from "./turnObservations.js";
@@ -11,7 +12,7 @@ const inFlight = new WeakMap<Database.Database, Map<string, Promise<void>>>();
 const subscriptions = new WeakMap<Database.Database, ReturnType<typeof onLarkTurnObservation>>();
 const updateIntervalMs = 10_000;
 const maxAttempts = 5;
-function tasks(database = db) {
+function tasks(database: Database.Database) {
   let map = inFlight.get(database);
   if (!map) { map = new Map(); inFlight.set(database, map); }
   return map;
@@ -24,7 +25,7 @@ type ProgressSource = Pick<LarkMessageRow, "id" | "message_id" | "sender_type" |
 export function observeLarkProgressCards(database: Database.Database): () => void {
   subscriptions.get(database)?.close();
   const subscription = onLarkTurnObservation(database, event => {
-    if (!database.open || database !== db) return;
+    if (!database.open || database !== db || !larkBuiltinPluginEnabled(database, "progress-cards")) return;
     if (event.kind === "turn.finished") {
       finishLarkProgressCard(event.runId, event.outcome);
       return;
@@ -45,7 +46,7 @@ export function observeLarkProgressCards(database: Database.Database): () => voi
 
 export function queueLarkProgressUpdate(input: { progressId: string; turnId: string; threadId: string; source: ProgressSource; eventId: string; text: string }): boolean {
   try {
-  if (config.runtimeMode !== "active" || !getAppSettings().larkCodexInterimRepliesEnabled || input.source.sender_type === "bot" || !ownerAssistMayExecute(input.source.id)
+  if (!larkBuiltinPluginEnabled(db, "progress-cards") || config.runtimeMode !== "active" || !getAppSettings().larkCodexInterimRepliesEnabled || input.source.sender_type === "bot" || !ownerAssistMayExecute(input.source.id)
     || config.groupPrivacyEnforced && input.source.chat_type !== "p2p" || !input.source.message_id) return false;
   const text = input.text.trim().replace(/\s+/g, " ").slice(0, 180);
   if (!text) return false;
@@ -65,7 +66,7 @@ export function queueLarkProgressUpdate(input: { progressId: string; turnId: str
 }
 
 export function finishLarkProgressCard(progressId: string, state: Exclude<LarkProgressState, "running">): void {
-  if (!db?.open) return;
+  if (!db?.open || !larkBuiltinPluginEnabled(db, "progress-cards")) return;
   try {
   const now = nowIso();
   db.prepare("UPDATE lark_progress_cards SET state=?,version=version+1,pending=1,attempts=0,next_attempt_at=?,updated_at=? WHERE progress_id=? AND state='running'")
@@ -75,12 +76,14 @@ export function finishLarkProgressCard(progressId: string, state: Exclude<LarkPr
 }
 
 export function rebindLarkProgressCard(progressId: string, turnId: string, threadId: string): void {
+  if (!larkBuiltinPluginEnabled(db, "progress-cards")) return;
   db.prepare("UPDATE lark_progress_cards SET native_turn_id=?,thread_id=? WHERE progress_id=? AND state='running'").run(turnId, threadId, progressId);
 }
 
 async function deliver(database: Database.Database, id: string): Promise<void> {
   // One writer per card: a terminal update must follow, never race an older PATCH.
   for (let pass = 0; pass < 3 && database.open && database === db; pass++) {
+    if (!larkBuiltinPluginEnabled(database, "progress-cards")) return;
     const current = row(database, id);
     if (!current?.pending || current.attempts >= maxAttempts || Date.parse(current.next_attempt_at) > Date.now()) return;
     const source = database.prepare(`SELECT m.*, COALESCE(e.turn_id,m.codex_turn_id) AS execution_turn_id
@@ -111,7 +114,10 @@ async function deliver(database: Database.Database, id: string): Promise<void> {
         recordOutboundLarkMessage({ messageId: cardId, chatId: source.chat_id, chatType: source.chat_type, recipientId: source.sender_id,
           content: textOf(content.entries, content.state), replyToMessageId: current.message_id, messageAt: sent.messageAt, messageType: "interactive", source: "reply" });
         // A UUID retry may return the receipt of an older accepted body.
-        if (current.create_attempted) await larkProgressUpdater(cardId, content);
+        if (current.create_attempted) {
+          if (!larkBuiltinPluginEnabled(database, "progress-cards")) return;
+          await larkProgressUpdater(cardId, content);
+        }
       } else await larkProgressUpdater(cardId, content);
       if (!database.open || database !== db) return;
       const latest = row(database, id)!;
@@ -130,10 +136,9 @@ async function deliver(database: Database.Database, id: string): Promise<void> {
   }
 }
 
-export async function retryPendingLarkProgressCards(): Promise<void> {
+export async function retryPendingLarkProgressCards(database = db): Promise<void> {
   try {
-  const database = db;
-  if (!database?.open || config.runtimeMode !== "active") return;
+  if (!database?.open || database !== db || !larkBuiltinPluginEnabled(database, "progress-cards") || config.runtimeMode !== "active") return;
   const rows = database.prepare("SELECT progress_id FROM lark_progress_cards WHERE pending=1 AND next_attempt_at<=? AND attempts<? ORDER BY next_attempt_at LIMIT 20")
     .all(nowIso(), maxAttempts) as Array<{ progress_id: string }>;
   const map = tasks(database);
@@ -151,13 +156,14 @@ export async function retryPendingLarkProgressCards(): Promise<void> {
   } catch { console.warn("lark_progress_retry_failed"); }
 }
 
-export async function drainLarkProgressCards(): Promise<void> {
-  await subscriptions.get(db)?.drain();
-  await retryPendingLarkProgressCards();
-  await Promise.all([...tasks().values()]);
+export async function drainLarkProgressCards(database = db): Promise<void> {
+  await subscriptions.get(database)?.drain();
+  await retryPendingLarkProgressCards(database);
+  await Promise.all(inFlight.get(database)?.values() ?? []);
 }
 
 export function reconcileLarkProgressCards(): void {
+  if (!larkBuiltinPluginEnabled(db, "progress-cards")) return;
   const cards = db.prepare(`SELECT progress_id,CASE WHEN COALESCE(e.turn_id,m.codex_turn_id)=p.native_turn_id THEN m.codex_status ELSE NULL END AS codex_status
     FROM lark_progress_cards p LEFT JOIN lark_messages m ON m.id=p.lark_message_id
     LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=p.lark_message_id

@@ -23,6 +23,16 @@ These rules apply to the entire repository.
   explicit `plugins` to `createRuntime`. Use `registerLarkRuntimePlugin`
   for an internal consumer that owns its registration lifetime. There is no
   external module discovery, runtime downloader, plugin sandbox or hot loader.
+- Built-in plugin composition lives under `apps/runtime/src/plugins`. The
+  runtime validates declared IDs and dependencies before starting background
+  services. A disabled plugin must not register feature routes, advertise or
+  execute its capabilities, or dispatch persisted work. Do not delete history
+  or stored feature settings to implement a pause. Test both default
+  compatibility and disablement; keep authorization in core.
+- Operators can set `LARK_AGENT_DISABLED_PLUGINS` to a comma-separated list
+  before starting Lark. Never use a plugin setting to bypass the group privacy
+  gate, native approval, trusted sender checks or the shared delivery outbox.
+  See [the built-in plugin guide](docs/builtin-plugins.md).
 - `message.route` proposals see a frozen, verified group-reply identity.
   They cannot consume a message. Only a core-registered route broker can
   verify its claimed scope and save both the claim's work and inbound row in
