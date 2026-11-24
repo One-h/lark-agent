@@ -2,9 +2,13 @@ import http from "node:http";
 import path from "node:path";
 import { lstatSync } from "node:fs";
 import type { RetainedExecutionTurns } from "./retainedExecutionTurns.js";
+import { retainedForegroundMcpContextToken } from "./retainedForegroundMcp.js";
+
+export { retainedForegroundMcpBearer, retainedForegroundMcpPrompt } from "./retainedForegroundMcp.js";
 
 export type RetainedHostConfig = { socketPath: string; token: string; engineIds: readonly string[] };
-export type RetainedTurnSnapshot = NonNullable<ReturnType<RetainedExecutionTurns["attach"]>>;
+export type RetainedTurnSnapshot = NonNullable<ReturnType<RetainedExecutionTurns["attach"]>> & { foregroundLarkToolsActive?: boolean };
+export type RetainedHostStatus = { generation: string; workspace: string; engines?: readonly { id: string; foregroundLarkTools?: boolean }[] };
 
 export class RetainedHostError extends Error {
   constructor(readonly status: number) { super(`Retained engine host returned HTTP ${status}`); }
@@ -16,6 +20,10 @@ export class RetainedExecutionClient {
   }
 
   supports(engineId: string): boolean { return this.config.engineIds.includes(engineId); }
+
+  foregroundMcpContextToken(generation: string, turnId: string): string {
+    return retainedForegroundMcpContextToken(this.config.token, generation, turnId);
+  }
 
   call<T>(input: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {

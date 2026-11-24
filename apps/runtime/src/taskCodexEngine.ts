@@ -1,13 +1,23 @@
+import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { unicodeSafePrefix, type CodexAppServerClient, type CodexAppServerNotification } from "@lark-agent/adapter-codex-app-server";
+import { CodexAppServerClient, unicodeSafePrefix, type CodexAppServerNotification } from "@lark-agent/adapter-codex-app-server";
 import type { ExecutionEngine, ExecutionEngineEvent, ExecutionEngineSession, ExecutionTurnResult, LarkExecutionPolicy } from "@lark-agent/conversation-runtime";
 
 const textLimit = 24_000;
 const rpcTimeout = 10_000;
 const interruptTimeout = 4_000;
+const restrictedConfig = {
+  "features.apps": false, "features.plugins": false, "features.hooks": false,
+  "features.browser_use": false, "features.browser_use_external": false, "features.computer_use": false,
+  "features.skill_mcp_dependency_install": false, web_search: "disabled"
+};
 
-type AgentItem = { type?: unknown; phase?: unknown; text?: unknown };
-type NativeTurn = { id?: string; status?: string; items?: AgentItem[] };
+type NativeItem = { type?: unknown; phase?: unknown; text?: unknown; content?: unknown };
+type NativeTurn = { id?: string; status?: string; items?: NativeItem[] };
+type NativeThread = { id?: string; cwd?: string; status?: { type?: string }; turns?: NativeTurn[] };
+type RetainedDispatch = { key: string; recordNativeIdentity(identity: { sessionId: string; turnId: string | null }): unknown };
+type TaskCodexOpen = Parameters<ExecutionEngine["open"]>[0] & { retainedDispatch?: RetainedDispatch };
+type NativeSandbox = { type: "dangerFullAccess" } | { type: "readOnly"; networkAccess: false };
 type ActiveTurn = { turnId?: string; terminal: boolean; signal: AbortSignal; done?: Promise<ExecutionTurnResult> };
 type NativeEvent = { turnId: string } & (
   | { kind: "delta"; text: string; truncated: boolean }
@@ -16,8 +26,19 @@ type NativeEvent = { turnId: string } & (
 );
 
 function supportsPolicy(policy: LarkExecutionPolicy): boolean {
-  return policy.trustScope === "trusted" && policy.sandbox === "danger-full-access"
-    && policy.approvalPolicy === "never" && isAbsolute(policy.cwd);
+  return isAbsolute(policy.cwd) && !policy.cwd.includes("\0") && (
+    policy.trustScope === "trusted" && policy.sandbox === "danger-full-access" && policy.approvalPolicy === "never"
+    || policy.trustScope === "untrusted" && policy.sandbox === "read-only" && policy.approvalPolicy === "on-request");
+}
+
+function sameDirectory(actual: unknown, expected: string): boolean {
+  try { return typeof actual === "string" && isAbsolute(actual) && realpathSync(actual) === realpathSync(expected); }
+  catch { return false; }
+}
+
+function containsInitialInput(item: NativeItem | undefined, text: string): boolean {
+  return item?.type === "userMessage" && Array.isArray(item.content) && item.content.length === 1
+    && item.content[0]?.type === "text" && item.content[0].text === text;
 }
 
 function textInput(text: string) {
@@ -27,7 +48,7 @@ function textInput(text: string) {
   return [{ type: "text", text }];
 }
 
-function answer(item?: AgentItem): string | undefined {
+function answer(item?: NativeItem): string | undefined {
   if (item?.type === "agentMessage" && (item.phase === "final_answer" || item.phase == null) && typeof item.text === "string") {
     return unicodeSafePrefix(item.text, textLimit);
   }
@@ -45,7 +66,7 @@ function terminal(turn: NativeTurn & { id: string }): NativeEvent {
 }
 
 function turnEvent(threadId: string, { method, params }: CodexAppServerNotification): NativeEvent | undefined {
-  const data = params as { threadId?: string; turnId?: string; turn?: NativeTurn; delta?: unknown; item?: AgentItem } | undefined;
+  const data = params as { threadId?: string; turnId?: string; turn?: NativeTurn; delta?: unknown; item?: NativeItem } | undefined;
   if (data?.threadId !== threadId) return;
   if (method === "turn/completed" && typeof data.turn?.id === "string") return terminal({ ...data.turn, id: data.turn.id });
   if (typeof data.turnId !== "string") return;
@@ -58,17 +79,58 @@ function turnEvent(threadId: string, { method, params }: CodexAppServerNotificat
   }
 }
 
-// The host owns the client lifetime and supplies a client dedicated to these sessions.
-export function createTaskCodexEngine(client: CodexAppServerClient, models: readonly string[] = []): ExecutionEngine {
+// Startup overrides remove inherited servers before the restricted process opens a thread.
+export function createTaskRestrictedCodexPool(env?: () => NodeJS.ProcessEnv) {
+  const clients = new Map<string, CodexAppServerClient>();
+  return {
+    get(cwd: string, disabled: Record<string, false>) {
+      const overrides = Object.keys(disabled).sort().map(key => key + "=false");
+      const key = JSON.stringify(overrides);
+      const previous = clients.get(key);
+      if (previous) return previous;
+      if (clients.size >= 8) throw new Error("Too many distinct restricted Codex configurations");
+      const created = new CodexAppServerClient(() => cwd, { env,
+        config: () => [...Object.entries(restrictedConfig).map(([name, value]) => name + "=" + JSON.stringify(value)), ...overrides] });
+      clients.set(key, created);
+      return created;
+    },
+    close() { for (const client of clients.values()) client.stop(); clients.clear(); }
+  };
+}
+
+async function mcpEntries(client: CodexAppServerClient, cwd: string): Promise<Record<string, unknown>> {
+  const effective = await client.requestIfRunning<{ config?: Record<string, unknown> }>("config/read", { cwd, includeLayers: false }, rpcTimeout);
+  const config = effective?.config;
+  const mcp = config?.mcp_servers;
+  if (!config || typeof config !== "object" || Array.isArray(config)
+    || (mcp != null && (typeof mcp !== "object" || Array.isArray(mcp)))) throw new Error("Codex restricted tasks require verifiable MCP configuration");
+  return (mcp ?? {}) as Record<string, unknown>;
+}
+
+// The host owns the trusted client and isolated restricted client lifetimes.
+export function createTaskCodexEngine(baseClient: CodexAppServerClient, models: readonly string[] = [],
+  restrictedPool?: ReturnType<typeof createTaskRestrictedCodexPool>): ExecutionEngine {
   const configuredModels = [...models];
   const ownedThreads = new Set<string>();
   return {
     descriptor: { id: "codex", label: "Codex", models: configuredModels },
     supportsPolicy,
-    async open({ sessionId, model, policy, signal, mcpServers }) {
+    async open({ sessionId, model, policy, signal, mcpServers, retainedDispatch }: TaskCodexOpen) {
       if (!supportsPolicy(policy) || mcpServers?.length) throw new Error("Codex task engine cannot enforce requested execution policy or MCP servers");
       if (model !== null && !configuredModels.includes(model)) throw new Error("Codex task model is not configured");
       signal.throwIfAborted();
+      const { cwd, sandbox } = policy;
+      const restricted = policy.trustScope === "untrusted";
+      let disabledMcp: Record<string, false> = {};
+      if (restricted) {
+        await baseClient.start();
+        const names = Object.keys(await mcpEntries(baseClient, cwd));
+        if (names.length > 100 || names.some(name => !/^[A-Za-z0-9_-]{1,100}$/.test(name)))
+          throw new Error("Codex cannot disable inherited MCP configuration");
+        disabledMcp = Object.fromEntries(names.map(name => [`mcp_servers.${name}.enabled`, false]));
+      }
+      signal.throwIfAborted();
+      const client = restricted ? restrictedPool?.get(cwd, disabledMcp) ?? baseClient : baseClient;
       if (sessionId !== null && (!sessionId.trim() || ownedThreads.has(sessionId))) throw new Error("Invalid or already open Codex thread");
       let id = sessionId, attached = false, disconnected = false;
       if (id !== null) ownedThreads.add(id);
@@ -84,13 +146,33 @@ export function createTaskCodexEngine(client: CodexAppServerClient, models: read
       try {
         await client.start();
         signal.throwIfAborted();
-        const { cwd, approvalPolicy, sandbox } = policy;
+        const confirmedDisabled = new Set<string>();
+        if (restricted && client !== baseClient) {
+          for (const [name, entry] of Object.entries(await mcpEntries(client, cwd))) {
+            if (!Object.hasOwn(disabledMcp, `mcp_servers.${name}.enabled`)
+              || !entry || typeof entry !== "object" || (entry as { enabled?: unknown }).enabled !== false)
+              throw new Error("Codex restricted process has an enabled MCP server");
+            confirmedDisabled.add(name);
+          }
+        }
+        // Authorization to dispatch is not permission to elevate a native operation.
+        const approvalPolicy = "never";
+        const sandboxPolicy: NativeSandbox = restricted ? { type: "readOnly", networkAccess: false } : { type: "dangerFullAccess" };
+        if (sessionId !== null) {
+          const existing = await client.requestIfRunning<{ thread?: NativeThread }>("thread/read", { threadId: sessionId, includeTurns: false }, rpcTimeout);
+          if (existing?.thread?.id !== sessionId || !sameDirectory(existing.thread.cwd, cwd)) {
+            throw new Error("Codex could not verify the original thread identity and workspace");
+          }
+          if (existing.thread.status?.type === "active") throw new Error("Resumed Codex thread is not idle");
+        }
+        signal.throwIfAborted();
         const opened = await client.requestIfRunning<{
-          thread?: { id?: string; status?: { type?: string } };
-          model?: string; sandbox?: { type?: string }; approvalPolicy?: string;
+          thread?: NativeThread; cwd?: string; model?: string;
+          sandbox?: { type?: string; networkAccess?: boolean }; approvalPolicy?: string;
         }>(sessionId === null ? "thread/start" : "thread/resume", {
           ...(sessionId === null ? { ephemeral: false, allowProviderModelFallback: false } : { threadId: sessionId, excludeTurns: true }),
-          cwd, model, approvalPolicy, approvalsReviewer: "user", sandbox
+          cwd, model, approvalPolicy, approvalsReviewer: "user", sandbox,
+          ...(restricted ? { config: { ...restrictedConfig, ...disabledMcp } } : {})
         }, rpcTimeout);
         const nativeId = opened?.thread?.id;
         if (typeof nativeId !== "string" || !nativeId || (sessionId !== null ? nativeId !== sessionId : ownedThreads.has(nativeId))) {
@@ -100,10 +182,26 @@ export function createTaskCodexEngine(client: CodexAppServerClient, models: read
         attached = true;
         ownedThreads.add(id);
         signal.throwIfAborted();
-        if (opened?.sandbox?.type !== "dangerFullAccess" || opened.approvalPolicy !== approvalPolicy
+        if (!sameDirectory(opened?.cwd, cwd) || !sameDirectory(opened?.thread?.cwd, cwd)
+          || opened?.sandbox?.type !== sandboxPolicy.type || restricted && opened.sandbox.networkAccess !== false || opened.approvalPolicy !== approvalPolicy
           || (model !== null && opened.model !== model)) throw new Error("Codex did not confirm the requested execution policy or model");
         if (sessionId !== null && opened.thread?.status?.type !== "idle") throw new Error("Resumed Codex thread is not idle");
-        return codexSession(client, id, cwd, model, () => disconnected, release);
+        if (restricted) {
+          type InventoryEntry = { name?: unknown; authStatus?: unknown; tools?: unknown; resources?: unknown; resourceTemplates?: unknown };
+          const inventory = await client.requestIfRunning<{ data?: InventoryEntry[]; nextCursor?: unknown }>("mcpServerStatus/list",
+            { threadId: id, detail: "toolsAndAuthOnly", limit: 100 }, rpcTimeout);
+          // App Server may include disabled config entries in its inventory.
+          if (!Array.isArray(inventory?.data) || inventory.nextCursor != null || inventory.data.some(entry =>
+            !entry || typeof entry.name !== "string" || !confirmedDisabled.has(entry.name) || entry.authStatus !== "unsupported"
+            || !entry.tools || typeof entry.tools !== "object" || Object.keys(entry.tools).length
+            || entry.resources != null && (!Array.isArray(entry.resources) || entry.resources.length)
+            || entry.resourceTemplates != null && (!Array.isArray(entry.resourceTemplates) || entry.resourceTemplates.length))) {
+            throw new Error("Codex did not confirm that the restricted thread has no MCP servers");
+          }
+        }
+        signal.throwIfAborted();
+        retainedDispatch?.recordNativeIdentity({ sessionId: id, turnId: null });
+        return codexSession(client, id, cwd, model, sandboxPolicy, retainedDispatch, () => disconnected, release);
       } catch (error) {
         await release().catch(() => {});
         throw error;
@@ -112,8 +210,8 @@ export function createTaskCodexEngine(client: CodexAppServerClient, models: read
   };
 }
 
-function codexSession(client: CodexAppServerClient, id: string, cwd: string, model: string | null,
-  disconnected: () => boolean, release: () => Promise<void>): ExecutionEngineSession {
+function codexSession(client: CodexAppServerClient, id: string, cwd: string, model: string | null, sandboxPolicy: NativeSandbox,
+  dispatch: RetainedDispatch | undefined, disconnected: () => boolean, release: () => Promise<void>): ExecutionEngineSession {
   const lifetime = new AbortController();
   let active: ActiveTurn | undefined;
   let closing: Promise<void> | undefined, uncertain = false;
@@ -156,6 +254,14 @@ function codexSession(client: CodexAppServerClient, id: string, cwd: string, mod
     let streamed = 0, buffered = 0, overflow = false, final: string | undefined, unphased: string | undefined;
     let interruptTimer: ReturnType<typeof setTimeout> | undefined;
     const early: NativeEvent[] = [];
+    // clientUserMessageId is accepted by turn/start but not part of native turn readback.
+    const dispatchInput = dispatch && `[Lark task dispatch: ${dispatch.key}]\n\n${input[0].text}`;
+    let observedTurnId: string | undefined, ambiguous = false;
+    const observeInput = (turnId: string, items: NativeItem[]) => {
+      if (!dispatchInput || !containsInitialInput(items[0], dispatchInput)) return;
+      if (observedTurnId && observedTurnId !== turnId) ambiguous = true;
+      else observedTurnId = turnId;
+    };
     const interrupt = () => {
       if (!current.turnId || current.terminal || interruptTimer) return;
       interruptTimer = setTimeout(() => fail(new Error("Codex did not confirm turn interruption")), interruptTimeout);
@@ -179,6 +285,16 @@ function codexSession(client: CodexAppServerClient, id: string, cwd: string, mod
       }
     };
     const offNotification = client.onNotification(notification => {
+      if (dispatchInput && !current.turnId) {
+        const data = notification.params as { threadId?: string; turnId?: string; turn?: NativeTurn; item?: NativeItem } | undefined;
+        if (data?.threadId === id) {
+          if ((notification.method === "item/started" || notification.method === "item/completed") && typeof data.turnId === "string" && data.item) {
+            observeInput(data.turnId, [data.item]);
+          }
+          if ((notification.method === "turn/started" || notification.method === "turn/completed")
+            && typeof data.turn?.id === "string" && Array.isArray(data.turn.items)) observeInput(data.turn.id, data.turn.items);
+        }
+      }
       const event = turnEvent(id, notification);
       if (!event) return;
       try {
@@ -191,18 +307,45 @@ function codexSession(client: CodexAppServerClient, id: string, cwd: string, mod
         }
       } catch (error) { fail(error); }
     });
-    const offExit = client.onExit(fail);
+    let transportError: Error | undefined;
+    const offExit = client.onExit(error => {
+      transportError = error;
+      if (current.turnId) fail(error);
+    });
     current.signal.addEventListener("abort", interrupt, { once: true });
     try {
-      const started = await client.requestIfRunning<{ turn?: NativeTurn }>("turn/start", {
-        threadId: id, cwd, model, input, approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: { type: "dangerFullAccess" }
-      }, rpcTimeout);
-      const turn = started?.turn;
-      if (typeof turn?.id !== "string" || !turn.id) throw new Error("Codex did not confirm the turn identity");
+      let turn: NativeTurn | undefined;
+      try {
+        const started = await client.requestIfRunning<{ turn?: NativeTurn }>("turn/start", {
+          threadId: id, cwd, model, approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy,
+          ...(dispatch && dispatchInput ? { input: [{ type: "text", text: dispatchInput }], clientUserMessageId: dispatch.key } : { input })
+        }, rpcTimeout);
+        turn = started?.turn;
+      } catch (error) {
+        if (!dispatchInput) throw error;
+      }
+      if (typeof turn?.id !== "string" || !turn.id) {
+        if (dispatchInput && !ambiguous && (!observedTurnId || !early.some(event => event.turnId === observedTurnId && event.kind === "terminal"))) {
+          const history = await client.requestIfRunning<{ thread?: NativeThread }>("thread/read", { threadId: id, includeTurns: true }, interruptTimeout).catch(() => null);
+          if (history?.thread?.id === id && sameDirectory(history.thread.cwd, cwd) && Array.isArray(history.thread.turns)) {
+            for (const candidate of history.thread.turns.slice(-128)) {
+              if (typeof candidate?.id !== "string" || !Array.isArray(candidate.items)) continue;
+              observeInput(candidate.id, candidate.items);
+              if (candidate.id === observedTurnId) turn = candidate;
+            }
+          }
+        }
+        if (!ambiguous && observedTurnId && turn?.id !== observedTurnId) turn = { id: observedTurnId };
+      }
+      if (ambiguous || typeof turn?.id !== "string" || !turn.id || observedTurnId && observedTurnId !== turn.id) {
+        throw new Error("Codex did not confirm the turn identity");
+      }
       current.turnId = turn.id;
+      dispatch?.recordNativeIdentity({ sessionId: id, turnId: turn.id });
       if (overflow) throw new Error("Codex sent too many notifications before confirming the turn");
       for (const event of early) apply(event);
       if (turn.status && turn.status !== "inProgress") apply(terminal({ ...turn, id: turn.id }));
+      if (!current.terminal && transportError) throw transportError;
       if (current.signal.aborted) interrupt();
       return await completed;
     } catch (error) {

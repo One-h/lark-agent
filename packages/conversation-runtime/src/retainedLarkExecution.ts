@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { ExecutionNativeApproval, ExecutionTurnResult, ExecutionWorkStage } from "./executionEngines.js";
-import { RetainedExecutionClient, RetainedHostError, type RetainedHostConfig, type RetainedTurnSnapshot } from "./retainedExecutionClient.js";
+import { RetainedExecutionClient, RetainedHostError, type RetainedHostConfig, type RetainedHostStatus, type RetainedTurnSnapshot } from "./retainedExecutionClient.js";
 
 type Binding = { message_id: number; turn_id: string; generation: string; session_key: string;
   engine_id: string; trusted: number; deadline: string; finalized: number };
@@ -12,7 +12,7 @@ type Operation = Parameters<ExecutionNativeApproval>[0];
 type Hooks = {
   workspace(): string;
   admit(source: Source): boolean;
-  current(binding: Binding): boolean;
+  current(binding: Binding, sessionId?: string): boolean;
   acceptSession(binding: Binding, sessionId: string): void;
   acceptInput(binding: Binding, sessionId: string): void;
   authorize(binding: Binding, requestId: string, operation: Operation, signal: AbortSignal, stillCurrent: () => boolean): Promise<boolean>;
@@ -25,6 +25,8 @@ export class RetainedLarkExecution {
   private readonly client: RetainedExecutionClient;
   private readonly lifetime = new AbortController();
   private readonly active = new Map<string, Local>();
+  private readonly mcpSessions = new Map<string, string>();
+  private readonly cancelling = new Set<string>();
   private busy = false;
   private timer?: ReturnType<typeof setInterval>;
 
@@ -63,10 +65,67 @@ export class RetainedLarkExecution {
     } catch { return false; }
   }
 
-  async start(input: Source & { prompt: string; model: string | null; sessionId: string | null }): Promise<void> {
-    const host = await this.client.call<{generation: string; workspace: string}>({ method: "status" }, this.lifetime.signal);
+  getForegroundMcpBinding(token: string): Binding | undefined {
+    return this.foregroundMcpBinding(token, true);
+  }
+
+  async resolveForegroundMcpBinding(token: string): Promise<Binding | undefined> {
+    const binding = this.foregroundMcpBinding(token, false);
+    if (binding && await this.confirmForegroundMcp(binding.message_id, binding.turn_id, token)) return this.getForegroundMcpBinding(token);
+  }
+
+  private foregroundMcpBinding(token: string, confirmed: boolean): Binding | undefined {
+    if (!this.db.open || this.lifetime.signal.aborted || confirmed && this.mcpSessions.size === 0
+      || !/^[A-Za-z0-9_-]{32}$/.test(token)) return;
+    return this.bindings().find(binding => {
+      const sessionId = this.mcpSessions.get(binding.turn_id);
+      return (!confirmed || sessionId !== undefined) && this.contextToken(binding) === token
+        && this.foregroundCurrent(binding, confirmed ? sessionId : undefined);
+    });
+  }
+
+  async confirmForegroundMcp(messageId: number, turnId: string, token: string): Promise<boolean> {
+    if (!this.db.open || this.lifetime.signal.aborted) return false;
+    const binding = this.get(messageId);
+    if (!binding || binding.turn_id !== turnId || this.contextToken(binding) !== token || !this.foregroundCurrent(binding)) return false;
+    try {
+      const snapshot = await this.call<RetainedTurnSnapshot | null>(binding,
+        { method: "attach", afterSequence: this.active.get(turnId)?.sequence ?? 0 });
+      if (snapshot?.foregroundLarkToolsActive === true && snapshot.engineId === binding.engine_id
+        && snapshot.status.state === "active" && typeof snapshot.status.sessionId === "string" && snapshot.status.sessionId
+        && this.foregroundCurrent(binding)) {
+        const sessionId = snapshot.status.sessionId;
+        // The first tool can arrive before the observer poll, including after a restart.
+        this.hooks.acceptSession(binding, sessionId);
+        if (this.foregroundCurrent(binding, sessionId)) {
+          this.hooks.acceptInput(binding, sessionId);
+          this.mcpSessions.set(turnId, sessionId);
+          return true;
+        }
+      }
+    } catch { /* An unavailable or changed host cannot authorize a tool. */ }
+    this.mcpSessions.delete(turnId);
+    return false;
+  }
+
+  private foregroundCurrent(binding: Binding, sessionId?: string): boolean {
+    if (this.lifetime.signal.aborted || !this.db.open || this.cancelling.has(binding.turn_id)
+      || !this.supports(binding.engine_id) || !(Date.parse(binding.deadline) > Date.now())) return false;
+    const current = this.get(binding.message_id);
+    return Boolean(current?.turn_id === binding.turn_id && current.generation === binding.generation
+      && current.engine_id === binding.engine_id && current.session_key === binding.session_key
+      && current.trusted === binding.trusted && current.deadline === binding.deadline && this.hooks.current(current, sessionId));
+  }
+
+  private contextToken(binding: Binding): string {
+    return this.client.foregroundMcpContextToken(binding.generation, binding.turn_id);
+  }
+
+  async start(input: Source & { prompt: string; model: string | null; sessionId: string | null; larkTools?: boolean }): Promise<void> {
+    const host = await this.client.call<RetainedHostStatus>({ method: "status" }, this.lifetime.signal);
     if (host.workspace !== this.hooks.workspace()) throw new Error("Retained engine workspace mismatch");
     this.lifetime.signal.throwIfAborted();
+    const foreground = input.larkTools && host.engines?.some(engine => engine.id === input.engineId && engine.foregroundLarkTools === true);
     const turnId = randomUUID();
     const deadline = new Date(Date.now() + (input.trusted ? 180_000 : 600_000)).toISOString();
     this.db.transaction(() => {
@@ -80,7 +139,8 @@ export class RetainedLarkExecution {
     })();
     try {
       await this.client.call({ method: "start", generation: host.generation, id: turnId, engineId: input.engineId,
-        text: input.prompt, sessionId: input.sessionId, model: input.model, trusted: input.trusted, deadline }, this.lifetime.signal);
+        text: input.prompt, sessionId: input.sessionId, model: input.model, trusted: input.trusted, deadline,
+        ...(foreground ? { lane: "foreground" } : {}) }, this.lifetime.signal);
     } catch {
       // Even a lost response can mean the engine accepted this exact request.
       // Only attach is allowed after the commit above; never resubmit.
@@ -98,9 +158,13 @@ export class RetainedLarkExecution {
     this.lifetime.abort();
     for (const local of this.active.values()) local.controller.abort();
     this.active.clear();
+    this.mcpSessions.clear();
+    this.cancelling.clear();
   }
 
   async cancel(binding: Binding): Promise<void> {
+    this.cancelling.add(binding.turn_id);
+    this.mcpSessions.delete(binding.turn_id);
     this.active.get(binding.turn_id)?.controller.abort();
     await this.call(binding, { method: "cancel" }).catch(() => {});
   }
@@ -141,6 +205,9 @@ export class RetainedLarkExecution {
     if (this.lifetime.signal.aborted) return;
     if (!this.hooks.current(binding)) return;
     if (snapshot && snapshot.engineId !== binding.engine_id) { this.finish(binding, null); return; }
+    if (snapshot && snapshot.status.state !== "starting" && snapshot.foregroundLarkToolsActive !== true) {
+      this.mcpSessions.delete(binding.turn_id);
+    }
     if (snapshot?.status.state === "finished") {
       this.hooks.acceptSession(binding, snapshot.status.sessionId);
       if (snapshot.status.result.status === "completed" || snapshot.sequence > 0) {
@@ -188,6 +255,9 @@ export class RetainedLarkExecution {
   private finish(binding: Binding, result: ExecutionTurnResult | null): void {
     this.active.get(binding.turn_id)?.controller.abort();
     this.active.delete(binding.turn_id);
+    this.mcpSessions.delete(binding.turn_id);
+    this.cancelling.delete(binding.turn_id);
+    if (result?.status === "completed") result = { ...result, text: result.text.replaceAll(this.contextToken(binding), "[redacted]") };
     const commit = this.db.transaction(() => {
       if (!this.db.prepare(`UPDATE lark_retained_turns SET finalized=1 WHERE turn_id=? AND finalized=0`).run(binding.turn_id).changes) return;
       return { deliver: this.hooks.finish(binding, result) };

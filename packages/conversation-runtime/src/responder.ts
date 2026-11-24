@@ -15,6 +15,8 @@ import { sanitizeLarkReply } from "./replySanitization.js";
 import { hasLarkManualTurnApproval, LarkApprovalError, larkNativeSocketReconnecting, notifyLarkNativeTurnDetached, notifyLarkTurnEnded } from "./approvalLifecycle.js";
 import { RetainedLarkExecution } from "./retainedLarkExecution.js";
 import type { RetainedHostConfig } from "./retainedExecutionClient.js";
+import { larkMcpToolsInstruction } from "./retainedForegroundMcp.js";
+export { retainedForegroundMcpBearer, retainedForegroundMcpPrompt } from "./retainedForegroundMcp.js";
 import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTaskContext.js";
 import { postHostJson } from "./hostHttp.js";
 import { rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
@@ -166,12 +168,6 @@ export function listLarkMcpTools(includeHostCapabilities: boolean) {
 
 export function larkMcpHostCapabilityId(tool: string): string | undefined {
   return larkMcpHostCapabilities().get(tool)?.id;
-}
-
-function larkMcpToolsInstruction(token?: string, trusted = false): string {
-  if (!token) return "";
-  const outcome = trusted ? "" : "工具仅返回 declined 或「用户拒绝」而没有明确来源时，用 lark_approval_status（input={}）核实结果。超时没有人工决定；可交付已完成的部分。仅在确认人工拒绝时称为人工拒绝。";
-  return `发布、PR 评审、Issue 分析、待办、飞书消息等能力通过 lark_tools MCP 直接调用。工具参数使用本轮 context_token=${token}，业务参数放在 input 内；令牌不可对外展示，不使用历史令牌。任务计划只用于安排工作，不是工具调用的前置步骤。按实际工具结果继续，不把未执行说成已完成。${outcome}`;
 }
 
 export function larkCodexTaskPaths(
@@ -3614,13 +3610,17 @@ function handleLarkHostDynamicTool(request: CodexAppServerRequest): boolean {
   return true;
 }
 
+function larkMcpSourceAllowed(message: LarkMessageRow) {
+  return !(config.groupPrivacyEnforced && message.chat_type === "group");
+}
+
 function toolContext(message: LarkMessageRow, turnId: string, trusted: boolean, native?: PreparedLarkCodexMessage) {
-  if (!message.chat_id || !message.sender_id || config.groupPrivacyEnforced && message.chat_type === "group") return;
+  if (!message.chat_id || !message.sender_id || !larkMcpSourceAllowed(message)) return;
   const trustScope = trusted ? "trusted" as const : "untrusted" as const;
   return { larkMessageId: message.id, senderId: message.sender_id, chatId: message.chat_id, turnId, trustScope, native };
 }
 
-export function getLarkMcpToolContext(contextToken: string) {
+function getLocalLarkMcpToolContext(contextToken: string) {
   for (const run of activeLarkCodexRuns.values()) {
     if (run.settled || run.pendingSteers !== 0 || run.authRecovering || run.capacityRecovery) continue;
     const target = approvalRunMember(run);
@@ -3633,6 +3633,20 @@ export function getLarkMcpToolContext(contextToken: string) {
       return toolContext(run.mcp.source, run.id, run.mcp.trusted);
     }
   }
+}
+
+function retainedLarkMcpToolContext(binding: ReturnType<RetainedLarkExecution["getForegroundMcpBinding"]>) {
+  if (!binding) return;
+  const row = canDispatchLarkReply(binding.message_id);
+  if (row) return toolContext(row, binding.turn_id, Boolean(binding.trusted));
+}
+
+export function getLarkMcpToolContext(contextToken: string) {
+  return getLocalLarkMcpToolContext(contextToken) ?? retainedLarkMcpToolContext(retainedLark?.getForegroundMcpBinding(contextToken));
+}
+
+export async function resolveLarkMcpToolContext(contextToken: string) {
+  return getLocalLarkMcpToolContext(contextToken) ?? retainedLarkMcpToolContext(await retainedLark?.resolveForegroundMcpBinding(contextToken));
 }
 
 export function submitLarkMcpApprovalPlan(context: ReturnType<typeof toolContext>, input: unknown) {
@@ -4635,10 +4649,11 @@ export function configureRetainedLarkExecution(options?: RetainedHostConfig): vo
       return Boolean(row && row.codex_dispatch_context === dispatchContext(row) && isTrustedSender(row.sender_id) === source.trusted
         && externalExecutionForMessage(row)?.engineId === source.engineId);
     },
-    current(binding) {
+    current(binding, sessionId) {
       const row = canDispatchLarkReply(binding.message_id);
       return Boolean(row && row.codex_status === "running" && row.codex_turn_id === binding.turn_id
-        && row.codex_dispatch_context === dispatchContext(row));
+        && row.codex_dispatch_context === dispatchContext(row) && isTrustedSender(row.sender_id) === Boolean(binding.trusted)
+        && (sessionId === undefined || row.codex_session_id === sessionId));
     },
     acceptSession(binding, sessionId) {
       const row = db.prepare("SELECT * FROM lark_messages WHERE id=?").get(binding.message_id) as LarkMessageRow;
@@ -4970,6 +4985,14 @@ export function confirmExternalLarkMcpTurn(messageId: number, turnId: string): b
   return [...externalTopicTurns.values()].some(run => run.id === turnId && isExternalMcpTurnActive(run, messageId));
 }
 
+export function hasRetainedLarkForegroundBinding(messageId: number, turnId: string): boolean {
+  return retainedLark?.get(messageId)?.turn_id === turnId;
+}
+
+export async function confirmRetainedLarkMcpTurn(messageId: number, turnId: string, contextToken: string): Promise<boolean> {
+  return retainedLark?.confirmForegroundMcp(messageId, turnId, contextToken) ?? false;
+}
+
 export function confirmExternalLarkNativeTurn(messageId: number, turnId: string): boolean {
   if (retainedLark?.owns(messageId, turnId)) return true;
   return [...externalTopicTurns.values()].some(run => run.id === turnId && run.source.id === messageId
@@ -5058,7 +5081,9 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     }
     const prompt = await prepareExternalPrompt(message, route, trusted, text);
     await retainedLark.start({ messageId: message.id, sessionKey: key, engineId: route.engineId, trusted,
-      prompt, model: route.model, sessionId: loadTopicExecutionSession(key) });
+      prompt, model: route.model, sessionId: loadTopicExecutionSession(key),
+      larkTools: Boolean(engine.supportsLarkMcp && config.larkAgentRuntimeUrl && config.larkAgentMcpToken
+        && message.chat_id && message.sender_id && larkMcpSourceAllowed(message)) });
     return;
   }
   const active = externalTopicTurns.get(key);

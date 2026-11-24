@@ -41,9 +41,12 @@ import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNa
   boundedReadApprovalPlan, listLarkMcpTools, setExternalNativeApprovalHandler, setWholeTurnNativeApprovalHandler, submitLarkMcpApprovalPlan,
   approvalStatusToolName, readLarkMcpApprovalStatus, wholeTurnScope } from "@lark-agent/conversation-runtime";
 import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
-import { TaskOrchestration, taskCommand, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
+import { TaskOrchestration, taskCommand, taskInputSchema, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
+import { TaskArtifacts } from "./plugins/taskArtifacts.js";
 import { RetainedExecutionClient } from "@lark-agent/conversation-runtime";
-import { readLarkReplyReceipt } from "@lark-agent/adapter-lark-cli";
+import { confirmRetainedLarkMcpTurn, hasRetainedLarkForegroundBinding,
+  resolveLarkMcpToolContext, retainedForegroundMcpBearer } from "@lark-agent/conversation-runtime";
+import { readLarkReplyReceipt, sendLarkFileReply, uploadLarkReplyFile } from "@lark-agent/adapter-lark-cli";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
 import { registerOwnerMentionAssistRoutes } from "./ownerMentionAssistRoutes.js";
@@ -59,7 +62,9 @@ import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, fo
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
 type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"];
   retainedEngineHost?: RetainedHostConfig; codexSocket?: string; codexSocketMaxPayloadMiB?: number; plugins?: readonly LarkRuntimePlugin[];
-  disabledBuiltinPlugins?: readonly string[]; taskOrchestrationEnabled?: boolean; taskEngineHost?: TaskEngineHost };
+  disabledBuiltinPlugins?: readonly string[]; taskOrchestrationEnabled?: boolean; taskEngineHost?: TaskEngineHost;
+  taskOrchestrationChatIds?: readonly string[];
+  taskOrchestrationConcurrency?: { global: number; perEngine: number } };
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
 type StoredCapability = { id: string; title: string; description: string; input_schema: string; risk: "read" | "local-write" | "external-write" };
 type PendingApproval = { resolve: (status: LarkApprovalStatus) => void; timer: NodeJS.Timeout; cleanup: () => void; stillCurrent?: () => boolean; wholeTask?: boolean;
@@ -263,24 +268,40 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     const source = taskSource(origin.messageId);
     return Boolean(source?.direction === "inbound" && source.sender_type === "user" && source.chat_id === origin.chatId
       && source.sender_id === origin.senderId && source.reply_trigger !== "owner_mention"
+      && (!config.taskOrchestrationChatIds || config.taskOrchestrationChatIds.includes(source.chat_id))
       && (!conversationConfig.groupPrivacyEnforced || source.chat_type === "p2p")
       && taskPolicy(origin.senderId) === origin.policy && isTrustedLarkSender(origin.senderId) === origin.trusted);
   };
   const taskOrchestration = taskHost && pluginHost.mount("task-orchestration", () => new TaskOrchestration({
     db: store.db, host: taskHost, workspace: () => workspaceRoot, allows: taskAllowed,
+    artifacts: new TaskArtifacts(path.join(dataDirectory, "orchestration-artifacts")), admissionNotice: true,
+    concurrency: config.taskOrchestrationConcurrency ?? { global: 3, perEngine: 1 },
+    upload: (name, bytes, signal) => {
+      if (process.env.LARK_AGENT_TEST_DATABASE === "1") throw new Error("Test runtime cannot upload a real file");
+      return uploadLarkReplyFile(name, bytes, signal);
+    },
     send: (id, text, key) => {
       const source = taskSource(id);
       if (!source) throw new Error("Original task message disappeared");
-      const sent = (config.textReplySender ?? sendLarkTextReply)(source.message_id, text, key);
+      const sent = config.textReplySender ? config.textReplySender(source.message_id, text, key)
+        : sendLarkTextReply(source.message_id, text, key, undefined, Boolean(source.thread_id));
       if (!sent.ok) throw new Error("Task reply did not return a success receipt");
       return { receipt: sent.messageId };
     },
-    readback: async (id, text, attemptedAt, signal) => {
+    sendFile: (id, fileKey, key) => {
+      if (process.env.LARK_AGENT_TEST_DATABASE === "1") throw new Error("Test runtime cannot send a real file");
+      const source = taskSource(id);
+      if (!source) throw new Error("Original task message disappeared");
+      const sent = sendLarkFileReply(source.message_id, fileKey, key, Boolean(source.thread_id));
+      if (!sent.ok) throw new Error("Task file did not return a success receipt");
+      return { receipt: sent.messageId };
+    },
+    readback: async (id, text, attemptedAt, signal, fileKey) => {
       if (process.env.LARK_AGENT_TEST_DATABASE === "1") return;
       const source = taskSource(id);
       if (!source) return;
       const receipt = await readLarkReplyReceipt({ chatId: source.chat_id, threadId: source.thread_id,
-        replyTo: source.message_id, attemptedAt, msgType: "text", content: { text } }, signal);
+        replyTo: source.message_id, attemptedAt, msgType: fileKey ? "file" : "text", content: fileKey ? { file_key: fileKey } : { text } }, signal);
       return receipt?.messageId;
     },
     report: () => app.log.warn("lark_task_orchestration_operation_unconfirmed")
@@ -1176,22 +1197,26 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   };
   app.post("/v1/capabilities/:id/invoke", capabilityRoute);
   app.post("/v1/internal/capabilities/:id/execute", capabilityRoute);
-  const authenticatedMcp = (request: FastifyRequest) => request.headers.authorization === `Bearer ${mcpToken}`
+  const retainedBearer = config.retainedEngineHost ? retainedForegroundMcpBearer(config.retainedEngineHost.token) : undefined;
+  const retainedMcp = (request: FastifyRequest) => Boolean(retainedBearer && request.headers.authorization === `Bearer ${retainedBearer}`);
+  const authenticatedMcp = (request: FastifyRequest) => (request.headers.authorization === `Bearer ${mcpToken}` || retainedMcp(request))
     && ["127.0.0.1", "::1"].includes(request.ip);
   app.get("/v1/internal/mcp/tools", async (request, reply) => {
     if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
-    return { tools: [...listLarkMcpTools(Boolean(config.runtimeToken)), ...(taskOrchestration ? [{
+    return { tools: [...listLarkMcpTools(Boolean(config.runtimeToken) && !retainedMcp(request)), ...(taskOrchestration ? [{
       name: "lark_task_orchestration", description: "Only for explicit delegation or follow-up of a delegated task. Do not use for ordinary questions. " +
-        "dispatch: goal with the full user request and worker {engine, model?}; optional reviewer {engine, model?, criteria}, with requester for human acceptance. " +
-        "follow_up: taskId, text, expandsScope; list: current sender's tasks in this conversation. " +
-        "accept: taskId, resultId, verdict (pass/changes requested/inconclusive), reason, only for the requester's explicit verdict. Engines: codex/claude/dsh/opencode/agy.",
+        "Dispatch records the goal, constraints, deliverables, resources and Worker; the existing skill controls worktree use. " +
+        "Read list for the current revision before an update. Follow up with the original Worker; reserve rework for an explicit agent decision " +
+        "within an unused preauthorized allowance. Only use accept or amend_review for the requester's explicit instruction. " +
+        "A dispatch receipt is sent by the runtime, so do not separately send a second receipt.",
       inputSchema: { type: "object", required: ["context_token", "input"], additionalProperties: false,
-        properties: { context_token: { type: "string", pattern: "^[A-Za-z0-9_-]{32}$" }, input: { type: "object" } } }
+        properties: { context_token: { type: "string", pattern: "^[A-Za-z0-9_-]{32}$" }, input: taskInputSchema } }
     }] : [])] };
   });
   const mcpApprovals = new McpApprovalBridge();
   const mcpToolRoute = async (request: FastifyRequest, reply: FastifyReply, prepare: boolean) => {
     if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
+    const retained = retainedMcp(request);
     const payload = request.body as { tool?: unknown; contextToken?: unknown; input?: unknown; callId?: unknown; threadId?: unknown; turnId?: unknown } | null;
     const keys = prepare ? ["tool", "contextToken", "input", "threadId", "turnId"] : ["tool", "contextToken", "input", "callId"];
     if (!payload || typeof payload.tool !== "string" || typeof payload.contextToken !== "string"
@@ -1201,8 +1226,13 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       return reply.code(400).send({ error: "invalid MCP tool request" });
     }
     const token = payload.contextToken;
-    const context = getLarkMcpToolContext(token);
+    if (retained && (prepare || !["lark_task_orchestration", approvalStatusToolName].includes(payload.tool))) {
+      return reply.code(403).send({ error: "Tool is not available for this retained MCP connection" });
+    }
+    const context = retained ? await resolveLarkMcpToolContext(token) : getLarkMcpToolContext(token);
     if (!context || !liveTurn(context.larkMessageId, context.turnId)) return reply.code(409).send({ error: "当前回合的工具令牌不可用。" });
+    if (retained && !hasRetainedLarkForegroundBinding(context.larkMessageId, context.turnId))
+      return reply.code(409).send({ error: "Retained MCP token does not match the original engine run" });
     if (prepare) {
       const row = store.db.prepare("SELECT codex_session_id FROM lark_messages WHERE id=?").get(context.larkMessageId) as { codex_session_id: string | null };
       if (!context.native || typeof payload.threadId !== "string" || payload.threadId !== row.codex_session_id || payload.turnId !== context.turnId) {
@@ -1227,6 +1257,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
         if (!source?.sender_id || source.sender_id !== context.senderId || source.chat_id !== context.chatId)
           throw new Error("Task source is no longer current");
         const origin: TaskOrigin = { messageId: context.larkMessageId, senderId: source.sender_id, chatId: source.chat_id,
+          threadId: source.thread_id,
           trusted: isTrustedLarkSender(source.sender_id), policy: taskPolicy(source.sender_id) };
         const current = () => {
           const live = getLarkMcpToolContext(token);
@@ -1236,7 +1267,9 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
         const key = mcpApprovalKey(token, payload.tool as string, payload.input);
         const run = async (signal: AbortSignal, beforeCommit?: (signal: AbortSignal) => Promise<void>) => {
           const lifetime = AbortSignal.any([signal, runtimeClosing.signal]);
-          const active = async () => !lifetime.aborted && current() && await confirmTurn(origin.messageId, context.turnId) && current();
+          const active = async () => !lifetime.aborted && current() && (retained
+            ? await confirmRetainedLarkMcpTurn(origin.messageId, context.turnId, token)
+            : await confirmTurn(origin.messageId, context.turnId)) && current();
           if (!await active()) throw new Error("The original task request is no longer active");
           return taskOrchestration.command(origin, parsed, async intent => {
             if (origin.trusted) return "approved";
@@ -1412,6 +1445,7 @@ if (process.argv[1]?.endsWith("index.ts")) {
   const configuredPayload = process.env.LARK_AGENT_CODEX_SOCKET_MAX_PAYLOAD_MIB;
   const runtime = createRuntime({ executionEngines, retainedEngineHost, codexSocket: process.env.LARK_AGENT_CODEX_APP_SERVER_SOCKET,
     taskOrchestrationEnabled: process.env.LARK_AGENT_TASK_ORCHESTRATION === "1",
+    taskOrchestrationChatIds: (process.env.LARK_AGENT_TASK_ORCHESTRATION_CHAT_IDS ?? "").split(",").map(id => id.trim()).filter(Boolean),
     disabledBuiltinPlugins: (process.env.LARK_AGENT_DISABLED_PLUGINS ?? "").split(",").map(id => id.trim()).filter(Boolean),
     codexSocketMaxPayloadMiB: configuredPayload === undefined ? undefined : Number(configuredPayload),
     wholeTaskAutoApproval: process.env.LARK_AGENT_AUTO_APPROVAL_GRANULARITY !== "operation", databasePath: process.env.LARK_AGENT_DATABASE ?? "./lark-agent.sqlite", mode: process.env.LARK_AGENT_MODE === "active" ? "active" : "shadow", trustedSenderIds: (process.env.LARK_AGENT_TRUSTED_SENDERS ?? "").split(",").filter(Boolean), approverId: process.env.LARK_AGENT_APPROVER_ID, workspaceRoot: process.env.LARK_AGENT_WORKSPACE_ROOT, hostBaseUrl: process.env.LARK_AGENT_HOST_URL, hostToken: process.env.LARK_AGENT_HOST_TOKEN, runtimeToken: process.env.LARK_AGENT_RUNTIME_TOKEN, host: "127.0.0.1", port });

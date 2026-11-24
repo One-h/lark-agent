@@ -1,6 +1,9 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { LarkReplyPresentation } from "./richReply.js";
 
 export function larkReplyIdempotencyKey(kind: string, seed: string): string {
@@ -75,17 +78,44 @@ export function parseLarkSentMessage(stdout: string): LarkSentMessage {
   };
 }
 
+export async function uploadLarkReplyFile(name: string, bytes: Buffer, signal: AbortSignal): Promise<string> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.(?:md|txt|csv|tsv|json|pdf|xlsx|ods)$/i.test(name)
+    || !bytes.length || bytes.length > 4 * 1024 * 1024) throw new Error("Invalid task reply file");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lark-reply-file-"));
+  try {
+    await writeFile(path.join(dir, name), bytes, { mode: 0o600, flag: "wx" });
+    const { stdout } = await promisify(execFile)("lark-cli", ["im", "files", "create", "--as", "bot",
+      "--data", JSON.stringify({ file_name: name, file_type: "stream" }), "--file", "file=" + name, "--format", "json"],
+    { cwd: dir, signal, timeout: 30_000, maxBuffer: 256 * 1024 });
+    const envelope = jsonFromCliOutput(stdout) as { ok?: boolean; identity?: string; code?: number; data?: { file_key?: unknown } } | null;
+    const key = envelope?.data?.file_key;
+    if (envelope?.ok === false || envelope?.identity && envelope.identity !== "bot" || envelope?.code && envelope.code !== 0
+      || typeof key !== "string" || !/^file_[A-Za-z0-9_-]{1,150}$/.test(key)) throw new Error("No confirmed file upload receipt");
+    return key;
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}
+
+export function sendLarkFileReply(messageId: string, fileKey: string, idempotencyKey: string, inThread = false): LarkSendResult {
+  if (!/^file_[A-Za-z0-9_-]{1,150}$/.test(fileKey)) return { ok: false, error: "Invalid uploaded file key" };
+  const result = spawnSync("lark-cli", ["im", "+messages-reply", "--as", "bot", "--message-id", messageId,
+    "--msg-type", "file", "--content", JSON.stringify({ file_key: fileKey }), "--idempotency-key", idempotencyKey,
+    ...(inThread ? ["--reply-in-thread"] : []), "--format", "json"],
+  { encoding: "utf8", timeout: 30_000 });
+  return result.status === 0 ? parseLarkSentMessage(result.stdout) : { ok: false, error: "File reply did not return a receipt" };
+}
+
 export function sendLarkTextReply(
   messageId: string,
   text: string,
   idempotencyKey: string,
-  presentation?: LarkReplyPresentation
+  presentation?: LarkReplyPresentation,
+  inThread = false
 ): LarkSendResult {
   const result = spawnSync(
     "lark-cli",
     ["im", "+messages-reply", "--as", "bot", "--message-id", messageId,
       ...(presentation ? ["--msg-type", presentation.msgType, "--content", JSON.stringify(presentation.content)] : ["--text", text]),
-      "--idempotency-key", idempotencyKey, "--format", "json"],
+      "--idempotency-key", idempotencyKey, ...(inThread ? ["--reply-in-thread"] : []), "--format", "json"],
     { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 }
   );
   if (result.status === 0) {
