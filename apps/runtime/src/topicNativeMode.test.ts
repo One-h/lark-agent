@@ -540,11 +540,14 @@ createInterface({input:process.stdin}).on('line',line=>{
       assert.equal(progress(first.row().id)?.state, "completed");
       assert.equal(progress(follow.row().id), undefined);
       const firstEvents = observations.filter(event => event.sourceMessageId === first.row().id);
-      assert.equal(firstEvents[0]?.kind, "turn.progress");
-      const terminal = firstEvents.at(-1);
+      assert.equal(firstEvents[0]?.kind, "turn.dispatched");
+      assert(firstEvents.some(event => event.kind === "turn.progress"));
+      const terminal = firstEvents.at(-2);
       assert(terminal?.kind === "turn.finished" && terminal.outcome === "completed");
+      assert.equal(firstEvents.at(-1)?.kind, "reply.delivered");
       assert(firstEvents.every(event => event.runId === terminal.runId));
-      assert.deepEqual(observations.filter(event => event.sourceMessageId === follow.row().id).map(event => event.kind), ["turn.finished"]);
+      assert.deepEqual(observations.filter(event => event.sourceMessageId === follow.row().id).map(event => event.kind),
+        ["turn.dispatched", "turn.finished", "reply.delivered"]);
       assert.equal(first.row().codex_reply, "| Value | Count |\n| --- | --- |\n| Fixture | 2 |");
       assert.equal(JSON.parse(first.row().reply_delivery_payload).msgType, "interactive");
       assert.equal(follow.row().codex_reply, "**Short answer**");

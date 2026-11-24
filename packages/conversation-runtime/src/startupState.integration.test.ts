@@ -591,8 +591,8 @@ test("progress delivery failure never blocks or duplicates final text", async ()
     const card = f.store.db.prepare("SELECT state,last_error FROM lark_progress_cards").get() as any;
     assert.equal(card.state, "completed"); assert.match(card.last_error, /fixture progress failed/);
     assert(stalled);
-    assert.deepEqual(observed.map(event => event.kind), ["turn.progress", "turn.finished"]);
-    assert.equal(observed[0].runId, observed[1].runId);
+    assert.deepEqual(observed.map(event => event.kind), ["turn.dispatched", "turn.progress", "turn.finished", "reply.delivered"]);
+    assert(observed.every(event => event.runId === observed[0].runId));
   } finally { hanging.close(); recorder.close(); config.larkCodexInterimReplyDelayMs = delay; await f.close(); }
 });
 

@@ -5,6 +5,8 @@ import { onLarkTurnObservation, publishLarkTurnObservation, type LarkTurnObserva
 const identity = { runId: "run", turnId: "turn", threadId: "thread", sourceMessageId: 1 };
 const progress = { ...identity, kind: "turn.progress", progressKey: "step", summary: "Reading fixture" } as const;
 const finished = { ...identity, kind: "turn.finished", outcome: "completed" } as const;
+const dispatched = { ...identity, kind: "turn.dispatched", engineId: "codex" } as const;
+const delivered = { ...identity, kind: "reply.delivered", confirmation: "send" } as const;
 
 test("turn observers receive ordered immutable snapshots without waiting for each other", async () => {
   const scope = {};
@@ -46,16 +48,28 @@ test("turn observers receive ordered immutable snapshots without waiting for eac
   }
 });
 
-test("a burst of progress leaves room for the terminal event on the same queue", async () => {
+test("informational bursts leave room for completion and delivery evidence", async () => {
   const scope = {};
   const observed: string[] = [];
   const subscription = onLarkTurnObservation(scope, event => { observed.push(event.kind); });
   try {
-    for (let i = 0; i < 150; i++) publishLarkTurnObservation(scope, { ...progress, progressKey: String(i) });
+    for (let i = 0; i < 150; i++) publishLarkTurnObservation(scope, i % 2 ? dispatched : { ...progress, progressKey: String(i) });
     publishLarkTurnObservation(scope, finished);
+    publishLarkTurnObservation(scope, delivered);
     await subscription.drain();
-    assert.equal(observed.at(-1), "turn.finished");
+    assert.deepEqual(observed.slice(-2), ["turn.finished", "reply.delivered"]);
     assert.equal(observed.filter(kind => kind === "turn.finished").length, 1);
     assert(observed.length < 150);
+  } finally { subscription.close(); }
+});
+
+test("subscribers can select event kinds without queuing unrelated traffic", async () => {
+  const scope = {};
+  const events: LarkTurnObservation[] = [];
+  const subscription = onLarkTurnObservation(scope, event => { events.push(event); }, { kinds: ["reply.delivered"] });
+  try {
+    for (const event of [dispatched, progress, finished, delivered]) publishLarkTurnObservation(scope, event);
+    await subscription.drain();
+    assert.deepEqual(events, [delivered]);
   } finally { subscription.close(); }
 });

@@ -1,15 +1,20 @@
 type TurnIdentity = { runId: string; turnId: string; threadId: string; sourceMessageId: number };
 export type LarkTurnObservation = Readonly<TurnIdentity & (
+  | { kind: "turn.dispatched"; engineId: string }
   | { kind: "turn.progress"; progressKey: string; summary: string }
   | { kind: "turn.finished"; outcome: "completed" | "failed" | "cancelled" | "interrupted" }
+  | { kind: "reply.delivered"; confirmation: "send" | "readback" }
 )>;
 
 type Observer = { enqueue(event: LarkTurnObservation): void };
 type Handler = (event: LarkTurnObservation, signal: AbortSignal) => void | Promise<void>;
 const observers = new WeakMap<object, Set<Observer>>();
 const queueLimit = 64;
+const isInformational = (event: LarkTurnObservation) => event.kind === "turn.progress" || event.kind === "turn.dispatched";
 
-export function onLarkTurnObservation(scope: object, handler: Handler, { timeoutMs = 2_000 }: { timeoutMs?: number } = {}) {
+export function onLarkTurnObservation(scope: object, handler: Handler,
+  { timeoutMs = 2_000, kinds }: { timeoutMs?: number; kinds?: readonly LarkTurnObservation["kind"][] } = {}) {
+  const selected = kinds && new Set(kinds);
   let members = observers.get(scope);
   if (!members) { members = new Set(); observers.set(scope, members); }
   const queue: LarkTurnObservation[] = [];
@@ -49,10 +54,10 @@ export function onLarkTurnObservation(scope: object, handler: Handler, { timeout
   };
   const observer: Observer = {
     enqueue(event) {
-      if (closed) return;
+      if (closed || selected && !selected.has(event.kind)) return;
       if (queue.length === queueLimit) {
-        if (event.kind === "turn.progress") return;
-        const discard = queue.findIndex(item => item.kind === "turn.progress");
+        if (isInformational(event)) return;
+        const discard = queue.findIndex(isInformational);
         if (discard === -1) {
           console.warn("lark_turn_observer_overflow");
           close();

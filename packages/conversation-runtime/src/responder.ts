@@ -1060,6 +1060,19 @@ function retryDelayMs(attempt: number): number {
   return Math.min(300_000, 1_000 * 2 ** Math.max(0, attempt - 1));
 }
 
+function observeConfirmedLarkReply(database: typeof db, id: number, confirmation: "send" | "readback"): void {
+  try {
+    const bound = database.prepare(`SELECT COALESCE(e.turn_id,m.codex_turn_id) AS turnId,
+      COALESCE(e.session_id,m.codex_session_id) AS threadId
+      FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id
+      WHERE m.id=? AND m.direction='inbound' AND m.codex_status='answered'
+      AND m.reply_status='sent' AND m.reply_sent_at IS NOT NULL`).get(id) as
+      { turnId: string | null; threadId: string | null } | undefined;
+    if (bound?.turnId && bound.threadId) publishLarkTurnObservation(database, { kind: "reply.delivered",
+      runId: bound.turnId, turnId: bound.turnId, threadId: bound.threadId, sourceMessageId: id, confirmation });
+  } catch { console.warn("lark_reply_observer_lookup_failed"); }
+}
+
 function deliverQueuedLarkTextReply(id: number): boolean {
   if (groupPrivacyBlocks(id)) {
     db.prepare("UPDATE lark_messages SET reply_status='skipped',reply_error='Group privacy owner review required',reply_next_attempt_at=NULL WHERE id=?").run(id);
@@ -1100,6 +1113,7 @@ function deliverQueuedLarkTextReply(id: number): boolean {
         .run(nowIso(), id);
       markOwnerAssistSent(id);
     })();
+    if (sent.messageId) observeConfirmedLarkReply(db, id, "send");
     return true;
   }
   const attempts = message.reply_delivery_attempts + 1;
@@ -2325,10 +2339,10 @@ function finishRun(
     return artifacts;
   })();
   writeArtifacts();
-  if (sendReply) deliverStagedLarkReply(textMessageId, [...mediaDeliveryIds, ...[...otherDeliveryIds.values()].flat()]);
   publishLarkTurnObservation(db, { kind: "turn.finished", runId: run.progressId, turnId: run.turnId,
     threadId: run.threadId, sourceMessageId: target.row.id, outcome: !sendReply ? "interrupted" : finalStatus === "failed"
       ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed" });
+  if (sendReply) deliverStagedLarkReply(textMessageId, [...mediaDeliveryIds, ...[...otherDeliveryIds.values()].flat()]);
   if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
   if (sendReply) {
     retryPendingLarkCompletionReactions();
@@ -4364,6 +4378,8 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   acceptPreparedPrompt(prepared, threadId, turn.turn.id);
   markLarkGroupContextDelivered(prepared);
   const run = registerLarkRun(prepared, executionConfig, socketIdentity ? { requests: new Set(), restored: false } : undefined);
+  publishLarkTurnObservation(db, { kind: "turn.dispatched", runId: run.progressId, turnId: run.turnId,
+    threadId, sourceMessageId: prepared.row.id, engineId: "codex" });
   recordAcceptedExecutionConfig(prepared, executionConfig);
   writeSessionArtifact(prepared, {
     action: "turn/start",
@@ -4549,6 +4565,8 @@ export function configureRetainedLarkExecution(options?: RetainedHostConfig): vo
         recordTopicExecution(row.id, route, sessionId, binding.turn_id);
       } else if (Date.now() - Date.parse(row.codex_last_heartbeat_at ?? "") < 5_000) return;
       updateCodexState(row.id, { status: "running", sessionId, turnId: binding.turn_id, heartbeatAt: nowIso() });
+      if (!row.codex_session_id) publishLarkTurnObservation(db, { kind: "turn.dispatched", runId: binding.turn_id, turnId: binding.turn_id,
+        threadId: sessionId, sourceMessageId: row.id, engineId: binding.engine_id });
     },
     authorize(binding, requestId, operation, signal, stillCurrent) {
       return externalNativeApprovalHandler?.(binding.message_id, binding.turn_id, operation, signal, stillCurrent, requestId) ?? Promise.resolve(false);
@@ -4967,6 +4985,8 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     const nativePolicy = authorizeNative ? "\n\n默认保持只读。按工具契约发起实际调用，由引擎和运行时处理权限，依据工具结果继续。" : "";
     try {
       markLarkTurnSubmitted(message.id);
+      publishLarkTurnObservation(db, { kind: "turn.dispatched", runId: progressId, turnId: progressId,
+        threadId: session.id, sourceMessageId: message.id, engineId: route.engineId });
       result = await session.run(`${prompt}${mcpToken ? `\n\n${externalLarkMcpInstructions(message, mcpToken, trusted)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent);
     }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
@@ -4997,9 +5017,9 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
       const deliveries = db.transaction(() => [...run.members.values()].map(member =>
         stageExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
           status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined)))();
-      for (const deliver of deliveries) deliver?.();
       publishLarkTurnObservation(db, { kind: "turn.finished", runId: progressId, turnId: progressId, threadId: session.id,
         sourceMessageId: message.id, outcome: cancelled ? "cancelled" : result ? "completed" : "failed" });
+      for (const deliver of deliveries) deliver?.();
     } finally { externalTopicTurns.delete(key); }
   })();
   void run.done.catch(() => console.warn("lark_external_topic_finish_failed"));
@@ -5209,7 +5229,7 @@ export async function inspectInterruptedLarkReplies(signal?: AbortSignal, readba
           .run(message.id,uncertainDelivery,message.reply_delivery_key);
         continue;
       }
-      database.transaction(() => {
+      const committed = database.transaction(() => {
         const updated = database.prepare(`UPDATE lark_messages SET reply_status='sent',reply_error=NULL,reply_sent_at=?
           WHERE id=? AND reply_status='failed' AND reply_error=? AND reply_delivery_key=? AND reply_send_attempted_at=?`)
           .run(receipt.sentAt,message.id,uncertainDelivery,message.reply_delivery_key,message.reply_send_attempted_at);
@@ -5220,7 +5240,9 @@ export async function inspectInterruptedLarkReplies(signal?: AbortSignal, readba
             messageAt: receipt.sentAt, messageType: presentation?.msgType ?? "text", source: "reply" });
           markOwnerAssistSent(message.id);
         }
+        return Boolean(updated.changes);
       })();
+      if (committed) observeConfirmedLarkReply(database, message.id, "readback");
     }
   } finally { deliveryReadbacks.delete(database); }
 }

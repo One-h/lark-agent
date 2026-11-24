@@ -79,3 +79,16 @@ enable these settings on a running bot. OpenCode uses ACP in this mode.
 Hosted ACP turns publish the same progress and terminal observer events as
 other turns. Early work is remembered until the progress delay is reached,
 and a short turn still does not create a progress card.
+
+Turn observers can select event kinds. `turn.dispatched` reports a new turn
+bound to an engine session when it is dispatched or first observed, not a
+reattachment, steer, or proof of completed work. `reply.delivered` reports
+an answered turn's final text/rich reply only after a send receipt or exact
+readback is committed. It excludes progress cards, approval notifications,
+separate attachments, and uncertain delivery. For a turn completed in the
+current runtime, `turn.finished` precedes `reply.delivered`; a confirmed
+readback can emit delivery without replaying past lifecycle events.
+
+The hooks are best-effort, process-local observations with bounded subscriber
+queues. On overload they prefer completion and delivery over dispatch and
+progress. They neither authorize operations nor influence execution.

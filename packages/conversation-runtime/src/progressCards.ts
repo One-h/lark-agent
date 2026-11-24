@@ -29,12 +29,13 @@ export function observeLarkProgressCards(database: Database.Database): () => voi
       finishLarkProgressCard(event.runId, event.outcome);
       return;
     }
+    if (event.kind !== "turn.progress") return;
     const source = database.prepare(`SELECT m.id,m.message_id,m.sender_type,m.chat_type
       FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id
       WHERE m.id=? AND COALESCE(e.turn_id,m.codex_turn_id)=?`).get(event.sourceMessageId, event.turnId) as ProgressSource | undefined;
     if (source) queueLarkProgressUpdate({ progressId: event.runId, turnId: event.turnId, threadId: event.threadId,
       source, eventId: event.progressKey, text: event.summary });
-  });
+  }, { kinds: ["turn.progress", "turn.finished"] });
   subscriptions.set(database, subscription);
   return () => {
     subscription.close();

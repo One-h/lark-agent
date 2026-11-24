@@ -6,7 +6,7 @@ import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import test from "node:test";
 import { claimLarkCodexReply, deliverLarkOutboxRow, inspectInterruptedLarkReplies, inspectInterruptedLarkTurns,
-  resumeQueuedLarkCodexReplies, retryPendingLarkTextReplies, type ExecutionEngine } from "@lark-agent/conversation-runtime";
+  onLarkTurnObservation, resumeQueuedLarkCodexReplies, retryPendingLarkTextReplies, type ExecutionEngine, type LarkTurnObservation } from "@lark-agent/conversation-runtime";
 import { reconcileInterruptedNativeTurns } from "../../../packages/conversation-runtime/src/crashRecovery.js";
 import { createRuntime } from "./index.js";
 
@@ -151,6 +151,8 @@ test("crash recovery survives process loss before engine result and before local
       assert.equal(child.status,73,child.stderr || child.stdout);
       let attempts=0;
       const runtime=createRuntime({...options(root),textReplySender:()=>{attempts++; return {ok:false,error:"do not retry"};}});
+      const observed: LarkTurnObservation[] = [];
+      const subscription = onLarkTurnObservation(runtime.store.db, event => { observed.push(event); }, { kinds: ["reply.delivered"] });
       try {
         const row=runtime.store.db.prepare("SELECT * FROM lark_messages WHERE message_id='om_fixture'").get() as Record<string,unknown>;
         if (phase==="engine") {
@@ -173,12 +175,16 @@ test("crash recovery survives process loss before engine result and before local
           assert.equal(probes,1);
           assert.equal(runtime.store.db.prepare("SELECT reply_status FROM lark_messages WHERE message_id='om_fixture'").pluck().get(),"sent");
           assert.equal(runtime.store.db.prepare("SELECT reply_to_message_id FROM lark_messages WHERE message_id='om_remote_receipt'").pluck().get(),"om_fixture");
+          await inspectInterruptedLarkReplies(undefined, async () => assert.fail("readback ran after a verified receipt"));
+          await subscription.drain();
+          assert.equal(observed.length, 1);
+          assert(observed[0]?.kind === "reply.delivered" && observed[0].confirmation === "readback");
         }
         resumeQueuedLarkCodexReplies();
         assert.equal(retryPendingLarkTextReplies(),0);
         assert.equal(attempts,0);
         assert.equal(fs.readFileSync(path.join(root,"trace"),"utf8"),phase==="engine"?"engine\n":"engine\ntransport\n");
-      } finally { await runtime.app.close();runtime.stop(); }
+      } finally { subscription.close(); await runtime.app.close();runtime.stop(); }
     } finally { fs.rmSync(root,{recursive:true,force:true}); }
   }
 });
