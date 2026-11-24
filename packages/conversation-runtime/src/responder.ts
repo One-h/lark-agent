@@ -2066,6 +2066,19 @@ function runMemberByMessageId(run: ActiveLarkCodexRun, messageId: string): Prepa
   return [...run.members.values()].find((prepared) => prepared.messageId === messageId) ?? null;
 }
 
+function acceptSteeredInput(run: ActiveLarkCodexRun, member: PreparedLarkCodexMessage, seen = false): void {
+  if (run.socketRecovery) {
+    const accepted = db.prepare("UPDATE lark_native_socket_steers SET state=? WHERE message_id=? AND turn_id=? AND state='pending'")
+      .run(seen ? "seen" : "accepted", member.row.id, run.turnId).changes;
+    if (seen && !accepted) db.prepare("UPDATE lark_native_socket_steers SET state='seen' WHERE message_id=? AND turn_id=? AND state='accepted'")
+      .run(member.row.id, run.turnId);
+    if (!accepted) return;
+  }
+  run.acceptedSteerMessageId = Math.max(run.acceptedSteerMessageId ?? 0, member.row.id);
+  publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: run.progressId, turnId: run.turnId,
+    threadId: run.threadId, sourceMessageId: member.row.id, engineId: "codex", input: "steered" });
+}
+
 function updateRunMembers(
   run: ActiveLarkCodexRun,
   status: LarkMessageRow["codex_status"],
@@ -2737,6 +2750,7 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
     if (messageEvent.type === "user") {
       const owner = runMemberByMessageId(run, messageEvent.clientId);
       if (owner) {
+        if (run.socketRecovery) acceptSteeredInput(run, owner, true);
         run.responseMemberId = owner.row.id;
         run.lastAgentMessage = null;
         run.finalAgentMessage = null;
@@ -2772,7 +2786,9 @@ function handleRunNotification(run: ActiveLarkCodexRun, notification: CodexAppSe
       abandonNativeSocketTurn(target.row.id, run.turnId);
       return;
     }
-    if (socket?.restored && socket.terminalRead !== "complete" && !run.finalAgentMessage) {
+    if (socket && socket.terminalRead !== "complete" && (
+      socket.restored && (!run.finalAgentMessage || run.members.size > 1)
+      || db.prepare("SELECT 1 FROM lark_native_socket_steers WHERE turn_id=? AND state!='seen'").get(run.turnId))) {
       if (socket.terminalRead === "pending") return;
       socket.terminalRead = "pending";
       const recoverySignal = nativeSocketLifetime.signal;
@@ -4512,18 +4528,27 @@ function registerLarkRun(prepared: PreparedLarkCodexMessage, executionConfig: La
 
 async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedLarkCodexMessage): Promise<void> {
   if (skipDisabledTopicContinuation(prepared.row)) return;
+  if (run.socketRecovery && (run.settled || !codexAppServer.status().running)) {
+    db.prepare("UPDATE lark_messages SET codex_status='queued',codex_dispatch_phase='queued' WHERE id=? AND codex_dispatch_phase='preparing'")
+      .run(prepared.row.id);
+    return;
+  }
   updatePreparedPrompt(prepared, "delta", run.threadId);
-  markLarkTurnSubmitted(prepared.row.id);
+  db.transaction(() => {
+    markLarkTurnSubmitted(prepared.row.id);
+    if (run.socketRecovery) db.prepare("INSERT INTO lark_native_socket_steers(message_id,turn_id,state) VALUES(?,?,'pending')")
+      .run(prepared.row.id, run.turnId);
+    updateCodexState(prepared.row.id, {
+      status: "running",
+      sessionId: run.threadId,
+      turnId: run.turnId,
+      heartbeatAt: nowIso(),
+      taskDir: prepared.taskDir,
+      startedAt: nowIso()
+    });
+  })();
   run.members.set(prepared.row.id, prepared);
   run.pendingSteers += 1;
-  updateCodexState(prepared.row.id, {
-    status: "running",
-    sessionId: run.threadId,
-    turnId: run.turnId,
-    heartbeatAt: nowIso(),
-    taskDir: prepared.taskDir,
-    startedAt: nowIso()
-  });
   try {
     await codexAppServer.request("turn/steer", {
       threadId: run.threadId,
@@ -4532,17 +4557,21 @@ async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedL
       clientUserMessageId: prepared.messageId
     });
     // The steer acknowledgement can precede the native user-message notification.
-    run.acceptedSteerMessageId = Math.max(run.acceptedSteerMessageId ?? 0, prepared.row.id);
-    publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: run.progressId, turnId: run.turnId,
-      threadId: run.threadId, sourceMessageId: prepared.row.id, engineId: "codex", input: "steered" });
+    acceptSteeredInput(run, prepared);
+    if (run.settled) return;
     acceptPreparedPrompt(prepared, run.threadId, run.turnId);
     recordAcceptedExecutionConfig(prepared, { ...run.executionConfig, action: "turn/steer", recordedAt: nowIso() });
     writeSessionArtifact(prepared, { action: "turn/steer", previousThreadId: run.threadId, threadId: run.threadId, turnId: run.turnId });
     markLarkGroupContextDelivered(prepared);
     run.lastInputMs = Date.now();
   } catch (error) {
-    run.members.delete(prepared.row.id);
     appendPreparedError(prepared, `Unable to steer active turn ${run.turnId}: ${error instanceof Error ? error.message : String(error)}`);
+    if (run.socketRecovery) {
+      run.pendingSteers--;
+      if (!run.settled) detachNativeLarkRun(run, true);
+      return;
+    }
+    run.members.delete(prepared.row.id);
     run.pendingSteers -= 1;
     const deferredCompletion = run.deferredCompletion;
     run.deferredCompletion = null;
@@ -4686,7 +4715,7 @@ function nativeSocketContextCurrent(messageId: number, turnId: string): boolean 
   const source = canDispatchLarkReply(messageId);
   if (!source || source.codex_turn_id !== turnId || source.codex_status !== "running" || source.codex_dispatch_context !== dispatchContext(source)) return false;
   const identity = nativeSocketIdentity();
-  return !!identity && !!db.prepare("SELECT 1 FROM lark_native_socket_turns WHERE message_id=? AND turn_id=? AND socket_identity=?")
+  return !!identity && !!db.prepare("SELECT 1 FROM lark_native_socket_members WHERE message_id=? AND turn_id=? AND socket_identity=? AND state!='pending'")
     .get(messageId, turnId, identity);
 }
 
@@ -4706,6 +4735,47 @@ const nativeRecoveryRetry = new Map<string, { attempts: number; nextAt: number }
 function deferNativeSocketRecovery(turnId: string): void {
   const attempts = (nativeRecoveryRetry.get(turnId)?.attempts ?? 0) + 1;
   nativeRecoveryRetry.set(turnId, { attempts, nextAt: Date.now() + Math.min(30_000, 1000 * 2 ** Math.min(attempts - 1, 5)) });
+}
+
+function restoreSocketPrepared(row: LarkMessageRow, trustedSender: boolean): PreparedLarkCodexMessage {
+  const { taskDir, sessionDir } = larkCodexTaskPaths(row, trustedSender);
+  return {
+    row, messageId: row.message_id!, trustedSender, sessionKey: preparedSessionKey(row, trustedSender), taskDir, sessionDir,
+    activityVersion: 0, conversationStyle: captureConversationStyle(row.chat_id), historyImages: createHistoryImageState(),
+    stickerContextToken: crypto.randomBytes(24).toString("base64url"), prompt: "", input: [],
+    promptPath: path.join(taskDir, "prompt.md"), stdoutPath: path.join(taskDir, "codex.stdout.jsonl"),
+    stderrPath: path.join(taskDir, "codex.stderr.log"), sessionPath: path.join(taskDir, "resume-session.json"),
+    referencedImagePaths: [], referencedFiles: [], missingImageCount: 0, groupContextCursorId: null, promptMode: null
+  };
+}
+
+function loadSocketSteerInputs(anchor: PreparedLarkCodexMessage, stored: LarkExecutionConfig,
+  items: Record<string, unknown>[] | undefined, terminal = false): PreparedLarkCodexMessage[] | undefined {
+  const journal = db.prepare("SELECT message_id,state FROM lark_native_socket_steers WHERE turn_id=? ORDER BY message_id")
+    .all(stored.turnId) as Array<{ message_id: number; state: "pending" | "accepted" | "seen" }>;
+  const nativeInputs = new Set(items?.filter(item => item.type === "userMessage").map(item => item.clientId));
+  const members: PreparedLarkCodexMessage[] = [];
+  for (const entry of journal) {
+    const row = canDispatchLarkReply(entry.message_id);
+    if (!row?.message_id || row.sender_id !== anchor.row.sender_id || row.codex_status !== "running"
+      || row.codex_turn_id !== stored.turnId || row.codex_session_id !== stored.threadId
+      || row.codex_dispatch_context !== dispatchContext(row)
+      || preparedSessionKey(row, anchor.trustedSender) !== anchor.sessionKey) return;
+    // A lost RPC acknowledgement is not permission to replay. For terminal
+    // delivery, require native positions even for locally acknowledged steers.
+    if ((terminal || entry.state !== "seen") && !nativeInputs.has(row.message_id)) return;
+    members.push(restoreSocketPrepared(row, anchor.trustedSender));
+  }
+  return members;
+}
+
+function restoreSocketSteerInputs(run: ActiveLarkCodexRun, members: PreparedLarkCodexMessage[], terminal = false): void {
+  for (const member of members) {
+    if (!run.members.has(member.row.id)) run.members.set(member.row.id, member);
+    acceptSteeredInput(run, member, true);
+    run.acceptedSteerMessageId = Math.max(run.acceptedSteerMessageId ?? 0, member.row.id);
+    if (!terminal) run.responseMemberId = member.row.id;
+  }
 }
 
 async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
@@ -4746,22 +4816,24 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
           else deferNativeSocketRecovery(entry.turn_id);
           continue;
         }
-        const { taskDir, sessionDir } = larkCodexTaskPaths(row, trustedSender);
-        const prepared: PreparedLarkCodexMessage = {
-          row, messageId: row.message_id, trustedSender, sessionKey, taskDir, sessionDir, activityVersion: 0,
-          conversationStyle: captureConversationStyle(row.chat_id), historyImages: createHistoryImageState(),
-          stickerContextToken: crypto.randomBytes(24).toString("base64url"), prompt: "", input: [],
-          promptPath: path.join(taskDir, "prompt.md"), stdoutPath: path.join(taskDir, "codex.stdout.jsonl"),
-          stderrPath: path.join(taskDir, "codex.stderr.log"), sessionPath: path.join(taskDir, "resume-session.json"),
-          referencedImagePaths: [], referencedFiles: [], missingImageCount: 0, groupContextCursorId: null, promptMode: null
-        };
+        const prepared = restoreSocketPrepared(row, trustedSender);
         const current = canDispatchLarkReply(row.id);
         if (!current || current.codex_dispatch_context !== dispatchContext(current)) continue;
         if (state.status !== "active") {
           if (!await restoreNativeSocketTerminal(prepared, stored, request)) deferNativeSocketRecovery(entry.turn_id);
           continue;
         }
+        const needItems = db.prepare("SELECT 1 FROM lark_native_socket_steers WHERE turn_id=? AND state!='seen'").get(stored.turnId);
+        const items = needItems ? await readCompleteTurnItems(request, stored) : undefined;
+        if (signal.aborted || nativeSocketIdentity() !== identity) return;
+        const members = loadSocketSteerInputs(prepared, stored, items);
+        if (!members) {
+          if (recoveryExpired) abandonNativeSocketTurn(row.id, entry.turn_id);
+          else deferNativeSocketRecovery(entry.turn_id);
+          continue;
+        }
         const run = registerLarkRun(prepared, stored, { requests: new Set(), restored: true });
+        restoreSocketSteerInputs(run, members);
         try {
           const params = buildLarkCodexThreadParams(trustedSender, "resume", stored.model ?? undefined);
           const resumed = await codexAppServer.request<ThreadResponse>("thread/resume", { ...params, threadId: entry.thread_id }, 4_000);
@@ -4793,8 +4865,9 @@ async function restoreNativeSocketTurns(signal: AbortSignal): Promise<void> {
 function abandonNativeSocketTurn(messageId: number, turnId: string): void {
   nativeRecoveryRetry.delete(turnId);
   db.transaction(() => {
-    quarantineLarkExecution(db, messageId, nowIso());
-    db.prepare("DELETE FROM lark_native_socket_turns WHERE message_id=? AND turn_id=?").run(messageId, turnId);
+    const memberIds = db.prepare("SELECT message_id FROM lark_native_socket_members WHERE turn_id=?").pluck().all(turnId) as number[];
+    for (const memberId of new Set([messageId, ...memberIds])) quarantineLarkExecution(db, memberId, nowIso());
+    db.prepare("DELETE FROM lark_native_socket_turns WHERE turn_id=?").run(turnId);
   })();
   reconcileLarkProgressCards();
 }
@@ -4810,8 +4883,12 @@ async function restoreNativeSocketTerminal(prepared: PreparedLarkCodexMessage, s
     if (existing) detachNativeLarkRun(existing);
     return false;
   }
-  const row = canDispatchLarkReply(prepared.row.id);
-  if (!row || row.codex_dispatch_context !== dispatchContext(row) || !items) {
+  const anchorId = db.prepare("SELECT message_id FROM lark_native_socket_turns WHERE turn_id=?").pluck().get(stored.turnId) as number | undefined;
+  const row = anchorId === undefined ? undefined : canDispatchLarkReply(anchorId);
+  const anchor = row?.message_id && row.codex_dispatch_context === dispatchContext(row)
+    ? restoreSocketPrepared(row, stored.trustScope === "trusted") : undefined;
+  const members = anchor && items ? loadSocketSteerInputs(anchor, stored, items, true) : undefined;
+  if (!anchor || !items || !members) {
     if (existing) detachNativeLarkRun(existing);
     if (Date.now() - Date.parse(prepared.row.codex_last_heartbeat_at ?? prepared.row.codex_started_at ?? "") > 600_000) {
       abandonNativeSocketTurn(prepared.row.id, stored.turnId);
@@ -4819,7 +4896,12 @@ async function restoreNativeSocketTerminal(prepared: PreparedLarkCodexMessage, s
     }
     return false;
   }
-  const run = existing ?? registerLarkRun(prepared, stored, { requests: new Set(), restored: true });
+  const run = existing ?? registerLarkRun(anchor, stored, { requests: new Set(), restored: true });
+  restoreSocketSteerInputs(run, members, true);
+  run.responseMemberId = anchor.row.id;
+  run.lastAgentMessage = null;
+  run.finalAgentMessage = null;
+  run.pendingInterim = null;
   if (run.socketRecovery) run.socketRecovery.terminalRead = "complete";
   for (const item of items) handleRunNotification(run, { method: "item/completed", params: { threadId: stored.threadId, turnId: stored.turnId, item } });
   handleRunNotification(run, { method: "turn/completed", params: { threadId: stored.threadId, turn: { id: stored.turnId, status: state.status, error: state.error } } });
@@ -4848,7 +4930,7 @@ export function stopRetainedLarkRecovery(): void {
 }
 export function hasRetainedLarkBinding(messageId: number, turnId: string): boolean {
   return Boolean(retainedLark?.get(messageId)?.turn_id === turnId || larkCodexSocket && db.prepare(
-    "SELECT 1 FROM lark_native_socket_turns WHERE message_id=? AND turn_id=?").get(messageId, turnId));
+    "SELECT 1 FROM lark_native_socket_members WHERE message_id=? AND turn_id=? AND state!='pending'").get(messageId, turnId));
 }
 export async function confirmRetainedLarkRequest(messageId: number, turnId: string, requestId: string): Promise<boolean> {
   const run = [...activeLarkCodexRuns.values()].find(candidate =>
@@ -5150,14 +5232,19 @@ async function routeLarkCodexReply(larkMessageId: number): Promise<void> {
       return;
     }
     const sessionKey = preparedSessionKey(message, trustedSender);
+    let activeRun = activeLarkCodexRuns.get(sessionKey);
     if (larkCodexSocket && db.prepare(`SELECT 1 FROM lark_native_socket_turns r JOIN lark_messages m ON m.id=r.message_id
       WHERE m.chat_id IS ? AND m.thread_id IS ? AND m.codex_status='running' LIMIT 1`).get(message.chat_id, message.thread_id)) {
-      db.prepare("UPDATE lark_messages SET codex_dispatch_phase='queued' WHERE id=? AND codex_dispatch_phase='preparing'").run(message.id);
-      return;
+      // Only follow-ups from the same requester can steer an attached, tracked turn.
+      // Detached turns and independent requests keep their durable queue position.
+      if (!activeRun?.socketRecovery || activeRun.settled || activeRun.pendingSteers || !codexAppServer.status().running
+        || !message.sender_id || message.reply_trigger === "owner_mention" || message.sender_id !== approvalRunMember(activeRun).row.sender_id) {
+        db.prepare("UPDATE lark_messages SET codex_dispatch_phase='queued' WHERE id=? AND codex_dispatch_phase='preparing'").run(message.id);
+        return;
+      }
     }
     const activityVersion = (larkSessionActivityVersions.get(sessionKey) ?? 0) + 1;
     larkSessionActivityVersions.set(sessionKey, activityVersion);
-    let activeRun = activeLarkCodexRuns.get(sessionKey);
     if (activeRun && message.reply_trigger === "owner_mention") {
       await activeRun.done;
       activeRun = activeLarkCodexRuns.get(sessionKey);
@@ -5458,7 +5545,7 @@ export function reconcileOrphanedLarkCodexRuns(nowMs = Date.now(), force = false
       AND COALESCE(codex_last_heartbeat_at, codex_started_at) <= ?
   `).all(cutoff) as Array<{ id: number }>;
   const ids = candidates.map((candidate) => candidate.id).filter((id) => !activeMessageIds.has(id) && !retainedLark?.get(id)
-    && !(larkCodexSocket && db.prepare("SELECT 1 FROM lark_native_socket_turns WHERE message_id=?").get(id)));
+    && !(larkCodexSocket && db.prepare("SELECT 1 FROM lark_native_socket_members WHERE message_id=?").get(id)));
   if (ids.length === 0) {
     return 0;
   }

@@ -190,6 +190,16 @@ export class SqliteAgentStore {
         message_id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL UNIQUE,
         socket_identity TEXT NOT NULL, execution_config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS lark_native_socket_steers (
+        message_id INTEGER PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES lark_native_socket_turns(turn_id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK(state IN ('pending','accepted','seen'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_lark_native_socket_steers_turn ON lark_native_socket_steers(turn_id);
+      CREATE VIEW IF NOT EXISTS lark_native_socket_members AS
+        SELECT message_id,thread_id,turn_id,socket_identity,'anchor' AS state FROM lark_native_socket_turns
+        UNION ALL
+        SELECT s.message_id,t.thread_id,t.turn_id,t.socket_identity,s.state
+        FROM lark_native_socket_steers s JOIN lark_native_socket_turns t USING (turn_id);
       CREATE TABLE IF NOT EXISTS lark_codex_archive_queue (thread_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, activity_version INTEGER NOT NULL, token TEXT NOT NULL, due_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_lark_codex_archive_queue_due ON lark_codex_archive_queue(due_at);
       CREATE TABLE IF NOT EXISTS lark_owner_mention_assists (

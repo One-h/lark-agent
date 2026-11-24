@@ -67,9 +67,13 @@ contract.
   engine IDs on Lark with `LARK_AGENT_ENGINE_HOST_ENGINES` (comma-separated).
   A hosted engine never falls back to a different launcher to bypass its policy.
 
-This initial mode covers single-input text turns with native permission
-callbacks. It serializes inputs rather than steering an in-flight turn. Hosted
-ACP does not mount Lark MCP tools. In-flight Lark MCP callbacks, transient
+An attached Codex socket turn accepts same-requester follow-ups through
+`turn/steer`. Lark journals each submission before sending it, records
+acceptance after an acknowledgement or native input observation, and checks
+native input IDs to reconstruct the final reply's target after reconnect.
+An ambiguous steer is never resubmitted or turned into a fresh prompt.
+Independent requests, detached turns, and hosted ACP still serialize input.
+Hosted ACP does not mount Lark MCP tools. In-flight Lark MCP callbacks, transient
 attachment or sticker state, and legacy Codex per-operation cards are not
 reattached. The engine host itself cannot be hot restarted.
 

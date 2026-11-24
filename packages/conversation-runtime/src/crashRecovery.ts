@@ -29,8 +29,8 @@ export function reconcileLarkCrash(database: Database.Database, at: string, reta
           AND link.turn_id=lark_capability_approvals.turn_id AND (
             (?=1 AND EXISTS(SELECT 1 FROM lark_retained_turns turn WHERE turn.turn_id=link.turn_id AND turn.finalized=0
               AND turn.message_id=lark_capability_approvals.lark_message_id))
-            OR (?=1 AND EXISTS(SELECT 1 FROM lark_native_socket_turns turn WHERE turn.turn_id=link.turn_id
-              AND turn.message_id=lark_capability_approvals.lark_message_id)))
+            OR (?=1 AND EXISTS(SELECT 1 FROM lark_native_socket_members turn WHERE turn.turn_id=link.turn_id
+              AND turn.state!='pending' AND turn.message_id=lark_capability_approvals.lark_message_id)))
       )`).run(interruptedApproval, at, Number(retainHostTurns), Number(retainNativeTurns));
     const inFlightCalls = database.prepare("SELECT DISTINCT lark_message_id FROM lark_capability_invocations WHERE status='running'")
       .pluck().all() as number[];
@@ -43,7 +43,7 @@ export function reconcileLarkCrash(database: Database.Database, at: string, reta
         SELECT 1 FROM lark_retained_turns turn WHERE turn.message_id=lark_messages.id AND turn.turn_id=lark_messages.codex_turn_id
         AND turn.finalized=0 AND lark_messages.codex_dispatch_phase='submitted'
       )) AND (?=0 OR NOT EXISTS (
-        SELECT 1 FROM lark_native_socket_turns turn WHERE turn.message_id=lark_messages.id AND turn.turn_id=lark_messages.codex_turn_id
+        SELECT 1 FROM lark_native_socket_members turn WHERE turn.message_id=lark_messages.id AND turn.turn_id=lark_messages.codex_turn_id
         AND turn.thread_id=lark_messages.codex_session_id AND lark_messages.codex_dispatch_phase='submitted'
       ))`).all(Number(retainHostTurns), Number(retainNativeTurns)) as Array<{ id: number; phase: string | null; context: string | null; reply_trigger: string }>;
     const requeue = database.prepare(`UPDATE lark_messages SET codex_status='queued',codex_dispatch_phase='queued',
