@@ -181,6 +181,11 @@ export class SqliteAgentStore {
         turn_id TEXT NOT NULL, request_id TEXT NOT NULL, approval_id INTEGER NOT NULL UNIQUE, policy_hash TEXT NOT NULL,
         PRIMARY KEY (turn_id, request_id)
       );
+      CREATE TABLE IF NOT EXISTS lark_delivery_confirmations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_kind TEXT NOT NULL, platform_receipt TEXT NOT NULL,
+        source_message_id INTEGER NOT NULL, turn_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+        confirmation TEXT NOT NULL, confirmed_at TEXT NOT NULL, UNIQUE(delivery_kind, platform_receipt)
+      );
       CREATE TABLE IF NOT EXISTS lark_native_socket_turns (
         message_id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL UNIQUE,
         socket_identity TEXT NOT NULL, execution_config TEXT NOT NULL
@@ -253,6 +258,7 @@ export class SqliteAgentStore {
     this.ensureColumn("lark_messages", "codex_recovery_checks", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("lark_messages", "codex_recovery_checked_at", "TEXT");
     this.ensureColumn("lark_messages", "reply_send_attempted_at", "TEXT");
+    this.ensureColumn("lark_retained_turns", "input_accepted", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("lark_messages", "reply_recovery_attempts", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("lark_messages", "reply_recovery_checked_at", "TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_recovery_queue ON lark_messages(id) WHERE codex_status='queued' AND codex_dispatch_phase='queued'");

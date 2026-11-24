@@ -132,13 +132,14 @@ export function sendLarkMediaReply(
   taskDir: string,
   relativePath: string,
   idempotencyKey: string
-): { ok: true } | { ok: false; error: string } {
+): { ok: true; messageId?: string | null } | { ok: false; error: string } {
   const result = spawnSync("lark-cli", buildLarkMediaReplyArgs(messageId, relativePath, idempotencyKey), {
     cwd: taskDir,
     encoding: "utf8"
   });
   if (result.status === 0) {
-    return { ok: true };
+    const messageId = parseLarkSentMessage(result.stdout).messageId;
+    return messageId ? { ok: true, messageId } : { ok: true };
   }
   return { ok: false, error: (result.stderr || result.stdout || `lark-cli exited with code ${result.status}`).trim() };
 }
@@ -188,7 +189,7 @@ export function sendLarkImagePostReply(
   taskDir: string,
   imagePaths: string[],
   idempotencyKey: string
-): { ok: true; imageCount: number } | { ok: false; error: string } {
+): { ok: true; imageCount: number; messageId?: string | null } | { ok: false; error: string } {
   const imageKeys: string[] = [];
   for (const imagePath of imagePaths) {
     const uploaded = uploadLarkReplyImage(taskDir, imagePath);
@@ -202,7 +203,8 @@ export function sendLarkImagePostReply(
     encoding: "utf8"
   });
   if (result.status === 0) {
-    return { ok: true, imageCount: imageKeys.length };
+    const messageId = parseLarkSentMessage(result.stdout).messageId;
+    return { ok: true, imageCount: imageKeys.length, ...(messageId ? { messageId } : {}) };
   }
   return { ok: false, error: (result.stderr || result.stdout || `lark-cli exited with code ${result.status}`).trim() };
 }

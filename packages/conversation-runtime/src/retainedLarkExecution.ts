@@ -14,6 +14,7 @@ type Hooks = {
   admit(source: Source): boolean;
   current(binding: Binding): boolean;
   acceptSession(binding: Binding, sessionId: string): void;
+  acceptInput(binding: Binding, sessionId: string): void;
   authorize(binding: Binding, requestId: string, operation: Operation, signal: AbortSignal, stillCurrent: () => boolean): Promise<boolean>;
   observe(binding: Binding, sessionId: string, stage?: ExecutionWorkStage): boolean;
   finish(binding: Binding, result: ExecutionTurnResult | null): (() => void) | undefined;
@@ -142,6 +143,9 @@ export class RetainedLarkExecution {
     if (snapshot && snapshot.engineId !== binding.engine_id) { this.finish(binding, null); return; }
     if (snapshot?.status.state === "finished") {
       this.hooks.acceptSession(binding, snapshot.status.sessionId);
+      if (snapshot.status.result.status === "completed" || snapshot.sequence > 0) {
+        this.hooks.acceptInput(binding, snapshot.status.sessionId);
+      }
       this.finish(binding, snapshot.status.result);
       return;
     }
@@ -154,6 +158,7 @@ export class RetainedLarkExecution {
     if (snapshot.status.state === "failed" || snapshot.status.state === "acknowledged") { this.finish(binding, null); return; }
     if (snapshot.status.state !== "active") return;
     this.hooks.acceptSession(binding, snapshot.status.sessionId);
+    if (snapshot.sequence > 0 || snapshot.approvals.length > 0) this.hooks.acceptInput(binding, snapshot.status.sessionId);
     if (!local) {
       local = { controller: new AbortController(), requests: new Set(), pending: new Set(), sequence: 0 };
       this.active.set(binding.turn_id, local);

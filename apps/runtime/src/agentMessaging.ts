@@ -160,20 +160,26 @@ export class AgentMessaging {
       await delay(Math.min(500, Math.max(0, deadline - Date.now())), undefined, { signal });
     }
   }
-  private captureGroupReply(message: AgentMessage): boolean {
+  matchGroupReply(input: { chatId: string; senderId: string; replyTo: string }): string | undefined {
+    const ids = this.store.db.prepare(`SELECT o.id FROM agent_outreach o JOIN agent_group_questions q ON q.outreachId=o.id
+      WHERE o.messageId=? AND o.chatId=? AND o.recipientId=? AND o.identity='bot' AND o.status='open' AND o.createdAt>=? LIMIT 2`)
+      .pluck().all(input.replyTo,input.chatId,input.senderId,groupQuestionCutoff()) as string[];
+    return ids.length === 1 ? ids[0] : undefined;
+  }
+  private captureGroupReply(message: AgentMessage, expected?: string): boolean {
     if (message.chatType !== "group" || message.messageType !== "text" || !message.replyTo || !message.content.trim()
       || !/^om_[A-Za-z0-9]+$/.test(message.messageId) || !/^ou_[A-Za-z0-9]+$/.test(message.senderId)) return false;
     return this.store.db.transaction(() => {
-      if (this.store.db.prepare("SELECT 1 FROM agent_replies WHERE messageId=? AND status='turn_reply'").get(message.messageId)) return true;
-      const request = this.store.db.prepare(`SELECT o.id FROM agent_outreach o JOIN agent_group_questions q ON q.outreachId=o.id
-        WHERE o.messageId=? AND o.chatId=? AND o.recipientId=? AND o.identity='bot' AND o.status='open' AND o.createdAt>=?`)
-        .get(message.replyTo, message.chatId, message.senderId, groupQuestionCutoff()) as { id: string } | undefined;
-      if (!request) return false;
+      const recorded = this.store.db.prepare("SELECT outreachId FROM agent_replies WHERE messageId=? AND status='turn_reply'")
+        .pluck().get(message.messageId) as string | undefined;
+      if (recorded) return !expected || recorded === expected;
+      const request = this.matchGroupReply({ ...message, replyTo: message.replyTo! });
+      if (!request || expected && request !== expected) return false;
       const inserted = this.store.db.prepare(`INSERT OR IGNORE INTO agent_replies
         (messageId,chatId,senderId,payload,candidates,outreachId,status,createdAt) VALUES(?,?,?,?,?,?,'turn_reply',?)`)
-        .run(message.messageId,message.chatId,message.senderId,JSON.stringify(message),"[]",request.id,new Date().toISOString());
+        .run(message.messageId,message.chatId,message.senderId,JSON.stringify(message),"[]",request,new Date().toISOString());
       if (!inserted.changes) return false;
-      this.close(request.id);
+      this.close(request);
       return true;
     })();
   }
@@ -208,13 +214,21 @@ export class AgentMessaging {
       .run(message.messageId,message.chatId,message.senderId,JSON.stringify(message),JSON.stringify(candidates.map(item=>item.id)),matched?.id ?? null,matched ? "queued" : "needs_owner",new Date().toISOString());
     return true;
   }
-  ingestEvent(event: Record<string, unknown>, listenerVerified = false) {
-    if (event.sender_type !== "user") return false;
-    const message: AgentMessage = { messageId: String(event.message_id ?? event.id ?? ""), chatId: String(event.chat_id ?? ""),
+  private eventMessage(event: Readonly<Record<string, unknown>>): AgentMessage | undefined {
+    if (event.sender_type !== "user") return;
+    return { messageId: String(event.message_id ?? event.id ?? ""), chatId: String(event.chat_id ?? ""),
       chatType: event.chat_type === "group" ? "group" : "p2p", senderId: String(event.sender_id ?? ""), senderName: String(event.sender_name ?? event.sender_id ?? ""),
       content: String(event.content ?? "").slice(0,20000), sourceTime: String(event.create_time ?? ""), messageType: String(event.message_type ?? "unknown"),
       chatName: String(event.chat_name ?? ""), replyTo: typeof event.reply_to === "string" ? event.reply_to : undefined,
       rootId: typeof event.root_id === "string" ? event.root_id : undefined };
+  }
+  commitGroupReply(event: Readonly<Record<string, unknown>>, expected: string): boolean {
+    const message = this.eventMessage(event);
+    return !!message && this.captureGroupReply(message, expected);
+  }
+  ingestEvent(event: Record<string, unknown>, listenerVerified = false) {
+    const message = this.eventMessage(event);
+    if (!message) return false;
     if (listenerVerified && this.captureGroupReply(message)) return true;
     return this.ingest(message, "bot");
   }

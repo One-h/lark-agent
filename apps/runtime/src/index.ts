@@ -15,6 +15,7 @@ import { registerHostOutboundRoutes } from "./outbound.js";
 import { PersonalInbox, registerPersonalInboxRoutes } from "./personalInbox.js";
 import { createGroupNameCache } from "./groupNames.js";
 import { registerLarkSignalShutdown } from "./shutdown.js";
+import { registerLarkRuntimePlugin, registerLarkRouteBroker, type LarkRuntimePlugin } from "@lark-agent/conversation-runtime";
 import { isManagedChatCapability, managedChatCapabilities, managedChats, ManagedChatError } from "./managedChats.js";
 import { createManagedLarkChat, type ManagedChatCreator } from "@lark-agent/adapter-lark-cli";
 import { registerPersonaRoutes } from "./personaRoutes.js";
@@ -49,7 +50,8 @@ import { onLarkTurnEnded, hasLarkManualTurnApproval, loadApprovalTaskContext, fo
   LarkApprovalError, loadApprovalDirectQuote, type LarkApprovalStatus } from "@lark-agent/conversation-runtime";
 
 type ProactiveMessageSender = (recipientId: string, text: string, idempotencyKey: string) => LarkSentMessage | { ok: false; error: string };
-type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"]; retainedEngineHost?: RetainedHostConfig; codexSocket?: string };
+type RuntimeAdapters = { managedChatCreator?: ManagedChatCreator; groupQuestionCli?: ConstructorParameters<typeof AgentMessaging>[1]["cli"];
+  retainedEngineHost?: RetainedHostConfig; codexSocket?: string; plugins?: readonly LarkRuntimePlugin[] };
 const groupAskCapability = "lark.group.ask";
 const groupReplyCapability = "lark.group.ask_reply";
 export type RuntimeConfig = { wholeTaskAutoApproval?: boolean; executionEngines?: readonly ExecutionEngine[]; databasePath: string; mode: "shadow" | "active"; trustedSenderIds: string[]; approverId?: string; workspaceRoot?: string; hostBaseUrl?: string; hostToken?: string; runtimeToken?: string; host?: string; port?: number; turnActivityProbe?: (messageId: number, turnId: string) => Promise<boolean>; approvalCardSender?: typeof sendApprovalCard; approvalCardUpdater?: typeof updateApprovalCard; textReplySender?: LarkTextReplySender; reactionSender?: LarkReactionSender; proactiveMessageSender?: ProactiveMessageSender; turnApprovalReviewer?: TurnApprovalReviewer; autoApprovalNotificationSender?: AutoApprovalNotificationSender; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; ownerMentionAssistMembershipProbe?: (chatId: string, ownerId: string) => Promise<boolean | null>; ownerMentionAssistDelayMs?: number };
@@ -807,10 +809,21 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     approvedReceipt: (outreachId, messageId, chatId) => agentMessaging.approvedGroupReceipt(outreachId, messageId, chatId),
     forward: (message, identity) => agentMessaging.ingest(message, identity) });
   registerGroupPrivacyRoutes(app, groupPrivacy, request => Boolean(config.runtimeToken) && authenticated(request));
-  setExternalMessageHandler((event, verified) => groupPrivacy.ingestEvent(event)
-    || agentMessaging.ingestEvent(event, Boolean(questionTarget && verified)));
+  const removeExtensions: Array<() => void> = [];
+  if (questionTarget) {
+    const broker = "group-question";
+    removeExtensions.push(registerLarkRouteBroker(store.db, broker, {
+      verify: (input, claimId) => input.messageType === "text" && agentMessaging.matchGroupReply(input) === claimId,
+      commit: (_input, claimId, event) => agentMessaging.commitGroupReply(event, claimId)
+    }), registerLarkRuntimePlugin(store.db, { id: "builtin-group-question", route(input) {
+      const claimId = input.messageType === "text" && agentMessaging.matchGroupReply(input);
+      return claimId ? { broker, claimId } : undefined;
+    } }));
+  }
+  for (const plugin of config.plugins ?? []) removeExtensions.push(registerLarkRuntimePlugin(store.db, plugin));
+  setExternalMessageHandler(event => groupPrivacy.ingestEvent(event), event => agentMessaging.ingestEvent(event));
   if (config.mode === "active" && process.env.LARK_AGENT_TEST_DATABASE !== "1") groupPrivacy.start();
-  app.addHook("onClose", async () => { setExternalMessageHandler(null); });
+  app.addHook("onClose", async () => { setExternalMessageHandler(null); for (const remove of removeExtensions) remove(); });
   if (config.mode === "active") agentMessaging.start();
   const personalInbox = new PersonalInbox(store, { ownerId: () => approverId ?? "", model: configuredLarkCodexModel,
     routeMessage: message => groupPrivacy.ingest(message, "user") || agentMessaging.ingest(message, "user"),

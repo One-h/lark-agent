@@ -19,6 +19,8 @@ import { loadApprovalTaskContext, formatApprovalTaskContext } from "./approvalTa
 import { postHostJson } from "./hostHttp.js";
 import { rebindLarkProgressCard, reconcileLarkProgressCards } from "./progressCards.js";
 import { publishLarkTurnObservation } from "./turnObservations.js";
+import { collectLarkTurnContext } from "./runtimeHooks.js";
+import { recordLarkDeliveryConfirmation, publishLarkDeliveryConfirmation } from "./deliveryConfirmations.js";
 import { applySelectedSticker, runStickerTool, type StickerToolState } from "./stickerTools.js";
 import { downloadLarkImageToTask, imageMarkersWithoutKeys, larkImageResourcesFromMessage } from "./mediaImages.js";
 export { larkImageResourceFromMessage, larkImageResourcesFromMessage } from "./mediaImages.js";
@@ -195,6 +197,7 @@ export function larkMessageTopicKey(
 }
 
 type PreparedLarkCodexMessage = {
+  pluginContext?: string;
   executionConfig?: LarkExecutionConfig;
   stickerTools?: StickerToolState;
   attachmentTools?: AttachmentState;
@@ -1101,7 +1104,8 @@ function deliverQueuedLarkTextReply(id: number): boolean {
   const sent: ReturnType<typeof larkTextReplySender> = requiresReceipt && delivered.ok && !delivered.messageId
     ? { ok: false as const, error: "Reply returned no delivery receipt" } : delivered;
   if (sent.ok) {
-    db.transaction(() => {
+    const sentAt = nowIso();
+    const confirmed = db.transaction(() => {
       if (sent.messageId) {
         try {
           recordOutboundLarkMessage({ messageId: sent.messageId, chatId: sent.chatId ?? message.chat_id, chatType: message.chat_type,
@@ -1110,10 +1114,13 @@ function deliverQueuedLarkTextReply(id: number): boolean {
         } catch { console.warn("lark_outbound_record_failed", { messageId: message.id }); }
       }
       db.prepare(`UPDATE lark_messages SET reply_status='sent',reply_error=NULL,reply_sent_at=?,reply_next_attempt_at=NULL WHERE id=?`)
-        .run(nowIso(), id);
+        .run(sentAt, id);
       markOwnerAssistSent(id);
+      return recordLarkDeliveryConfirmation(db, { messageId: id, receipt: sent.messageId, confirmation: "send",
+        deliveryKind: message.codex_status === "answered" ? "reply" : "notice", confirmedAt: sentAt });
     })();
     if (sent.messageId) observeConfirmedLarkReply(db, id, "send");
+    publishLarkDeliveryConfirmation(db, confirmed);
     return true;
   }
   const attempts = message.reply_delivery_attempts + 1;
@@ -1222,11 +1229,17 @@ function retryLarkMediaFailureNotices(limit: number): number {
     try { sent = larkTextReplySender(payload.messageId, text, row.idempotency_key); }
     catch { sent = { ok: false as const, error: "Attachment failure notification could not be delivered" }; }
     if (sent.ok) {
-      db.prepare("UPDATE lark_delivery_outbox SET status='sent',sent_at=?,last_error=NULL WHERE id=?").run(nowIso(), row.id);
+      const sentAt = nowIso();
+      const confirmed = db.transaction(() => {
+        db.prepare("UPDATE lark_delivery_outbox SET status='sent',sent_at=?,last_error=NULL WHERE id=?").run(sentAt, row.id);
+        return recordLarkDeliveryConfirmation(db, { messageId: row.lark_message_id, receipt: sent.messageId,
+          confirmation: "send", deliveryKind: "notice", confirmedAt: sentAt, expectedTurnId: payload.turnId });
+      })();
       if (sent.messageId) try {
         recordOutboundLarkMessage({ messageId: sent.messageId, chatId: sent.chatId ?? message.chat_id,
           chatType: message.chat_type, recipientId: message.sender_id, content: text, replyToMessageId: payload.messageId, source: "reply" });
       } catch { console.warn(`attachment_failure_notice_record_failed messageId=${row.lark_message_id}`); }
+      publishLarkDeliveryConfirmation(db, confirmed);
     } else {
       const attempts = row.attempts + 1;
       db.prepare("UPDATE lark_delivery_outbox SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?")
@@ -1298,7 +1311,7 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
     })();
     return { ok: false, sentCount: 0, error: "Registered attachment failed integrity validation" };
   }
-  let sent: { ok: true; imageCount?: number } | { ok: false; error: string };
+  let sent: { ok: true; imageCount?: number; messageId?: string | null } | { ok: false; error: string };
   db.prepare("UPDATE lark_delivery_outbox SET send_stage='attempted' WHERE id=?").run(row.id);
   try {
     sent = row.kind === "image-post"
@@ -1307,11 +1320,14 @@ export function deliverLarkOutboxRow(row: LarkDeliveryOutboxRow, mediaSender = l
   } catch { sent = { ok: false, error: "Attachment transport failed" }; }
   if (sent.ok) {
     const sentAt = nowIso();
-    db.transaction(() => {
+    const confirmed = db.transaction(() => {
       db.prepare("UPDATE lark_delivery_outbox SET status='sent', sent_at=?, last_error=NULL, next_attempt_at=? WHERE id=?").run(sentAt, sentAt, row.id);
       for (const stickerId of payload.stickerIds ?? []) recordLarkStickerSend(stickerId, row.lark_message_id, payload.chatId ?? null);
       markAttachmentOnlyReplyDelivered(row.lark_message_id);
+      return recordLarkDeliveryConfirmation(db, { messageId: row.lark_message_id, receipt: sent.messageId, confirmation: "send",
+        deliveryKind: payload.stickerIds?.length ? "sticker" : "attachment", confirmedAt: sentAt, expectedTurnId: payload.turnId });
     })();
+    publishLarkDeliveryConfirmation(db, confirmed);
     return { ok: true, sentCount: row.kind === "image-post" ? (sent as unknown as { imageCount: number }).imageCount : 1 };
   }
   const attempts = row.attempts + 1;
@@ -2193,7 +2209,13 @@ export function retryPendingLarkExecutionReceipts(limit = 10): number {
     db.prepare("UPDATE lark_execution_receipts SET send_stage='attempted' WHERE id=?").run(row.id);
     const sent = sendLarkExecutionReceiptCard(row.message_id, { status: row.status, entries }, larkReplyIdempotencyKey("receipt", `${row.lark_message_id}:${row.turn_id}`));
     if (sent.ok) {
-      db.prepare("UPDATE lark_execution_receipts SET card_message_id=?, delivery_status='sent', delivery_error=NULL, updated_at=? WHERE id=?").run(sent.messageId, nowIso(), row.id);
+      const sentAt = nowIso();
+      const confirmed = db.transaction(() => {
+        db.prepare("UPDATE lark_execution_receipts SET card_message_id=?, delivery_status='sent', delivery_error=NULL, updated_at=? WHERE id=?").run(sent.messageId, sentAt, row.id);
+        return recordLarkDeliveryConfirmation(db, { messageId: row.lark_message_id, receipt: sent.messageId, confirmation: "send",
+          expectedTurnId: row.turn_id, deliveryKind: "notice", confirmedAt: sentAt });
+      })();
+      publishLarkDeliveryConfirmation(db, confirmed);
     } else {
       const current = db.prepare("SELECT delivery_attempts FROM lark_execution_receipts WHERE id=?").get(row.id) as { delivery_attempts: number };
       const attempts = current.delivery_attempts + 1;
@@ -4199,6 +4221,7 @@ function updatePreparedPrompt(prepared: PreparedLarkCodexMessage, promptMode: La
   prepared.prompt = promptMode === "full"
     ? buildLarkCodexPrompt(prepared.row, attachments)
     : buildLarkCodexDeltaPrompt(prepared.row, attachments);
+  if (prepared.pluginContext) prepared.prompt += prepared.pluginContext;
   if (nativeTopicMode && promptMode === "full") prepared.prompt += "\n\n话题原生会话模式：本话题后续真人消息会继续追加到同一信任范围的 thread；按新增消息延续或调整既有任务。";
   const assistPrompt = ownerAssistPrompt(prepared.row, prepared.stickerContextToken);
   if (assistPrompt) prepared.prompt += `\n\n${assistPrompt}`;
@@ -4266,6 +4289,7 @@ async function prepareLarkCodexMessage(larkMessageId: number, promptMode: LarkPr
 }
 
 async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<void> {
+  prepared.pluginContext ??= await preparePluginContext(prepared.row, "codex", prepared.trustedSender);
   prepared.conversationStyle = captureConversationStyle(prepared.row.chat_id);
   prepared.promptMode = null;
   const previousSession = larkCodexSessionForMessage(prepared.row, prepared.trustedSender);
@@ -4380,6 +4404,8 @@ async function startPreparedTurn(prepared: PreparedLarkCodexMessage): Promise<vo
   const run = registerLarkRun(prepared, executionConfig, socketIdentity ? { requests: new Set(), restored: false } : undefined);
   publishLarkTurnObservation(db, { kind: "turn.dispatched", runId: run.progressId, turnId: run.turnId,
     threadId, sourceMessageId: prepared.row.id, engineId: "codex" });
+  publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: run.progressId, turnId: run.turnId,
+    threadId, sourceMessageId: prepared.row.id, engineId: "codex", input: "first" });
   recordAcceptedExecutionConfig(prepared, executionConfig);
   writeSessionArtifact(prepared, {
     action: "turn/start",
@@ -4488,6 +4514,8 @@ async function steerPreparedMessage(run: ActiveLarkCodexRun, prepared: PreparedL
     });
     // The steer acknowledgement can precede the native user-message notification.
     run.acceptedSteerMessageId = Math.max(run.acceptedSteerMessageId ?? 0, prepared.row.id);
+    publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: run.progressId, turnId: run.turnId,
+      threadId: run.threadId, sourceMessageId: prepared.row.id, engineId: "codex", input: "steered" });
     acceptPreparedPrompt(prepared, run.threadId, run.turnId);
     recordAcceptedExecutionConfig(prepared, { ...run.executionConfig, action: "turn/steer", recordedAt: nowIso() });
     writeSessionArtifact(prepared, { action: "turn/steer", previousThreadId: run.threadId, threadId: run.threadId, turnId: run.turnId });
@@ -4570,6 +4598,12 @@ export function configureRetainedLarkExecution(options?: RetainedHostConfig): vo
     },
     authorize(binding, requestId, operation, signal, stillCurrent) {
       return externalNativeApprovalHandler?.(binding.message_id, binding.turn_id, operation, signal, stillCurrent, requestId) ?? Promise.resolve(false);
+    },
+    acceptInput(binding, sessionId) {
+      if (!db.prepare("UPDATE lark_retained_turns SET input_accepted=1 WHERE turn_id=? AND input_accepted=0 AND finalized=0")
+        .run(binding.turn_id).changes) return;
+      publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: binding.turn_id, turnId: binding.turn_id,
+        threadId: sessionId, sourceMessageId: binding.message_id, engineId: binding.engine_id, input: "first" });
     },
     observe(binding, sessionId, stage) {
       const started = db.prepare("SELECT codex_started_at FROM lark_messages WHERE id=?").pluck().get(binding.message_id) as string;
@@ -4848,6 +4882,18 @@ function externalLarkMcpInstructions(message: LarkMessageRow, token: string, tru
   return `${larkMcpToolsInstruction(token, trusted)}\n\n${larkStickerPrompt(token, { chatId: message.chat_id })}`;
 }
 
+function preparePluginContext(message: LarkMessageRow, engineId: string, trusted: boolean): Promise<string> {
+  return collectLarkTurnContext(db, { sourceMessageId: message.id, chatId: message.chat_id,
+    chatType: message.chat_type, engineId, trusted, text: message.content ?? "" });
+}
+
+async function prepareExternalPrompt(message: LarkMessageRow, route: ExternalExecutionRoute, trusted: boolean, text: string): Promise<string> {
+  const persona = route.conversation ? captureConversationStyle(message.chat_id).effectiveInstructions : "";
+  const prompt = persona ? `${persona}\n\n当前飞书消息：\n${text}` : text;
+  const extra = await preparePluginContext(message, route.engineId, trusted);
+  return prompt.length + extra.length <= 24_000 ? prompt + extra : prompt;
+}
+
 async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalExecutionRoute, trusted: boolean): Promise<void> {
   if (message.id <= route.afterMessageId) {
     finishExternalTopicMessage(message, "no_reply", "");
@@ -4873,8 +4919,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
       db.prepare("UPDATE lark_messages SET codex_dispatch_phase='queued' WHERE id=? AND codex_dispatch_phase='preparing'").run(message.id);
       return;
     }
-    const style = route.conversation ? captureConversationStyle(message.chat_id).effectiveInstructions : "";
-    const prompt = style ? `${style}\n\n当前飞书消息：\n${text}` : text;
+    const prompt = await prepareExternalPrompt(message, route, trusted, text);
     await retainedLark.start({ messageId: message.id, sessionKey: key, engineId: route.engineId, trusted,
       prompt, model: route.model, sessionId: loadTopicExecutionSession(key) });
     return;
@@ -4893,6 +4938,8 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
           turnId: nextToken ? running.id : undefined });
         if (nextToken && running.mcp && message.id > running.mcp.source.id) running.mcp = { token: nextToken, source: message, trusted };
         running.members.set(message.id, message);
+        publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: running.id, turnId: running.id,
+          threadId: running.session.id, sourceMessageId: message.id, engineId: route.engineId, input: "steered" });
       }
       return outcome;
     });
@@ -4915,8 +4962,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
     finishExternalTopicMessage(message, "no_reply", "");
     return;
   }
-  const persona = route.conversation ? captureConversationStyle(message.chat_id).effectiveInstructions : "";
-  const prompt = persona ? `${persona}\n\n当前飞书消息：\n${text}` : text;
+  const prompt = await prepareExternalPrompt(message, route, trusted, text);
   const controller = new AbortController();
   const progressId = crypto.randomUUID();
   const mcpServer = engine.supportsLarkMcp ? larkAgentToolsMcpServer() : undefined;
@@ -4965,9 +5011,18 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
   const workDueAt = Date.now() + Math.min(externalWorkProgressDelayMs, config.larkCodexInterimReplyDelayMs);
   let workTimer: ReturnType<typeof setTimeout> | undefined;
   let stage: ExecutionWorkStage | undefined;
+  let firstInputAccepted = false;
+  const acceptFirstInput = () => {
+    if (firstInputAccepted || !run.accepting) return;
+    firstInputAccepted = true;
+    publishLarkTurnObservation(db, { kind: "turn.inputAccepted", runId: progressId, turnId: progressId,
+      threadId: session.id, sourceMessageId: message.id, engineId: route.engineId, input: "first" });
+  };
   const showWork = () => { if (stage) showProgress(`work:${stage}`, externalWorkProgressText[stage]); };
   const onEngineEvent = (event: ExecutionEngineEvent) => {
-    if (!run.accepting || event.type !== "work") return;
+    if (!run.accepting) return;
+    acceptFirstInput();
+    if (event.type !== "work") return;
     stage = event.stage;
     if (Date.now() >= workDueAt) showWork();
     else workTimer ??= setTimeout(showWork, workDueAt - Date.now());
@@ -4988,6 +5043,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
       publishLarkTurnObservation(db, { kind: "turn.dispatched", runId: progressId, turnId: progressId,
         threadId: session.id, sourceMessageId: message.id, engineId: route.engineId });
       result = await session.run(`${prompt}${mcpToken ? `\n\n${externalLarkMcpInstructions(message, mcpToken, trusted)}` : ""}${nativePolicy}`, controller.signal, onEngineEvent);
+      if (result.status === "completed") acceptFirstInput();
     }
     catch { /* A failed or disconnected turn is never rerun automatically. */ }
     finally {
@@ -5239,10 +5295,14 @@ export async function inspectInterruptedLarkReplies(signal?: AbortSignal, readba
             recipientId: message.sender_id, content: message.reply_delivery_text!, replyToMessageId: message.message_id,
             messageAt: receipt.sentAt, messageType: presentation?.msgType ?? "text", source: "reply" });
           markOwnerAssistSent(message.id);
+          return { confirmed: recordLarkDeliveryConfirmation(database, { messageId: message.id, receipt: receipt.messageId,
+            deliveryKind: message.codex_status === "answered" ? "reply" : "notice", confirmation: "readback", confirmedAt: receipt.sentAt }) };
         }
-        return Boolean(updated.changes);
       })();
-      if (committed) observeConfirmedLarkReply(database, message.id, "readback");
+      if (committed) {
+        observeConfirmedLarkReply(database, message.id, "readback");
+        publishLarkDeliveryConfirmation(database, committed.confirmed);
+      }
     }
   } finally { deliveryReadbacks.delete(database); }
 }

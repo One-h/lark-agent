@@ -3,6 +3,7 @@ import { defaultLarkAcknowledgeReactionEmoji, isLarkReactionEmojiType, larkReact
 import { config, db, getAppSettings, larkReactionSender, nowIso, type LarkMessageRow } from "./context.js";
 import { ensureOwnerMentionAssist, observeOwnerAssistContext, ownerMentionAssistSettings, ownerAssistSourceAllowed } from "./ownerMentionAssist.js";
 import { appendOwnerAssistContext, claimLarkCodexReply, decideLarkExecutionApprovalFromCard, scheduleLarkCodexReply, replyToNativeTopicCommand } from "./responder.js";
+import { applyLarkRoute } from "./runtimeHooks.js";
 import { backfillLarkContactsFromMessageMentions, upsertLarkContactsFromMentions } from "./contacts.js";
 import { conversationSpontaneousSettings } from "./spontaneous.js";
 import { imageKeysFromContent } from "./mediaImages.js";
@@ -29,7 +30,9 @@ let intentionallyStopped = false;
 let currentBotOpenId: string | undefined;
 let botOpenIdRetryAfterMs = 0;
 let externalMessageHandler: ((event: LarkEvent, fromListener: boolean) => boolean) | null = null;
-export function setExternalMessageHandler(handler: ((event: LarkEvent, fromListener: boolean) => boolean) | null) { externalMessageHandler = handler; }
+let externalMessageFallback: ((event: LarkEvent) => boolean) | undefined;
+export function setExternalMessageHandler(handler: ((event: LarkEvent, fromListener: boolean) => boolean) | null,
+  fallback?: (event: LarkEvent) => boolean) { externalMessageHandler = handler; externalMessageFallback = fallback; }
 
 let additionalApprovalHandler: ((event: LarkEvent) => boolean) | null = null;
 const botOpenIdRetryDelayMs = 5_000;
@@ -304,22 +307,24 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
   const replyContext = config.groupPrivacyEnforced && event.chat_type === "group"
     ? { replyToMessageId: stringValue(event.reply_to), replyToMessageType: null, replyToContent: null, replyToRawJson: null }
     : resolveReplyContext(messageId, stringValue(event.reply_to));
-  const externallyRouted = externalMessageHandler?.({ ...event, reply_to: replyContext.replyToMessageId, privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation },
-    fromListener) ?? false;
-  const shouldRespond = !externallyRouted && !topicCommand && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
+  const routeEvent = { ...event, message_id: messageId, reply_to: replyContext.replyToMessageId,
+    privacy_trigger: directlyMentioned || spontaneous || ownerMentioned || topicContinuation };
+  const defaultShouldRespond = !topicCommand && config.runtimeMode === "active" && (directlyMentioned || spontaneous || ownerMentioned || topicContinuation);
   const replyTrigger = topicCommand ? "topic_command" : ownerMentioned ? "owner_mention" : topicContinuation ? "topic" : spontaneous ? "spontaneous" : event.chat_type === "p2p" ? "p2p" : directlyMentioned ? "mention" : "none";
   upsertLarkContactsFromMentions(eventMentions(event));
-  let replyStatus = shouldRespond ? "pending" : "skipped";
+  let replyStatus = defaultShouldRespond ? "pending" : "skipped";
   let replyError: string | null = null;
 
-  if (shouldRespond && !messageId) {
+  if (defaultShouldRespond && !messageId) {
     replyStatus = "failed";
     replyError = "Missing message_id for Lark reply";
   }
 
   const receivedAt = nowIso();
   const messageAt = eventMessageAt(event, receivedAt);
-  const { insert, queuedId } = db.transaction(() => {
+  const { insert, queuedId, externallyRouted, shouldRespond } = db.transaction(() => {
+    let routed = externalMessageHandler?.(routeEvent, fromListener) ?? false;
+    if (routed) { replyStatus = "skipped"; replyError = null; }
     const insert = db.prepare(`
     INSERT OR IGNORE INTO lark_messages (
       event_id, message_id, chat_id, chat_type, sender_id, sender_type, direction, message_type, content, message_at,
@@ -352,6 +357,13 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
     receivedAt,
     fromListener && event.sender_type === "user" ? 1 : 0
     );
+    if (!routed && (insert.changes > 0 && !config.groupPrivacyEnforced && config.runtimeMode === "active"
+      && applyLarkRoute(db, routeEvent, fromListener) || externalMessageFallback?.(routeEvent))) {
+      routed = true;
+      replyStatus = "skipped";
+      if (insert.changes > 0) db.prepare("UPDATE lark_messages SET reply_status='skipped',reply_error=NULL WHERE id=?").run(insert.lastInsertRowid);
+    }
+    const shouldRespond = !routed && defaultShouldRespond;
     let queuedId: number | undefined;
     if (insert.changes > 0 && shouldRespond && messageId) {
       const persisted = db.prepare("SELECT * FROM lark_messages WHERE message_id=?").get(messageId) as LarkMessageRow;
@@ -359,7 +371,7 @@ function persistLarkEvent(event: LarkEvent, fromListener = false): void {
       if (claimLarkCodexReply(persisted.id)) queuedId = persisted.id;
       else db.prepare("UPDATE lark_messages SET reply_status='skipped' WHERE id=? AND codex_status='skipped' AND reply_status='pending'").run(persisted.id);
     }
-    return { insert, queuedId };
+    return { insert, queuedId, externallyRouted: routed, shouldRespond };
   })();
   if (insert.changes === 0) {
     const keyColumn = messageId ? "message_id" : "event_id";

@@ -119,7 +119,7 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
       await until(() => observations.some(event => event.kind === "turn.finished" && event.turnId === originalTurn));
       assert.deepEqual(observations.flatMap(event => event.kind === "turn.finished" && event.turnId === originalTurn ? [event.outcome] : []), ["completed"]);
       assert.deepEqual(observations.filter(event => event.turnId === originalTurn && event.kind !== "turn.progress").map(event => event.kind),
-        ["turn.dispatched", "turn.finished", "reply.delivered"]);
+        ["turn.dispatched", "turn.inputAccepted", "turn.finished", "reply.delivered", "delivery.confirmed"]);
       await closeRuntime();
       runtime = setup();
       assert.equal(retryPendingLarkTextReplies(),0);

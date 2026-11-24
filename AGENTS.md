@@ -2,6 +2,51 @@
 
 These rules apply to the entire repository.
 
+## Development Framework
+
+- Use Node 24, TypeScript workspaces, Fastify for HTTP, and the SQLite adapter
+  for durable state. Run `npm run build` and `npm test` before handoff.
+- `apps/runtime` is the composition root: it wires the listener, trusted
+  plugins, policies, routes and managed shutdown. Keep execution-agnostic
+  conversation flow in `packages/conversation-runtime` and provider details
+  in the appropriately scoped engine or Lark adapter. Keep engine selection
+  and session ownership out of business plugins.
+- SQLite is the source of truth for admission, acceptance, pending approval,
+  delivery and reconciliation. Commit before publishing observations. Keep
+  Feishu transport and MCP behind the existing core capabilities and
+  authorization checks. Recover an original operation by identity and
+  evidence; do not reissue an uncertain call based on an observer event.
+
+## Hooks And Plugins
+
+- Plugins are trusted, in-repository code. Declare a unique ID and pass
+  explicit `plugins` to `createRuntime`. Use `registerLarkRuntimePlugin`
+  for an internal consumer that owns its registration lifetime. There is no
+  external module discovery, runtime downloader, plugin sandbox or hot loader.
+- `message.route` proposals see a frozen, verified group-reply identity.
+  They cannot consume a message. Only a core-registered route broker can
+  verify its claimed scope and save both the claim's work and inbound row in
+  one SQLite transaction. Competing valid claims fall through to the ordinary
+  trusted route. Keep the privacy gate ahead of any plugin routing. Never
+  send a message or start a model in a proposal or broker commit.
+- `turn.prepare` contributors receive the same bounded source input and
+  return reference fragments. The runtime applies timeouts, deterministic
+  ordering and one aggregate budget. Do not mutate shared prompts, read
+  another plugin's fragment, or add identity, tool grants or approvals.
+- Use the observation API for dispatch, input acceptance, progress, terminal
+  state and delivery. Select only the required events. Keep payloads small
+  and immutable; never expose raw events, transcripts, commands or tokens.
+  Decide based on the recorded fact, not hook ordering. A terminal turn is
+  not a delivery receipt, and a local queue entry is not accepted input.
+- For a reliable delivery consumer, read the receipt journal with
+  `readLarkDeliveryConfirmations` and checkpoint by `eventId` in the
+  owning module. Do not start business side effects from a best-effort
+  observation alone; use the authorized core capability and its dedupe key.
+- Before adding a hook, state its producer, ownership, evidence, replay
+  semantics and failure behavior. Test Codex and ACP where relevant, plus
+  a conflict, timeout or restart case appropriate to the new boundary.
+  See [the extension contract](docs/turn-observations.md).
+
 ## Shared Public Main
 
 - Internal and public repositories share one sanitized main. Publish with `npm run sync:main`; both remote main refs must read back the same commit before reporting success.

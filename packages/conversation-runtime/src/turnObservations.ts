@@ -1,16 +1,20 @@
 type TurnIdentity = { runId: string; turnId: string; threadId: string; sourceMessageId: number };
 export type LarkTurnObservation = Readonly<TurnIdentity & (
   | { kind: "turn.dispatched"; engineId: string }
+  | { kind: "turn.inputAccepted"; engineId: string; input: "first" | "steered" }
   | { kind: "turn.progress"; progressKey: string; summary: string }
   | { kind: "turn.finished"; outcome: "completed" | "failed" | "cancelled" | "interrupted" }
   | { kind: "reply.delivered"; confirmation: "send" | "readback" }
+  | { kind: "delivery.confirmed"; deliveryKind: "reply" | "attachment" | "sticker" | "notice";
+      eventId: number; confirmation: "send" | "readback"; confirmedAt: string }
 )>;
 
 type Observer = { enqueue(event: LarkTurnObservation): void };
 type Handler = (event: LarkTurnObservation, signal: AbortSignal) => void | Promise<void>;
 const observers = new WeakMap<object, Set<Observer>>();
 const queueLimit = 64;
-const isInformational = (event: LarkTurnObservation) => event.kind === "turn.progress" || event.kind === "turn.dispatched";
+const isInformational = (event: LarkTurnObservation) =>
+  event.kind === "turn.progress" || event.kind === "turn.dispatched" || event.kind === "turn.inputAccepted";
 
 export function onLarkTurnObservation(scope: object, handler: Handler,
   { timeoutMs = 2_000, kinds }: { timeoutMs?: number; kinds?: readonly LarkTurnObservation["kind"][] } = {}) {
