@@ -15,8 +15,10 @@ type ContextRow={message_id:string;sender_id:string;content:string};
 const errorText=(error:unknown)=>error instanceof Error?error.message:"处理失败。";
 export class GroupPrivacy {
   private timer?:ReturnType<typeof setInterval>;private busy=false;private closing=false;private locks=new Set<number>();
+  private noticeCursor=0;
   constructor(readonly store:SqliteAgentStore,private options:{ownerId:()=>string;model:()=>string;cli?:typeof inboxCli;
     canChangeEnabled?:()=>boolean;enabledChanged?:(enabled:boolean)=>void;
+    canDispatchOutreach?:(outreachId:string)=>boolean;
     plan?:(input:unknown,model:string)=>Promise<GroupPlan>;execute?:(root:string,argv:string[])=>Promise<string>;
     approvedReceipt?:(outreachId:string,messageId:string,chatId:string)=>void;
     forward?:(message:PersonalMessage,identity:"bot"|"user")=>boolean}){
@@ -102,14 +104,20 @@ export class GroupPrivacy {
           if(plan.category==="company"&&this.roots().length)await this.research(row.id,plan.queries);
         }catch(error){this.update(row.id,{status:"needs_owner",draft:"",error:errorText(error),reason:"隔离分析失败，群中未自动发送。"});}
       }
-      const notices=this.store.db.prepare("SELECT * FROM group_privacy WHERE status IN ('needs_owner','operation_unknown','send_unknown') AND notified=0 LIMIT 5").all() as GroupRow[];
+      const notices=this.store.db.prepare("SELECT * FROM group_privacy WHERE status IN ('needs_owner','operation_unknown','send_unknown') AND notified=0 AND id>? ORDER BY id LIMIT 50")
+        .all(this.noticeCursor) as GroupRow[];
+      let attempted=0;
       for(const row of notices){
         if(!this.options.ownerId())break;
+        this.noticeCursor=row.id;
+        if(row.outreachId && this.options.canDispatchOutreach?.(row.outreachId) === false)continue;
         try{await this.cli(["im","+messages-send","--as","bot","--user-id",this.options.ownerId(),"--text",
           `群聊隐私确认 #${row.id}\n请求：${row.content.slice(0,400)}\n${row.reason||row.error||"请确认如何处理。"}\n${row.draft?`草稿：${row.draft.slice(0,700)}\n`:""}所有模型回复、承诺和操作均未自动发群或执行。请私下审核：http://127.0.0.1:4732/group-privacy`,"--idempotency-key",`group-privacy-${row.id}-${row.version}`]);
           this.store.db.prepare("UPDATE group_privacy SET notified=1 WHERE id=?").run(row.id);
         }catch{/* Retain the row for owner review; never fall back to a group notice. */}
+        if(++attempted===5)break;
       }
+      if(!notices.length||this.noticeCursor===notices.at(-1)?.id&&notices.length<50)this.noticeCursor=0;
     }finally{this.busy=false;}
   }
   private async research(id:number,queries?:string[]){
@@ -131,6 +139,8 @@ export class GroupPrivacy {
     try{
       if(row.status==="operation_unknown"&&body.action!=="dismiss")throw new Error("请先人工核对不确定的操作结果，不能重试。");
       if(body.action==="dismiss"){this.update(id,{status:"dismissed"});return this.row(id);}
+      if(row.outreachId && this.options.canDispatchOutreach?.(row.outreachId) === false)
+        throw new Error("对应的外联插件已停用，此历史请求不会执行或发送。");
       if(body.action==="research"){await this.research(id,typeof body.query==="string"&&body.query.trim()?[body.query.trim()]:undefined);return this.row(id);}
       if(body.action==="forward"){
         if(row.category==="personal")throw new Error("个人事项不能转交原 Agent 自动处理，请你私下决定。");

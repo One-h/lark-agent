@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { appSettingValue, config, setAppSettingValue, type LarkMessageRow } from "./context.js";
+import { appSettingValue, config, db, setAppSettingValue, type LarkMessageRow } from "./context.js";
+import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 
 type TopicMessage = Partial<Pick<LarkMessageRow, "chat_id" | "chat_type" | "thread_id" | "sender_type" | "reply_trigger">>;
 export type NativeTopicCommand = "join" | "leave";
 
 export function topicNativeModeEnabled(): boolean {
-  return appSettingValue("topicNativeModeEnabled") === "true";
+  return larkBuiltinPluginEnabled(db, "native-topics") && appSettingValue("topicNativeModeEnabled") === "true";
 }
 
 export function resetTopicNativeEnrollmentEpoch(): string {

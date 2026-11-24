@@ -24,6 +24,19 @@ async function fixture(run:(f:any)=>Promise<void>){
 test("generated group answers only become owner drafts, even if a model calls them public",async()=>fixture(async({privacy,calls,row}:any)=>{
  privacy.ingest(message,"bot");await privacy.tick();assert.equal(row().status,"needs_owner");assert.ok(calls.every((c:string[])=>c.includes("--user-id")&&c.includes("ou_owner")));assert.equal(calls.some((c:string[])=>c.includes("+messages-reply")),false);
 }));
+test("paused outreach does not publish or notify, and does not block ordinary privacy review",async()=>fixture(async({store,options,calls}:any)=>{
+ const privacy=new GroupPrivacy(store,{...options,canDispatchOutreach:()=>false});
+ const paused=privacy.propose({outreachId:"paused",chatId:"oc_group",identity:"bot",text:"PAUSED_OUTREACH_FIXTURE"});
+ privacy.ingest(message,"bot");
+ await privacy.tick();
+ assert.equal(calls.length,1);
+ assert(!JSON.stringify(calls).includes("PAUSED_OUTREACH_FIXTURE"));
+ const row=store.db.prepare("SELECT id,notified,version FROM group_privacy WHERE id=?").get(paused) as
+   {id:number;notified:number;version:number};
+ assert.equal(row.notified,0);
+ await assert.rejects(privacy.decide(row.id,{action:"publish",text:"must not send",version:row.version}),/已停用/);
+ assert.equal(calls.length,1);
+}));
 test("a publication approves exact text once, rejects stale decisions, and never grants execution",async()=>fixture(async({privacy,calls,executed,row}:any)=>{
  privacy.ingest(message,"bot");await privacy.tick();const before=row();await assert.rejects(privacy.decide(before.id,{action:"publish",text:"确定文本",version:0}),/刷新/);
  await privacy.decide(before.id,{action:"publish",text:"确定文本",version:before.version});const sent=calls.find((c:string[])=>c.includes("+messages-reply"));assert.ok(sent.includes("确定文本\n（小龙的助手龙小祝，经小龙确认）"));assert.equal(executed.length,0);assert.equal(row().status,"sent");await assert.rejects(privacy.decide(before.id,{action:"publish",text:"再发",version:row().version}),/刷新/);

@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
 import { sendLarkProgressCard, updateLarkProgressCard } from "@lark-agent/adapter-lark-cli";
 import { sendLarkTextReply, sendLarkMediaReply, sendLarkReaction, type LarkSendResult, type LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
+import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 
 export type LarkStickerRow = {
   id: string;
@@ -97,7 +98,7 @@ export function getAppSettings() {
   return {
     larkMessageListenerEnabled: db ? (db.prepare("SELECT value FROM settings WHERE key='listenerEnabled'").get() as { value?: string } | undefined)?.value !== "false" : true,
     larkGroupSpontaneousRepliesEnabled: db ? (db.prepare("SELECT value FROM settings WHERE key='groupSpontaneousRepliesEnabled'").get() as { value?: string } | undefined)?.value === "true" : false,
-    larkOwnerMentionAssistEnabled: db ? appSettingValue("ownerMentionAssistEnabled") === "true" : false,
+    larkOwnerMentionAssistEnabled: db ? larkBuiltinPluginEnabled(db, "owner-assist") && appSettingValue("ownerMentionAssistEnabled") === "true" : false,
     larkOwnerMentionAssistOwnerId: db ? appSettingValue("ownerMentionAssistOwnerId") ?? "" : "",
     larkGroupSpontaneousChatIds: groupSpontaneousChatIds(),
     larkGroupSpontaneousReplyRate: groupSpontaneousReplyRate(),
@@ -107,7 +108,7 @@ export function getAppSettings() {
     larkGroupMessageReactionEmoji: db ? appSettingValue("groupMessageReactionEmoji") ?? "THUMBSUP" : "THUMBSUP",
     larkGroupMessageReactionChatIds: groupMessageReactionChatIds(),
     larkCodexRepliesEnabled: db ? (db.prepare("SELECT value FROM settings WHERE key='repliesEnabled'").get() as { value?: string } | undefined)?.value !== "false" : true,
-    larkCodexInterimRepliesEnabled: db ? appSettingValue("interimRepliesEnabled") !== "false" : true,
+    larkCodexInterimRepliesEnabled: db ? larkBuiltinPluginEnabled(db, "progress-cards") && appSettingValue("interimRepliesEnabled") !== "false" : true,
     larkCodexModel: configuredLarkCodexModel(),
     larkCodexReasoningEffort: configuredLarkCodexReasoningEffort(),
     larkStickerUsageMode: configuredLarkStickerUsageMode(),
@@ -134,6 +135,7 @@ export type LarkStickerUsageMode = typeof larkStickerUsageModes[number];
 export type LarkStickerUsageOverride = "global" | LarkStickerUsageMode;
 
 export function configuredLarkStickerUsageMode(chatId?: string | null): LarkStickerUsageMode {
+  if (!larkBuiltinPluginEnabled(db, "stickers")) return "off";
   const conversationMode = chatId && db ? appSettingValue(`conversation.stickerUsageMode:${chatId}`) : undefined;
   if (larkStickerUsageModes.includes(conversationMode as LarkStickerUsageMode)) return conversationMode as LarkStickerUsageMode;
   const stored = db ? appSettingValue("stickerUsageMode") : undefined;
@@ -144,7 +146,7 @@ export function conversationStickerUsageSettings(chatId: string): { mode: LarkSt
   const stored = db ? appSettingValue(`conversation.stickerUsageMode:${chatId}`) : undefined;
   const mode = larkStickerUsageModes.includes(stored as LarkStickerUsageMode) ? stored as LarkStickerUsageMode : "global";
   const globalMode = configuredLarkStickerUsageMode();
-  return { mode, effectiveMode: mode === "global" ? globalMode : mode, globalMode };
+  return { mode, effectiveMode: larkBuiltinPluginEnabled(db, "stickers") && mode !== "global" ? mode : globalMode, globalMode };
 }
 
 export function setConversationStickerUsageMode(chatId: string, mode: LarkStickerUsageOverride): void {

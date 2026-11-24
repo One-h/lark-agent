@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type Database from "better-sqlite3";
+import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 import { jsonFromCliOutput, larkReplyIdempotencyKey, sendLarkTextMessage } from "@lark-agent/adapter-lark-cli";
 import { appSettingValue, config, db, getAppSettings, nowIso, setAppSettingValue, type LarkMessageRow } from "./context.js";
 
@@ -81,7 +82,8 @@ export function ownerMentionAssistSettings(chatId: string) {
   const candidate = appSettingValue("ownerMentionAssistOwnerId")?.trim() || config.larkExecutionApproverId;
   const ownerId = /^ou_[A-Za-z0-9]+$/.test(candidate) ? candidate : "";
   const botOnly = appSettingValue(`conversation.ownerMentionAssistBotOnly:${chatId}`) === "true";
-  return { mode, globalEnabled, ownerId, botOnly, effectiveEnabled: Boolean(reviewAvailable && ownerId && (mode === "on" || mode === "global" && globalEnabled)) };
+  return { mode, globalEnabled, ownerId, botOnly, effectiveEnabled: Boolean(larkBuiltinPluginEnabled(db, "owner-assist")
+    && reviewAvailable && ownerId && (mode === "on" || mode === "global" && globalEnabled)) };
 }
 
 export function setOwnerMentionAssistMode(chatId: string, mode: OwnerMentionAssistMode) {
@@ -288,7 +290,7 @@ export function deferOwnerAssistDelivery(id: number, reason: string): void {
 }
 
 export function retryOwnerAssistNotifications(): Promise<void> {
-  if (!db?.open || config.runtimeMode !== "active") return Promise.resolve();
+  if (!db?.open || !larkBuiltinPluginEnabled(db, "owner-assist") || config.runtimeMode !== "active") return Promise.resolve();
   const existing = notificationTasks.get(db);
   if (existing) return existing;
   if (!db.prepare("SELECT 1 FROM lark_owner_mention_assists WHERE status='needs_owner' AND notified=0 AND notify_attempts<5 AND notify_after<=? LIMIT 1").get(nowIso())) return Promise.resolve();
@@ -374,6 +376,7 @@ export async function reviewOwnerMentionAssist(id: number, input: Record<string,
 }
 
 export function observeOwnerAssistContext(message: LarkMessageRow): void {
+  if (!larkBuiltinPluginEnabled(db, "owner-assist")) return;
   if (message.chat_type !== "group" || message.sender_type !== "user") return;
   const rows = db.prepare(`SELECT a.lark_message_id,m.codex_status FROM lark_owner_mention_assists a JOIN lark_messages m ON m.id=a.lark_message_id
     WHERE a.owner_id=? AND a.status IN ('pending','handling','ready','reconsidering','needs_owner') AND m.chat_id=? AND m.id<?

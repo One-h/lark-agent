@@ -1,4 +1,5 @@
 import { larkReplyIdempotencyKey } from "@lark-agent/adapter-lark-cli";
+import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 import { config, db, larkReactionSender, nowIso } from "./context.js";
 
 type CompletionPayload = {
@@ -61,7 +62,7 @@ export function queueLarkCompletionReactions(
   mediaDeliveryIds: number[],
   defer = false
 ): void {
-  if (config.runtimeMode !== "active") return;
+  if (config.runtimeMode !== "active" || !larkBuiltinPluginEnabled(db, "completion-reactions")) return;
   const createdAt = nowIso();
   const insert = db.prepare("INSERT OR IGNORE INTO lark_delivery_outbox (lark_message_id,kind,payload,idempotency_key,next_attempt_at,created_at) VALUES (?,'completion-reaction',?,?,?,?)");
   db.transaction(() => {
@@ -74,7 +75,7 @@ export function queueLarkCompletionReactions(
 }
 
 export function retryPendingLarkCompletionReactions(limit = 10): number {
-  if (config.runtimeMode !== "active") return 0;
+  if (config.runtimeMode !== "active" || !larkBuiltinPluginEnabled(db, "completion-reactions")) return 0;
   const rows = db.prepare("SELECT id,lark_message_id,payload,attempts FROM lark_delivery_outbox WHERE kind='completion-reaction' AND status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,id LIMIT ?").all(nowIso(), limit) as CompletionRow[];
   for (const row of rows) deliverCompletion(row);
   return rows.length;
