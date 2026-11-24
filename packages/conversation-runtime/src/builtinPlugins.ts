@@ -1,6 +1,6 @@
 export const larkBuiltinPluginIds = [
   "managed-chats", "agent-outreach", "group-question", "personal-inbox",
-  "owner-assist", "native-topics", "progress-cards", "completion-reactions", "stickers"
+  "owner-assist", "native-topics", "progress-cards", "completion-reactions", "stickers", "task-orchestration"
 ] as const;
 export type LarkBuiltinPluginId = typeof larkBuiltinPluginIds[number];
 

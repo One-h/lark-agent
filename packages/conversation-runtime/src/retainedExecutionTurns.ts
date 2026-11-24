@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import type { ExecutionEngine, ExecutionEngineEvent, ExecutionNativeApproval, ExecutionTurnResult } from "./executionEngines.js";
+import type { ExecutionEngine, ExecutionEngineEvent, ExecutionEngineSession, ExecutionNativeApproval, ExecutionTurnResult } from "./executionEngines.js";
 
 type OpenOptions = Omit<Parameters<ExecutionEngine["open"]>[0], "signal" | "authorizeNative">;
 type NativeOperation = Parameters<ExecutionNativeApproval>[0];
 type Event = { sequence: number; event: ExecutionEngineEvent };
 type Approval = { id: string; operation: NativeOperation };
 type PendingApproval = { approval: Approval; answer: (allow: boolean) => boolean; stillCurrent: () => boolean };
+export type RetainedInputStatus = { id: string; state: "accepted" | "notAccepted" | "uncertain" | "pending" };
+type Input = { state: RetainedInputStatus["state"]; done?: Promise<void> };
+const inputsPerTurn = 32;
 type Status = { state: "starting" } | { state: "active"; sessionId: string }
   | { state: "finished"; sessionId: string; result: ExecutionTurnResult }
   | { state: "failed"; sessionId: string | null }
@@ -18,6 +21,8 @@ type Turn = {
   retainedTextChars: number;
   sequence: number;
   approvals: Map<string, PendingApproval>;
+  inputs: Map<string, Input>;
+  activeSession?: ExecutionEngineSession;
   done: Promise<void>;
 };
 
@@ -38,7 +43,7 @@ export class RetainedExecutionTurns {
     }
     const turn: Turn = {
       engineId: engine.descriptor.id, status: { state: "starting" }, controller: new AbortController(),
-      events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), done: Promise.resolve()
+      events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), inputs: new Map(), done: Promise.resolve()
     };
     this.turns.set(id, turn);
     const timer = duration === undefined ? undefined : setTimeout(() => turn.controller.abort(), duration).unref();
@@ -56,8 +61,34 @@ export class RetainedExecutionTurns {
       sequence: turn.sequence,
       gap: afterSequence < (turn.events[0]?.sequence ?? (turn.sequence + 1)) - 1,
       events: turn.events.filter(entry => entry.sequence > afterSequence),
-      approvals: [...turn.approvals.values()].filter(entry => entry.stillCurrent()).map(entry => entry.approval)
+      approvals: [...turn.approvals.values()].filter(entry => entry.stillCurrent()).map(entry => entry.approval),
+      inputs: [...turn.inputs].map(([id, { state }]): RetainedInputStatus => ({ id, state }))
     };
+  }
+
+  steer(id: string, inputId: string, text: string): RetainedInputStatus {
+    const turn = this.turns.get(id);
+    if (!turn) throw new Error("Unknown execution turn");
+    const previous = turn.inputs.get(inputId);
+    if (previous) return { id: inputId, state: previous.state };
+    if (turn.inputs.size >= inputsPerTurn) return { id: inputId, state: "notAccepted" };
+
+    const session = turn.activeSession;
+    const steer = session?.steer;
+    const input: Input = { state: "notAccepted" };
+    turn.inputs.set(inputId, input);
+    if (steer && !turn.controller.signal.aborted) {
+      input.state = "pending";
+      input.done = (async () => {
+        try {
+          const outcome = await steer.call(session, text, AbortSignal.any([turn.controller.signal, AbortSignal.timeout(12_000)]));
+          input.state = outcome === "injected" ? "accepted" : outcome === "idle" ? "notAccepted" : "uncertain";
+        } catch {
+          input.state = "uncertain";
+        }
+      })().finally(() => { delete input.done; });
+    }
+    return { id: inputId, state: input.state };
   }
 
   answerApproval(id: string, requestId: string, allow: boolean): boolean {
@@ -70,7 +101,7 @@ export class RetainedExecutionTurns {
     if (!turn) {
       if (this.turns.size >= this.limits.rememberedIds) return false;
       this.turns.set(id, { engineId: "", status: { state: "acknowledged", sessionId: null }, controller: new AbortController(),
-        events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), done: Promise.resolve() });
+        events: [], retainedTextChars: 0, sequence: 0, approvals: new Map(), inputs: new Map(), done: Promise.resolve() });
       return true;
     }
     if (turn.status.state !== "active" && turn.status.state !== "starting") return false;
@@ -100,6 +131,7 @@ export class RetainedExecutionTurns {
   private async run(turn: Turn, engine: ExecutionEngine, options: OpenOptions, text: string): Promise<void> {
     let session: Awaited<ReturnType<ExecutionEngine["open"]>> | undefined;
     let sessionKey: string | undefined;
+    let terminal: Status;
     let closeTimer: ReturnType<typeof setTimeout> | undefined;
     let closing: Promise<void> | undefined;
     const closeSession = () => closing ??= Promise.resolve().then(() => session?.close()).catch(() => {});
@@ -113,10 +145,10 @@ export class RetainedExecutionTurns {
     try {
       if (options.sessionId !== null) bindSession(options.sessionId);
       const authorizeNative: ExecutionNativeApproval = (operation, signal, stillCurrent) => {
-        if (turn.status.state !== "active" || signal.aborted || !stillCurrent()) return Promise.resolve(false);
+        if (!turn.activeSession || signal.aborted || !stillCurrent()) return Promise.resolve(false);
         const id = randomUUID();
         return new Promise<boolean>(resolve => {
-          const active = () => turn.status.state === "active" && !signal.aborted && !turn.controller.signal.aborted && stillCurrent();
+          const active = () => !!turn.activeSession && !signal.aborted && !turn.controller.signal.aborted && stillCurrent();
           const done = (result: boolean) => {
             turn.approvals.delete(id);
             signal.removeEventListener("abort", abort);
@@ -141,6 +173,7 @@ export class RetainedExecutionTurns {
       turn.controller.signal.throwIfAborted();
       if (options.sessionId === null) bindSession(session.id);
       else if (options.sessionId !== session.id) throw new Error("Execution engine returned a different session");
+      turn.activeSession = session;
       turn.status = { state: "active", sessionId: session.id };
       turn.controller.signal.addEventListener("abort", closeOnAbort, { once: true });
       const result = await session.run(text, turn.controller.signal, event => {
@@ -151,15 +184,19 @@ export class RetainedExecutionTurns {
           if (removed?.type === "text-delta") turn.retainedTextChars -= removed.text.length;
         }
       });
-      turn.status = { state: "finished", sessionId: session.id, result };
+      terminal = { state: "finished", sessionId: session.id, result };
     } catch {
-      turn.status = { state: "failed", sessionId: session?.id ?? null };
-    } finally {
-      turn.controller.signal.removeEventListener("abort", closeOnAbort);
-      clearTimeout(closeTimer);
-      turn.controller.abort();
-      await closeSession();
-      if (sessionKey) this.boundSessions.delete(sessionKey);
+      terminal = { state: "failed", sessionId: session?.id ?? null };
     }
+    // Stop accepting new input before exposing the terminal result or releasing the session.
+    turn.activeSession = undefined;
+    const pending = [...turn.inputs.values()].flatMap(input => input.done ? [input.done] : []);
+    if (pending.length) await Promise.all(pending);
+    turn.status = terminal;
+    turn.controller.signal.removeEventListener("abort", closeOnAbort);
+    clearTimeout(closeTimer);
+    turn.controller.abort();
+    await closeSession();
+    if (sessionKey) this.boundSessions.delete(sessionKey);
   }
 }

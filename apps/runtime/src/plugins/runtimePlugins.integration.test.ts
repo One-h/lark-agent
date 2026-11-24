@@ -42,9 +42,10 @@ test("stopping built-in plugins hides their routes and tools, preserves settings
     const pluginRoute = await app.inject({method:"GET",url:"/v1/plugins",headers:auth});
     assert.equal(pluginRoute.statusCode,200);
     const plugins=pluginRoute.json().plugins;
-    assert.equal(plugins.length,9);
+    assert.equal(plugins.length,10);
     assert(plugins.every((p:{enabled:boolean;mounted:boolean})=>!p.enabled&&!p.mounted));
     assert.deepEqual(plugins.find((p:{id:string})=>p.id==="group-question").blockedBy,["agent-outreach"]);
+    assert(!store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='lark_orchestration_tasks'").get());
     assert.equal((await app.inject({method:"GET",url:"/v1/plugins"})).statusCode,401);
     for (const target of ["/v1/managed-chats","/v1/agent-messaging","/v1/personal-inbox","/v1/stickers"]) {
       assert.equal((await app.inject({method:"GET",url:target,headers:auth})).statusCode,404,target);

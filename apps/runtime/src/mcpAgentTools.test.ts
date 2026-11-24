@@ -342,6 +342,64 @@ test("an opted-in restricted engine gets the shared MCP catalog and loses access
   } finally { finish(); await app.app.close(); app.stop(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("delegation MCP uses the source identity and does not start before the original approval", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-delegation-mcp-"));
+  let prompt: string | undefined, finish!: () => void;
+  const cards: number[] = [];
+  const starts: unknown[] = [];
+  const hold = new Promise<void>(resolve => { finish = resolve; });
+  const engine: ExecutionEngine = {
+    descriptor: { id: "fixture", label: "Fixture", models: [] }, supportsLarkMcp: true, supportsPolicy: () => true,
+    async open() { return { id: "fixture-session", close() {}, async run(text) {
+      prompt = text; await hold; return { status: "completed", text: "Request registered." };
+    } }; }
+  };
+  const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root,
+    trustedSenderIds: ["ou_owner"], approverId: "ou_owner", runtimeToken: "fixture-host-token",
+    executionEngines: [engine], taskOrchestrationEnabled: true,
+    taskEngineHost: { supports: id => id === "claude", async call<T>(request: Record<string, unknown>) {
+      if (request.method === "status") return { generation: "fixture-gen", workspace: root,
+        engines: [{ id: "claude", models: [], restricted: true, trusted: true }] } as T;
+      if (request.method === "start") { starts.push(request); return {} as T; }
+      return null as T;
+    } },
+    approvalCardSender: (_id, card) => { cards.push(card.approvalId); return { ok: true, messageId: "om_task_card" }; },
+    approvalCardUpdater: () => {},
+    textReplySender: () => ({ ok: true, messageId: "om_task_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" }),
+    reactionSender: () => ({ok:true}) });
+  try {
+    const now = new Date().toISOString();
+    const insert = runtime.store.db.prepare(`INSERT INTO lark_messages(id,message_id,chat_id,chat_type,thread_id,sender_id,sender_type,message_type,
+      content,mentioned,reply_trigger,reply_status,codex_status,raw_json,received_at,created_at)
+      VALUES(?,?,'oc_fixture','group','omt_fixture','ou_requester','user','text','Ask Claude to research the fixture',
+      1,'mention','skipped','skipped','{}',?,?)`);
+    insert.run(1, "om_seed", now, now);
+    assert.equal(updateConversationExecutionSettings("oc_fixture", { engineId: "fixture", model: null }), "ok");
+    insert.run(2, "om_task", now, now);
+    assert.equal(enqueueLarkCodexReply(2), true);
+    const text = await waitFor(() => prompt);
+    const token = text.match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
+    const secret = larkAgentToolsMcpServer()?.env.find(e => e.name === "LARK_AGENT_MCP_TOKEN")?.value;
+    assert(token && secret);
+    const headers = { authorization: `Bearer ${secret}` };
+    const catalog = await runtime.app.inject({ url: "/v1/internal/mcp/tools", headers });
+    assert(catalog.json().tools.some((tool: { name: string }) => tool.name === "lark_task_orchestration"));
+    const payload = { tool: "lark_task_orchestration", contextToken: token,
+      input: { action: "dispatch", goal: "Research the fixture", worker: { engine: "claude" } } };
+    const call = runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call", headers, payload });
+    const approval = await waitFor(() => cards[0]);
+    runtime.tickPlugins();
+    assert.equal(starts.length, 0);
+    assert.equal((await runtime.app.inject({ method: "POST", url: `/v1/approvals/${approval}/approve`, headers: auth })).statusCode, 200);
+    assert.equal(JSON.parse((await call).json().text).status, "approved");
+    runtime.tickPlugins();
+    await waitFor(() => starts[0]);
+    assert.equal(cards.length, 1);
+    assert.equal(starts.length, 1);
+    assert.equal((starts[0] as { trusted?: boolean }).trusted, false);
+  } finally { finish(); await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("external sticker MCP delivers only the current selection after final text", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-external-stickers-"));
   const mediaLog = path.join(root, "media.log");

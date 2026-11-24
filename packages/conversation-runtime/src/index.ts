@@ -26,7 +26,7 @@ export * from "./topicNativeMode.js";
 export * from "./approvalPlan.js";
 export * from "./executionEngines.js";
 export { listenRetainedExecutionHost } from "./retainedExecutionHost.js";
-export type { RetainedHostConfig } from "./retainedExecutionClient.js";
+export { RetainedExecutionClient, RetainedHostError, type RetainedHostConfig } from "./retainedExecutionClient.js";
 export * from "./topicExecution.js";
 export * from "./claudeExecutionEngine.js";
 export { configuredNativeAcpEngines, createNativeAcpExecutionEngine, type NativeAcpEngineId } from "./nativeAcpExecutionEngine.js";

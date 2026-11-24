@@ -1,7 +1,7 @@
 # Built-in plugins
 
-The runtime mounts trusted in-repository plugins explicitly. All built-ins
-are enabled by default, and existing workspace/chat settings and authorization
+The runtime mounts trusted in-repository plugins explicitly. Built-ins other
+than task orchestration are enabled by default. Existing workspace/chat settings and authorization
 requirements still apply. Changing the operator list takes effect at the next
 Lark startup. This is not an external plugin loader.
 
@@ -24,6 +24,7 @@ startup; no silent fallback changes the intended selection.
 | `progress-cards` | Progress observer and card queue | Observer and card retries paused |
 | `completion-reactions` | DONE reaction after verified dependencies | No new DONE work or queued reaction sends while disabled |
 | `stickers` | Sticker library and optional sticker output | Library routes, new sticker use and queued sticker sends paused; normal media and core MCP routes stay available |
+| `task-orchestration` | Optional [delegated tasks](task-orchestration.md) | No task tool or background scheduling; prior tasks retained |
 
 When restored, the owning module applies its original eligibility, expiry and
 unknown-outcome rules. Restarting does not grant permissions or replay an
@@ -34,3 +35,6 @@ Add built-ins at the composition root with feature-owned routes and explicit
 startup/maintenance hooks. Existing generic Hook contributors can be passed
 as `plugins` to `createRuntime`; reserve `builtin-*` for bundled modules.
 See [the lifecycle contracts](turn-observations.md).
+# Optional Task Orchestration
+
+The task-orchestration plugin is off by default. See [Delegated Tasks](task-orchestration.md) for opt-in configuration, engine requirements and recovery behavior.

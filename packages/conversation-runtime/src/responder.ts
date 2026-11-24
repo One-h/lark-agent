@@ -3769,7 +3769,7 @@ function handleLarkMcpConfirmation(request: CodexAppServerRequest): boolean {
   const meta = params._meta;
   const tool = meta?.tool_params as { context_token?: unknown; input?: unknown } | null | undefined;
   if (params.mode !== "form" || meta?.codex_approval_kind !== "mcp_tool_call" || typeof meta.tool_name !== "string"
-    || !larkMcpHostCapabilityId(meta.tool_name) || !tool || typeof tool !== "object" || Array.isArray(tool)
+    || !(larkMcpHostCapabilityId(meta.tool_name) || meta.tool_name === "lark_task_orchestration") || !tool || typeof tool !== "object" || Array.isArray(tool)
     || Object.keys(tool).some(key => !["context_token", "input"].includes(key)) || !("input" in tool)
     || typeof tool.context_token !== "string" || !config.larkAgentRuntimeUrl || !config.larkAgentMcpToken
     || typeof params.threadId !== "string" || typeof params.turnId !== "string") {

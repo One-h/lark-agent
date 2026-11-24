@@ -17,6 +17,7 @@ const calls = z.discriminatedUnion("method", [
     trusted: z.boolean(), deadline: z.iso.datetime().optional()
   }),
   z.strictObject({ method: z.literal("attach"), generation, id, afterSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) }),
+  z.strictObject({ method: z.literal("steer"), generation, id, inputId: id, text: z.string().min(1).max(24_000) }),
   z.strictObject({ method: z.literal("answerApproval"), generation, id, requestId: z.uuid(), allow: z.boolean() }),
   z.strictObject({ method: z.literal("acknowledge"), generation, id }),
   z.strictObject({ method: z.literal("cancel"), generation, id })
@@ -70,9 +71,13 @@ export async function listenRetainedExecutionHost(options: {
     try {
       const call = await parseRequest(req);
       if (!call) return send(400, { error: "invalid request" });
-      if (call.method === "status") return send(200, { generation: hostGeneration, workspace: options.workspace });
+      if (call.method === "status") return send(200, { generation: hostGeneration, workspace: options.workspace,
+        engines: [...engines.values()].map(engine => ({ id: engine.descriptor.id, models: engine.descriptor.models,
+          trusted: engine.supportsPolicy(larkExecutionPolicy(options.workspace, true)),
+          restricted: engine.supportsPolicy(larkExecutionPolicy(options.workspace, false)) })) });
       if (call.generation !== hostGeneration) return send(409, { error: "execution host generation changed" });
       if (call.method === "attach") return send(200, turns.attach(call.id, call.afterSequence));
+      if (call.method === "steer") return send(200, turns.steer(call.id, call.inputId, call.text));
       if (call.method === "answerApproval") return send(200, { accepted: turns.answerApproval(call.id, call.requestId, call.allow) });
       if (call.method === "acknowledge") return send(200, { acknowledged: await turns.acknowledge(call.id) });
       if (call.method === "cancel") return send(200, { cancelled: turns.cancel(call.id) });

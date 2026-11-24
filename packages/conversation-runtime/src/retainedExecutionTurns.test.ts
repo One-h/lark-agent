@@ -7,8 +7,11 @@ import http from "node:http";
 import path from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import type { ExecutionEngine, ExecutionTurnResult } from "./executionEngines.js";
 import type { NativeAcpEngineId } from "./nativeAcpExecutionEngine.js";
-import type { RetainedExecutionTurns } from "./retainedExecutionTurns.js";
+import { RetainedExecutionClient } from "./retainedExecutionClient.js";
+import { listenRetainedExecutionHost } from "./retainedExecutionHost.js";
+import type { RetainedExecutionTurns, RetainedInputStatus } from "./retainedExecutionTurns.js";
 
 function launcher(dir: string, engine: NativeAcpEngineId, restricted: boolean): string {
   const file = path.join(dir, restricted ? "restricted.mjs" : "trusted.mjs");
@@ -62,6 +65,98 @@ async function eventually<T>(read: () => Promise<T | undefined>): Promise<T> {
 }
 
 type Snapshot = NonNullable<ReturnType<RetainedExecutionTurns["attach"]>>;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+test("retained steering survives a new subscriber and settles before the terminal result", { timeout: 10_000 }, async () => {
+  const root = mkdtempSync("/tmp/lark-retained-steer-");
+  const config = { socketPath: path.join(root, "h.sock"), token: randomBytes(32).toString("hex"), engineIds: ["fixture"] };
+  const result = deferred<ExecutionTurnResult>();
+  const first = deferred<"injected">();
+  const uncertain = deferred<"idle">();
+  const submitted: string[] = [];
+  let closed = false;
+  const engine: ExecutionEngine = {
+    descriptor: { id: "fixture", label: "Fixture", models: [] },
+    supportsPolicy: () => true,
+    async open() {
+      return {
+        id: "fixture-session",
+        async run(_text, _signal, event) {
+          event?.({ type: "text-delta", text: "progress" });
+          return result.promise;
+        },
+        async steer(text) {
+          submitted.push(text);
+          if (text === "first") return first.promise;
+          if (text === "uncertain") return uncertain.promise;
+          return "idle";
+        },
+        close() { closed = true; }
+      };
+    }
+  };
+  const host = await listenRetainedExecutionHost({ ...config, workspace: root, engines: [engine] });
+  try {
+    const client = new RetainedExecutionClient(config);
+    const recovered = new RetainedExecutionClient(config);
+    const { generation } = await client.call<{ generation: string }>({ method: "status" });
+    const identity = { generation, id: "turn-one" };
+    const attach = (afterSequence = 0) => recovered.call<Snapshot>({ ...identity, method: "attach", afterSequence });
+    const steer = (inputId: string, text: string) => client.call<RetainedInputStatus>({ ...identity, method: "steer", inputId, text });
+    await client.call({ ...identity, method: "start", engineId: "fixture", text: "original", sessionId: null, model: null, trusted: true });
+    const active = await eventually(async () => {
+      const snapshot = await attach();
+      return snapshot.status.state === "active" ? snapshot : undefined;
+    });
+    assert.deepEqual(active.inputs, []);
+    await assert.rejects(steer("invalid/id", "first"), { status: 400 });
+    await assert.rejects(client.call({ ...identity, generation: randomUUID(), method: "steer", inputId: "first", text: "first" }), { status: 409 });
+    assert.deepEqual(await steer("first", "first"), { id: "first", state: "pending" });
+    assert.deepEqual(await steer("uncertain", "uncertain"), { id: "uncertain", state: "pending" });
+    await steer("idle", "idle");
+    assert.deepEqual(await recovered.call({ ...identity, method: "steer", inputId: "first", text: "duplicate" }), { id: "first", state: "pending" });
+    assert.deepEqual((await attach(active.sequence)).inputs, [
+      { id: "first", state: "pending" }, { id: "uncertain", state: "pending" }, { id: "idle", state: "notAccepted" }
+    ]);
+
+    result.resolve({ status: "completed", text: "done" });
+    assert.deepEqual(await steer("late", "must not submit"), { id: "late", state: "notAccepted" });
+    assert.equal((await attach()).status.state, "active");
+    assert.equal(closed, false);
+    assert.deepEqual(await recovered.call({ ...identity, method: "acknowledge" }), { acknowledged: false });
+    first.resolve("injected");
+    assert.deepEqual(await steer("first", "duplicate"), { id: "first", state: "accepted" });
+    assert.equal((await attach()).status.state, "active");
+    uncertain.reject(new Error("transport closed after submit"));
+    const finished = await eventually(async () => {
+      const snapshot = await attach(active.sequence);
+      return snapshot.status.state === "finished" ? snapshot : undefined;
+    });
+    assert.deepEqual(finished.status, { state: "finished", sessionId: "fixture-session", result: { status: "completed", text: "done" } });
+    assert.deepEqual(finished.events, []);
+    assert.deepEqual(finished.inputs, [
+      { id: "first", state: "accepted" }, { id: "uncertain", state: "uncertain" },
+      { id: "idle", state: "notAccepted" }, { id: "late", state: "notAccepted" }
+    ]);
+    assert.deepEqual(await steer("uncertain", "duplicate"), { id: "uncertain", state: "uncertain" });
+    assert.deepEqual(await steer("idle", "duplicate"), { id: "idle", state: "notAccepted" });
+    assert.deepEqual(submitted, ["first", "uncertain", "idle"]);
+    assert.deepEqual(await recovered.call({ ...identity, method: "acknowledge" }), { acknowledged: true });
+    assert.deepEqual((await attach(active.sequence)).inputs, finished.inputs);
+  } finally {
+    result.resolve({ status: "cancelled" });
+    first.resolve("injected");
+    uncertain.resolve("idle");
+    await host.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
   test(`${id}: a new client process attaches to original ACP prompt and answers its original permission once`, { timeout: 35_000 }, async () => {
@@ -142,12 +237,24 @@ for (const id of ["claude", "dsh", "opencode", "agy"] as const) {
       const { snapshot: first } = await subscriber(0, false);
       assert.deepEqual(first.status, { state: "active", sessionId: `fixture-${id}` });
       assert.equal(first.events.length, 1);
+      const unsupported = { id: "message-one", inputId: "unsupported", text: "not submitted" };
+      assert.deepEqual((await send("steer", unsupported)).body, { id: unsupported.inputId, state: "notAccepted" });
+      if (id === "claude") {
+        for (let i = 0; i < 32; i++) {
+          assert.deepEqual((await send("steer", { ...unsupported, inputId: `input-${i}` })).body, { id: `input-${i}`, state: "notAccepted" });
+        }
+        const snapshot = (await subscriber(first.sequence, false)).snapshot;
+        assert.equal(snapshot.inputs.length, 32);
+        assert.deepEqual(snapshot.inputs[0], { id: unsupported.inputId, state: "notAccepted" });
+        assert.equal(snapshot.inputs.some(input => input.id === "input-31"), false);
+      }
       const requestId = first.approvals[0]!.id;
       assert.equal(first.approvals[0]!.operation.engineId, id);
       assert.deepEqual((await send("answerApproval", { id: "different-turn", requestId, allow: true })).body, { accepted: false });
       assert.deepEqual((await send("answerApproval", { id: "message-one", requestId: randomUUID(), allow: true })).body, { accepted: false });
       const resumed = await subscriber(first.sequence, true);
       assert.deepEqual(resumed.snapshot.events, []);
+      assert.deepEqual(resumed.snapshot.inputs[0], { id: unsupported.inputId, state: "notAccepted" });
       assert.equal(resumed.snapshot.approvals[0]!.id, requestId);
       assert.deepEqual(resumed.answers, [true, false]);
       const finished = await eventually(async () => {
