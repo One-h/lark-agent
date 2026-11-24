@@ -44,7 +44,7 @@ import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { TaskOrchestration, taskCommand, taskInputSchema, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
 import { TaskArtifacts } from "./plugins/taskArtifacts.js";
 import { RetainedExecutionClient } from "@lark-agent/conversation-runtime";
-import { confirmRetainedLarkMcpTurn, hasRetainedLarkForegroundBinding, larkTaskDispatchGuidance,
+import { codexForegroundMcpBearer, confirmRetainedLarkMcpTurn, getCodexSocketMcpToolContext, hasRetainedLarkForegroundBinding, larkTaskDispatchGuidance,
   resolveLarkMcpToolContext, retainedForegroundMcpBearer } from "@lark-agent/conversation-runtime";
 import { readLarkReplyReceipt, sendLarkFileReply, uploadLarkReplyFile } from "@lark-agent/adapter-lark-cli";
 import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAssistNotifications, runLarkOwnerAssistMcpTool, ownerAssistMayExecute,
@@ -1199,10 +1199,13 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   app.post("/v1/internal/capabilities/:id/execute", capabilityRoute);
   const retainedBearer = config.retainedEngineHost ? retainedForegroundMcpBearer(config.retainedEngineHost.token) : undefined;
   const retainedMcp = (request: FastifyRequest) => Boolean(retainedBearer && request.headers.authorization === `Bearer ${retainedBearer}`);
+  const codexBearer = config.codexSocket ? codexForegroundMcpBearer(config.runtimeToken) : undefined;
+  const codexSocketMcp = (request: FastifyRequest) => Boolean(codexBearer && request.headers.authorization === `Bearer ${codexBearer}`)
+    && ["127.0.0.1", "::1"].includes(request.ip);
   const authenticatedMcp = (request: FastifyRequest) => (request.headers.authorization === `Bearer ${mcpToken}` || retainedMcp(request))
     && ["127.0.0.1", "::1"].includes(request.ip);
   app.get("/v1/internal/mcp/tools", async (request, reply) => {
-    if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
+    if (!authenticatedMcp(request) && !codexSocketMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
     return { tools: [...listLarkMcpTools(Boolean(config.runtimeToken) && !retainedMcp(request)), ...(taskOrchestration ? [{
       name: "lark_task_orchestration", description: larkTaskDispatchGuidance + " " +
         "Dispatch records the goal, constraints, deliverables, resources and Worker; the existing skill controls worktree use. " +
@@ -1215,7 +1218,9 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   });
   const mcpApprovals = new McpApprovalBridge();
   const mcpToolRoute = async (request: FastifyRequest, reply: FastifyReply, prepare: boolean) => {
-    if (!authenticatedMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
+    const viaCodexSocket = codexSocketMcp(request);
+    // Native elicitation is sent by the current runtime, not by the MCP subprocess.
+    if (!authenticatedMcp(request) && (!viaCodexSocket || prepare)) return reply.code(403).send({ error: "local MCP token required" });
     const retained = retainedMcp(request);
     const payload = request.body as { tool?: unknown; contextToken?: unknown; input?: unknown; callId?: unknown; threadId?: unknown; turnId?: unknown } | null;
     const keys = prepare ? ["tool", "contextToken", "input", "threadId", "turnId"] : ["tool", "contextToken", "input", "callId"];
@@ -1229,7 +1234,8 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     if (retained && (prepare || !["lark_task_orchestration", approvalStatusToolName].includes(payload.tool))) {
       return reply.code(403).send({ error: "Tool is not available for this retained MCP connection" });
     }
-    const context = retained ? await resolveLarkMcpToolContext(token) : getLarkMcpToolContext(token);
+    const readCurrentContext = () => viaCodexSocket ? getCodexSocketMcpToolContext(token) : getLarkMcpToolContext(token);
+    const context = retained ? await resolveLarkMcpToolContext(token) : readCurrentContext();
     if (!context || !liveTurn(context.larkMessageId, context.turnId)) return reply.code(409).send({ error: "当前回合的工具令牌不可用。" });
     if (retained && !hasRetainedLarkForegroundBinding(context.larkMessageId, context.turnId))
       return reply.code(409).send({ error: "Retained MCP token does not match the original engine run" });
@@ -1260,7 +1266,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
           threadId: source.thread_id,
           trusted: isTrustedLarkSender(source.sender_id), policy: taskPolicy(source.sender_id) };
         const current = () => {
-          const live = getLarkMcpToolContext(token);
+          const live = readCurrentContext();
           return taskAllowed(origin) && live?.larkMessageId === origin.messageId && live.turnId === context.turnId
             && liveTurn(origin.messageId, context.turnId);
         };
@@ -1302,7 +1308,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       return reply.code(409).send({ error: "跨群提问仅支持飞书中的原生 Codex 会话。" });
     const { native: _native, ...bound } = context;
     const stillCurrent = () => {
-      const live = getLarkMcpToolContext(token);
+      const live = readCurrentContext();
       return live?.turnId === bound.turnId && live.larkMessageId === bound.larkMessageId && live.senderId === bound.senderId
         && live.chatId === bound.chatId && live.trustScope === bound.trustScope;
     };

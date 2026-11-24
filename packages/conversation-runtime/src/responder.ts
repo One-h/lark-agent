@@ -3645,6 +3645,11 @@ export function getLarkMcpToolContext(contextToken: string) {
   return getLocalLarkMcpToolContext(contextToken) ?? retainedLarkMcpToolContext(retainedLark?.getForegroundMcpBinding(contextToken));
 }
 
+export function getCodexSocketMcpToolContext(contextToken: string) {
+  const context = getLocalLarkMcpToolContext(contextToken);
+  return context?.native && nativeSocketContextCurrent(context.larkMessageId, context.turnId) ? context : undefined;
+}
+
 export async function resolveLarkMcpToolContext(contextToken: string) {
   return getLocalLarkMcpToolContext(contextToken) ?? retainedLarkMcpToolContext(await retainedLark?.resolveForegroundMcpBinding(contextToken));
 }

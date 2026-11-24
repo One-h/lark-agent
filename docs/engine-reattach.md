@@ -28,6 +28,48 @@ engine hosts or stop the whole process tree during a hot handoff.
   is not evidence that a previous turn never ran. Do not automatically replay
   against a replacement host, including when the start response was lost.
 
+### Foreground Codex MCP
+
+On the dedicated Codex App Server, configure the **`lark_tools` MCP server
+once** in addition to the existing sticker server. It reads the current
+capability catalog from Lark on each `tools/list`, so new tools do not change
+the Codex launch configuration.
+
+Use the same private runtime token (at least 32 bytes) as Lark to derive the
+dedicated MCP bearer. The example assumes the Lark repository as the current
+directory, Node 24, installed dependencies, and the existing runtime token
+and loopback URL already exported by the managed launcher. Capture the derived
+value into the process environment; never log it.
+
+```sh
+export LARK_AGENT_MCP_TOKEN="$(node --import tsx --input-type=module -e '
+  import { codexForegroundMcpBearer } from "./packages/conversation-runtime/src/codexForegroundMcp.ts";
+  const token = codexForegroundMcpBearer(process.env.LARK_AGENT_RUNTIME_TOKEN);
+  if (!token) process.exit(1);
+  process.stdout.write(token);
+')"
+test -n "$LARK_AGENT_MCP_TOKEN" || exit 1
+```
+
+On the existing dedicated `codex app-server` launch command, keep the socket
+and other options; add these arguments (capturing repository and Node paths
+before changing the process working directory):
+
+```sh
+-c "mcp_servers.lark_tools.command=\"$(command -v node)\"" \
+-c "mcp_servers.lark_tools.args=[\"$PWD/node_modules/tsx/dist/cli.mjs\",\"$PWD/packages/mcp-stickers/src/agentTools.ts\"]" \
+-c 'mcp_servers.lark_tools.env_vars=["LARK_AGENT_RUNTIME_URL","LARK_AGENT_MCP_TOKEN"]' \
+-c 'mcp_servers.lark_tools.startup_timeout_sec=10' \
+-c 'mcp_servers.lark_tools.tool_timeout_sec=1200'
+```
+
+Apply the one-time App Server configuration when its active turns have
+drained. A subsequent Lark-only restart keeps the catalog bearer valid as
+long as the runtime token is unchanged. Tool calls still need the current
+native socket turn's context and the normal approvals. An old turn's token or
+an interrupted tool call is not replayed. The bearer cannot call the general
+runtime API or submit an approval decision.
+
 ## Lark recovery
 
 The runtime journals the source message and the submission boundary. ACP
