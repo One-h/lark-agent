@@ -76,13 +76,13 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
       args: ["--import", "tsx", fileURLToPath(new URL("../../../packages/mcp-stickers/src/agentTools.ts", import.meta.url))],
       env: { ...process.env as Record<string, string>, LARK_AGENT_RUNTIME_URL: url, LARK_AGENT_MCP_TOKEN: bearer } }));
     assert(!(await mcp.listTools()).tools.some(t => t.name === "lark_task_orchestration"));
-    const request = async (id: number) => {
+    const request = async (id: number, chatId = "oc_fixture") => {
       const turnIndex = tokens.length;
       const now = new Date().toISOString();
       runtime.store.db.prepare(`INSERT INTO lark_messages
         (id,message_id,chat_id,chat_type,sender_id,sender_type,message_type,mentioned,reply_trigger,reply_status,codex_status,content,raw_json,received_at,created_at)
-        VALUES(?,?,'oc_fixture','p2p','ou_fixture','user','text',1,'p2p','pending','skipped','fixture question','{}',?,?)`)
-        .run(id, "om_fixture_" + id, now, now);
+        VALUES(?,?,?,'p2p','ou_fixture','user','text',1,'p2p','pending','skipped','fixture question','{}',?,?)`)
+        .run(id, "om_fixture_" + id, chatId, now, now);
       assert(enqueueLarkCodexReply(id));
       const token = await until(() => tokens[turnIndex]);
       await until(() => runtime.store.db.prepare("SELECT 1 FROM lark_native_socket_turns WHERE message_id=?").get(id));
@@ -101,10 +101,20 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
     runtime = setup(true, port);
     await runtime.app.listen({ host: "127.0.0.1", port });
     assert((await mcp.listTools()).tools.some(t => t.name === "lark_task_orchestration"));
-    const newToken = await request(101);
+    const newToken = await request(101, "oc_unlisted");
     assert.notEqual(newToken, oldToken);
+    const switchGlobal = async (enabled: boolean) => {
+      const response = await runtime.app.inject({ method: "PATCH", url: "/v1/settings",
+        headers: { authorization: "Bearer " + runtimeToken }, payload: { taskOrchestrationGlobalEnabled: enabled } });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().taskOrchestrationGlobalEnabled, enabled);
+    };
+    assert.equal((await call("lark_task_orchestration", newToken, { action: "list" })).isError, true);
+    await switchGlobal(true);
     assert.equal((await call("lark_task_orchestration", oldToken, { action: "list" })).isError, true);
     assert.notEqual((await call("lark_task_orchestration", newToken, { action: "list" })).isError, true);
+    await switchGlobal(false);
+    assert.equal((await call("lark_task_orchestration", newToken, { action: "list" })).isError, true);
     assert.equal((await runtime.app.inject({ url: "/v1/internal/mcp/tools", headers: { authorization: "Bearer " + runtimeToken } })).statusCode, 403);
     assert.equal((await runtime.app.inject({ url: "/v1/plugins", headers: { authorization: "Bearer " + bearer } })).statusCode, 401);
     assert.equal((await runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/approve",

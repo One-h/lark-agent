@@ -391,14 +391,14 @@ test("delegation MCP uses the source identity and does not start before the orig
       input: { action: "dispatch", goal: "Research the fixture", worker: { engine: "claude" } } };
     const list = () => runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call", headers,
       payload: { ...payload, input: { action: "list" } } });
-    const switchAllGroups = (enabled: boolean, authHeaders = auth) => runtime.app.inject({ method: "PATCH",
-      url: "/v1/settings", headers: authHeaders, payload: { taskOrchestrationAllGroupsEnabled: enabled } });
+    const switchGlobal = (enabled: boolean, authHeaders = auth) => runtime.app.inject({ method: "PATCH",
+      url: "/v1/settings", headers: authHeaders, payload: { taskOrchestrationGlobalEnabled: enabled } });
     const settings = (await runtime.app.inject("/v1/settings")).json();
     assert.equal(settings.taskOrchestrationEnabled, true);
-    assert.equal(settings.taskOrchestrationAllGroupsEnabled, false);
+    assert.equal(settings.taskOrchestrationGlobalEnabled, false);
     assert.equal((await list()).statusCode, 409);
-    assert.equal((await switchAllGroups(true, headers)).statusCode, 401);
-    assert.equal((await switchAllGroups(true)).json().taskOrchestrationAllGroupsEnabled, true);
+    assert.equal((await switchGlobal(true, headers)).statusCode, 401);
+    assert.equal((await switchGlobal(true)).json().taskOrchestrationGlobalEnabled, true);
     assert.equal((await list()).statusCode, 200);
     config.groupPrivacyEnforced = true;
     try { assert.equal((await list()).statusCode, 409); }
@@ -414,7 +414,7 @@ test("delegation MCP uses the source identity and does not start before the orig
     assert.equal(cards.length, 1);
     assert.equal(starts.length, 1);
     assert.equal((starts[0] as { trusted?: boolean }).trusted, false);
-    assert.equal((await switchAllGroups(false)).json().taskOrchestrationAllGroupsEnabled, false);
+    assert.equal((await switchGlobal(false)).json().taskOrchestrationGlobalEnabled, false);
     assert.equal((await list()).statusCode, 409);
   } finally { finish(); await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
