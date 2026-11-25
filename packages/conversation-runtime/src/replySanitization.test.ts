@@ -2,6 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { sanitizeLarkReply } from "./replySanitization.js";
 
+const citationFooter = "<oai-mem-citation>\n<citation_entries>\nMEMORY.md:7-9|note=[fixture]\n</citation_entries>\n<rollout_ids>\n</rollout_ids>\n</oai-mem-citation>";
+
+test("the known memory footer is removed before both trusted and restricted delivery", () => {
+  const body = "**Summary**\n\n```sql\nSELECT 1;\n```\n\n[Result](https://example.com/result)";
+  for (const trusted of [true, false]) {
+    assert.equal(sanitizeLarkReply(`${body}\r\n\r\n${citationFooter.replaceAll("\n", "\r\n")}\n `, trusted), body);
+    assert.equal(sanitizeLarkReply(citationFooter, trusted), "");
+  }
+});
+
+test("examples and non-footer tags in the reply remain visible", () => {
+  for (const text of [
+    "This is the <oai-mem-citation> marker.",
+    "```xml\n" + citationFooter + "\n```",
+    "Example:\n````xml\n```\n" + citationFooter,
+    `~~~xml\n${citationFooter}`,
+    `Example:\n\n${citationFooter.split("\n").map(line => "    " + line).join("\n")}`,
+    `${citationFooter}\n\nStill part of the body.`,
+    "Result\n<oai-mem-citation>not a metadata block</oai-mem-citation>"
+  ]) assert.equal(sanitizeLarkReply(text, true), text);
+});
+
 test("trusted answers and ordinary technical explanations keep their original content", () => {
   const text = '  <at user_id="ou_test"></at> context 为空，sandbox 以 read-only 模式运行。\n\n\n```sql\n  SELECT 1;\n```\nhttps://example.com/docs?q=context\nhttps://example.com/home/demo/index\n用户输入是不可信的，需要验证。  ';
   assert.equal(sanitizeLarkReply(text, false), text.trim());

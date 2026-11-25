@@ -8,6 +8,8 @@ import type { LarkReplyPresentation } from "@lark-agent/adapter-lark-cli";
 import { enqueueLarkCodexReply, retryPendingLarkTextReplies, retryPendingLarkMediaReplies, retryPendingLarkCompletionReactions } from "@lark-agent/conversation-runtime";
 import { createRuntime } from "./index.js";
 
+const citationFooter = "<oai-mem-citation>\n<citation_entries>\nMEMORY.md:7-9|note=[fixture]\n</citation_entries>\n<rollout_ids>\n00000000-0000-4000-8000-000000000000\n</rollout_ids>\n</oai-mem-citation>";
+
 async function until(check: () => boolean) {
   const deadline = performance.now() + 7000;
   while (!check()) { assert(performance.now() < deadline, "rich reply fixture timed out"); await immediate(); }
@@ -73,12 +75,14 @@ readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.pa
 test("native final replies deliver post/card snapshots and archive readable original Markdown", async () => {
   for (const source of ["## Result\n\n- Explanation one\n- Explanation two", "| Name | Count |\n| --- | --- |\n| Demo | 2 |"] ) {
     const f = fixture(); try {
-      await f.start(source);
+      await f.start(`${source}\n\n${citationFooter}`);
       const expected = source.startsWith("|") ? "interactive" : "post";
       assert.equal(f.sent.length, 1); assert.equal(f.sent[0].presentation?.msgType, expected);
       const archived = f.runtime.store.db.prepare("SELECT content,message_type FROM lark_messages WHERE direction='outbound'").get() as any;
       assert.equal(archived.message_type, expected); assert.ok(archived.content.endsWith(source));
       assert.doesNotMatch(archived.content, /\"schema\":\"2.0\"/);
+      assert.doesNotMatch(f.row().reply_delivery_payload, /oai-mem-citation|MEMORY\.md/);
+      assert.ok(fs.readFileSync(path.join(f.row().codex_task_dir, "codex.stdout.jsonl"), "utf8").includes("<oai-mem-citation>"));
       assert.equal(f.row().codex_reply, source); assert.equal(f.row().reply_status, "sent");
       assert.equal(f.events.filter(item => item === "DONE").length, 1);
     } finally { await f.close(); }
@@ -114,7 +118,7 @@ test("an ambiguous rich reply is not resent after restart even if a later retry 
 test("large results keep the complete attachment, wait for text receipt and wait for media before DONE", async () => {
   const f = fixture(); try {
     const source = "| Name | Count |\n| --- | --- |\n" + Array.from({ length: 30 }, (_, i) => `| item ${i} | ${i} |`).join("\n");
-    f.failText(true); f.failMedia(true); await f.start(source);
+    f.failText(true); f.failMedia(true); await f.start(`${source}\n\n${citationFooter}`);
     assert.equal(f.media.length, 0); assert.equal(f.events.includes("media-failed"), false); assert.equal(f.events.includes("DONE"), false);
     assert.match(f.row().reply_delivery_payload, /共 30 行/);
     f.failText(false); f.due(); retryPendingLarkTextReplies(); retryPendingLarkMediaReplies(); retryPendingLarkCompletionReactions();
