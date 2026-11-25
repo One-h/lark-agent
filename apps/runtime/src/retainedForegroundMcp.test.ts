@@ -89,7 +89,8 @@ readline.createInterface({input:process.stdin}).on("line", line => {
   const engine = createNativeAcpExecutionEngine("dsh", { launcher, models: [] });
   const setup = (port?: number) => createRuntime({ databasePath: path.join(root, "runtime.sqlite"), mode: "active", workspaceRoot: root,
     trustedSenderIds: ["ou_fixture"], runtimeToken: "fixture-runtime-token", executionEngines: [engine], retainedEngineHost, port,
-    taskOrchestrationEnabled: true, taskEngineHost: { supports: id => id === "dsh", async call<T>(request: Record<string, unknown>) {
+    taskOrchestrationEnabled: true, taskOrchestrationChatIds: ["oc_fixture"],
+    taskEngineHost: { supports: id => id === "dsh", async call<T>(request: Record<string, unknown>) {
       if (request.method === "status") return { generation: "fixture-only", workspace: root,
         engines: [{ id: "dsh", models: [], trusted: true, restricted: false }] } as T;
       return null as T;

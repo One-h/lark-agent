@@ -263,12 +263,14 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   const taskPolicy = (sender: string) => createHash("sha256").update(JSON.stringify([
     workspaceRoot, approverId ?? null, isTrustedLarkSender(sender), configuredTrustedExecutionEnabled()
   ])).digest("hex");
+  const taskOrchestrationAllGroupsEnabled = () => store.setting("taskOrchestrationAllGroupsEnabled", "false") === "true";
   const taskAllowed = (origin: TaskOrigin) => {
     if (runtimeClosing.signal.aborted) return false;
     const source = taskSource(origin.messageId);
     return Boolean(source?.direction === "inbound" && source.sender_type === "user" && source.chat_id === origin.chatId
       && source.sender_id === origin.senderId && source.reply_trigger !== "owner_mention"
-      && (!config.taskOrchestrationChatIds || config.taskOrchestrationChatIds.includes(source.chat_id))
+      && (config.taskOrchestrationChatIds?.includes(source.chat_id)
+        || (source.chat_type === "group" && taskOrchestrationAllGroupsEnabled()))
       && (!conversationConfig.groupPrivacyEnforced || source.chat_type === "p2p")
       && taskPolicy(origin.senderId) === origin.policy && isTrustedLarkSender(origin.senderId) === origin.trusted);
   };
@@ -1378,12 +1380,16 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   const ownerMessageSettings = () => ({ ownerMessageFastPathEnabled: store.setting("ownerMessageFastPathEnabled", "false") === "true", ownerMessageFastPathOwnerId: store.setting("ownerMessageFastPathOwnerId", "") });
   const ownerAssistSettings = () => ({ ownerMentionAssistEnabled: pluginHost.enabled("owner-assist") && store.setting("ownerMentionAssistEnabled", "false") === "true", ownerMentionAssistOwnerId: store.setting("ownerMentionAssistOwnerId", ""), ownerMentionAssistBotIds: configuredOwnerMentionAssistBotIds() });
   const executionSettings = () => ({ workspaceRoot, trustedExecutionEnabled: configuredTrustedExecutionEnabled() });
-  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...ownerAssistSettings(), ...executionSettings(), topicNativeModeEnabled: topicNativeModeEnabled() });
+  const allSettings = () => ({ ...runtimeSettings(), ...autoApprovalSettings(), ...ownerMessageSettings(), ...ownerAssistSettings(),
+    ...executionSettings(), topicNativeModeEnabled: topicNativeModeEnabled(),
+    taskOrchestrationEnabled: Boolean(taskOrchestration), taskOrchestrationAllGroupsEnabled: taskOrchestrationAllGroupsEnabled() });
   app.get("/v1/settings", async () => allSettings());
   app.patch("/v1/settings", async (request, reply) => {
     let payload: RuntimeSettingsPatch;
     try { payload = parseRuntimeSettingsPatch(request.body); }
     catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+    if (payload.taskOrchestrationAllGroupsEnabled !== undefined && (!config.runtimeToken || !authenticated(request)))
+      return reply.code(401).send({ error: "Runtime token required for task orchestration settings" });
     if ((payload.ownerMentionAssistEnabled !== undefined || payload.ownerMentionAssistOwnerId !== undefined || payload.ownerMentionAssistBotIds !== undefined) && (!config.runtimeToken || !authenticated(request))) return reply.code(401).send({ error: "Runtime token required for owner assistance settings" });
     const nextApproverId = payload.approverId ?? approverId ?? "";
     const nextTrustedSenderIds = payload.trustedSenderIds ?? [...trustedSenderIds];

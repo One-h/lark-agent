@@ -357,6 +357,7 @@ test("delegation MCP uses the source identity and does not start before the orig
   const runtime = createRuntime({ databasePath: path.join(root, "test.sqlite"), mode: "active", workspaceRoot: root,
     trustedSenderIds: ["ou_owner"], approverId: "ou_owner", runtimeToken: "fixture-host-token",
     executionEngines: [engine], taskOrchestrationEnabled: true,
+    taskOrchestrationChatIds: ["oc_other"],
     taskEngineHost: { supports: id => id === "claude", async call<T>(request: Record<string, unknown>) {
       if (request.method === "status") return { generation: "fixture-gen", workspace: root,
         engines: [{ id: "claude", models: [], restricted: true, trusted: true }] } as T;
@@ -388,6 +389,20 @@ test("delegation MCP uses the source identity and does not start before the orig
     assert.match(taskTool.description, /用户指定执行引擎或要求不下派时，按用户要求处理/);
     const payload = { tool: "lark_task_orchestration", contextToken: token,
       input: { action: "dispatch", goal: "Research the fixture", worker: { engine: "claude" } } };
+    const list = () => runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call", headers,
+      payload: { ...payload, input: { action: "list" } } });
+    const switchAllGroups = (enabled: boolean, authHeaders = auth) => runtime.app.inject({ method: "PATCH",
+      url: "/v1/settings", headers: authHeaders, payload: { taskOrchestrationAllGroupsEnabled: enabled } });
+    const settings = (await runtime.app.inject("/v1/settings")).json();
+    assert.equal(settings.taskOrchestrationEnabled, true);
+    assert.equal(settings.taskOrchestrationAllGroupsEnabled, false);
+    assert.equal((await list()).statusCode, 409);
+    assert.equal((await switchAllGroups(true, headers)).statusCode, 401);
+    assert.equal((await switchAllGroups(true)).json().taskOrchestrationAllGroupsEnabled, true);
+    assert.equal((await list()).statusCode, 200);
+    config.groupPrivacyEnforced = true;
+    try { assert.equal((await list()).statusCode, 409); }
+    finally { config.groupPrivacyEnforced = false; }
     const call = runtime.app.inject({ method: "POST", url: "/v1/internal/mcp/tools/call", headers, payload });
     const approval = await waitFor(() => cards[0]);
     runtime.tickPlugins();
@@ -399,6 +414,8 @@ test("delegation MCP uses the source identity and does not start before the orig
     assert.equal(cards.length, 1);
     assert.equal(starts.length, 1);
     assert.equal((starts[0] as { trusted?: boolean }).trusted, false);
+    assert.equal((await switchAllGroups(false)).json().taskOrchestrationAllGroupsEnabled, false);
+    assert.equal((await list()).statusCode, 409);
   } finally { finish(); await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
