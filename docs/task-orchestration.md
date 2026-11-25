@@ -19,3 +19,7 @@ The optional task-orchestration plugin adds an authenticated `lark_task_orchestr
 - **Recovery and posting:** the runtime reattaches by the original host generation and dispatch ID. An uncertain start or input is not replayed. A started reply without a receipt is checked by exact Feishu readback rather than resent. Group privacy and source identity are checked before dispatch and posting. Review state and delivery are separate.
 
 Use the task tool's list action to obtain the current revision before a write. Concurrent changes, stale approval and old review callbacks are fenced by their versions. An old command with the same input can be read back without submitting it again.
+
+## Operator Readback
+
+Forge's local task workspace uses authenticated, read-only endpoints under `/v1/orchestration-tasks`. Source message filters use the local inbound message ID. The detail separates the latest Worker execution, the saved result and its review, and the result delivery receipts. An admission notice is not a result receipt, and a started send without a receipt is unconfirmed. A file download returns only the checksum-verified bytes frozen for the current result, never a file from the work directory. These endpoints do not expose the runtime token to the browser and are not added to the task MCP catalog.

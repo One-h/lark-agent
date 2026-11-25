@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
+import Fastify from "fastify";
 import { TaskOrchestration, type TaskEngineHost, type TaskOrigin } from "./taskOrchestration.js";
 import { TaskArtifacts } from "./taskArtifacts.js";
+import { registerTaskOrchestrationReadRoutes } from "./taskOrchestrationReadRoutes.js";
 
 const engines = ["codex", "claude", "dsh", "opencode", "agy"];
 const origin: TaskOrigin = { messageId: 1, chatId: "chat", senderId: "requester", trusted: true, policy: "policy" };
@@ -89,6 +91,62 @@ function fixture(t: { after(fn: () => void): void }, options: { concurrent?: boo
 const dispatch = { action: "dispatch", goal: "Research three approaches", worker: { engine: "codex" } };
 const approved = async () => "approved" as const;
 const tick = async (f: ReturnType<typeof fixture>, n = 1) => { for (let i = 0; i < n; i++) await f.service.tick(); };
+
+test("operator task reads separate execution, review and verified delivery for the exact result", async t => {
+  const f = fixture(t, { artifacts: true });
+  f.db.exec(`CREATE TABLE lark_messages (id INTEGER PRIMARY KEY, chat_type TEXT, received_at TEXT);
+    CREATE TABLE contacts (open_id TEXT PRIMARY KEY, name TEXT);
+    INSERT INTO lark_messages VALUES(1,'group','2026-01-01T00:00:00Z');
+    INSERT INTO contacts VALUES('requester','Fixture Requester');`);
+  const app = Fastify();
+  t.after(() => app.close());
+  const headers = { authorization: "Bearer test-runtime-token" };
+  registerTaskOrchestrationReadRoutes(app, f.db, request => request.headers.authorization === headers.authorization);
+  const base = "/v1/orchestration-tasks";
+  assert.equal((await app.inject(base)).statusCode, 401);
+  assert.equal((await app.inject({ url: `${base}?messageId=0`, headers })).statusCode, 400);
+  const issued = await f.service.command(origin, { ...dispatch, reviewer: { engine: "claude", criteria: "verify sources" } }, approved);
+  const url = `${base}/${taskId(issued)}`;
+  const read = async (path: string) => {
+    const response = await app.inject({ url: path, headers });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.headers["cache-control"], "no-store");
+    return response.json();
+  };
+  assert.deepEqual((await read(`${base}?messageId=2`)).items, []);
+  assert.deepEqual((await read(`${base}?messageId=1&status=queued`)).items[0], {
+    id: taskId(issued), messageId: 1, status: "queued", chatType: "group", requestedAt: "2026-01-01T00:00:00Z",
+    requesterName: "Fixture Requester", goal: dispatch.goal, worker: { engine: "codex" }
+  });
+  await tick(f);
+  const resultId = String(f.starts[0].id);
+  writeFileSync(path.join(f.artifacts.workerDirectory(resultId), "totals.csv"), "name,total\nA,2\n");
+  f.finish(0, "Result: deliver\nResearch report\nArtifact: file totals.csv");
+  await tick(f);
+  const awaiting = await read(url);
+  assert.equal(awaiting.execution.state, "completed");
+  assert.equal(awaiting.review.pending, true);
+  assert.equal(awaiting.review.decision, null);
+  assert.deepEqual(awaiting.delivery, []);
+
+  f.finish(1, "Verdict: pass\nSources verified.");
+  await tick(f, 3);
+  f.db.prepare("UPDATE lark_orchestration_outbox SET state='sending',receipt=NULL WHERE artifact_id=?").run(resultId);
+  const verified = await read(url);
+  assert.equal(verified.review.decision.verdict, "pass");
+  assert.equal(verified.result.text, "Research report");
+  assert.deepEqual(verified.delivery.map((row: { state: string; receipt: string | null }) => [row.state, row.receipt]),
+    [["sending", null], ["sent", "om_delivery"]]);
+  assert.equal(verified.result.artifacts[0].name, "totals.csv");
+  const downloadUrl = `${url}/results/${resultId}/files/${verified.result.artifacts[0].id}`;
+  const download = await app.inject({ url: downloadUrl, headers });
+  assert.equal(download.headers["content-disposition"], 'attachment; filename="totals.csv"');
+  assert.equal(download.body, "name,total\nA,2\n");
+  assert.equal((await app.inject({ url: `${downloadUrl}9`, headers })).statusCode, 404);
+  assert.equal((await app.inject({ method: "POST", url, headers })).statusCode, 404);
+  f.db.prepare("UPDATE lark_orchestration_tasks SET review_revision=review_revision+1,status='awaiting_review' WHERE id=?").run(taskId(issued));
+  assert.equal((await read(url)).review.decision, null);
+});
 const taskId = (value: unknown) => (value as { taskId: string }).taskId;
 
 test("blocked admission cannot start; duplicates share the same task and do not reapprove", async t => {

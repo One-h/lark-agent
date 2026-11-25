@@ -42,6 +42,7 @@ import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNa
   approvalStatusToolName, readLarkMcpApprovalStatus, wholeTurnScope } from "@lark-agent/conversation-runtime";
 import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
 import { TaskOrchestration, taskCommand, taskInputSchema, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
+import { registerTaskOrchestrationReadRoutes } from "./plugins/taskOrchestrationReadRoutes.js";
 import { TaskArtifacts } from "./plugins/taskArtifacts.js";
 import { RetainedExecutionClient } from "@lark-agent/conversation-runtime";
 import { codexForegroundMcpBearer, confirmRetainedLarkMcpTurn, getCodexSocketMcpToolContext, hasRetainedLarkForegroundBinding, larkTaskDispatchGuidance,
@@ -309,6 +310,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     report: () => app.log.warn("lark_task_orchestration_operation_unconfirmed")
   }));
   if (taskOrchestration) {
+    registerTaskOrchestrationReadRoutes(app, store.db, pluginApiAuthorized);
     pluginHost.own(() => taskOrchestration.close());
     pluginHost.maintenance("task-orchestration", () => taskOrchestration.tick());
   }
