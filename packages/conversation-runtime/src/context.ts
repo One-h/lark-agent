@@ -52,8 +52,9 @@ export type LarkProgressSender = typeof sendLarkProgressCard;
 export type LarkProgressUpdater = typeof updateLarkProgressCard;
 export let larkProgressSender: LarkProgressSender = sendLarkProgressCard;
 export let larkProgressUpdater: LarkProgressUpdater = updateLarkProgressCard;
+export let larkWorkerOwnsReply = (_messageId: number, _turnId: string): boolean => false;
 
-export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; mcpToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender; groupPrivacyEnforced?: boolean; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater }): void {
+export function configureConversationRuntime(input: { database: Database.Database; mode?: "shadow" | "active"; larkStickerDirectory: string; repoRoot: string; workspaceRoot?: string; taskOutputDir?: string; approverId?: string; trustedSenderIds?: string[]; model?: string; runtimeUrl?: string; runtimeToken?: string; mcpToken?: string; textReplySender?: LarkTextReplySender; mediaReplySender?: typeof sendLarkMediaReply; reactionSender?: LarkReactionSender; groupPrivacyEnforced?: boolean; progressSender?: LarkProgressSender; progressUpdater?: LarkProgressUpdater; workerOwnsReply?: typeof larkWorkerOwnsReply }): void {
   db = input.database;
   config.groupPrivacyEnforced = input.groupPrivacyEnforced ?? false;
   config.runtimeMode = input.mode ?? "shadow";
@@ -72,6 +73,7 @@ export function configureConversationRuntime(input: { database: Database.Databas
   larkReactionSender = input.reactionSender ?? sendLarkReaction;
   larkProgressSender = input.progressSender ?? sendLarkProgressCard;
   larkProgressUpdater = input.progressUpdater ?? updateLarkProgressCard;
+  larkWorkerOwnsReply = input.workerOwnsReply ?? (() => false);
 }
 
 export function recordOutboundLarkMessage(input: { messageId: string; chatId: string | null; chatType: string | null; recipientId: string | null; content: string; replyToMessageId: string | null; messageAt?: string | null; messageType?: string | null; source: "reply" | "proactive" }): number | null {

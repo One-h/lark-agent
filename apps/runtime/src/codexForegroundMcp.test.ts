@@ -33,6 +33,9 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
   const threadId = "fixture-thread";
   const item = { id: "fixture-answer", type: "agentMessage", phase: "final_answer", text: "Fixture finished." };
   let turn = "", nativeActive = false;
+  const sentTexts: string[] = [];
+  const progressEntries: string[][] = [];
+  let workerStarts = 0;
   const tokens: string[] = [];
   ws.on("connection", peer => peer.on("message", data => {
     const rpc = JSON.parse(data.toString());
@@ -61,9 +64,26 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
     databasePath: path.join(root, "test.sqlite"), workspaceRoot: root, mode: "active", codexSocket, port,
     trustedSenderIds: ["ou_fixture"], runtimeToken, taskOrchestrationEnabled: enabled,
     taskOrchestrationChatIds: ["oc_fixture"],
-    taskEngineHost: { supports: () => false, async call() { throw new Error("No task should be dispatched"); } },
+    taskEngineHost: { supports: engine => engine === "dsh", async call<T>(request: Record<string, unknown>) {
+      switch (request.method) {
+        case "status": return { generation: "fixture", workspace: root, engines: [{ id: "dsh", models: [], trusted: true, restricted: false }] } as T;
+        case "start": workerStarts++; return {} as T;
+        case "attach": return { engineId: "dsh", approvals: [], status: { state: "finished", sessionId: "worker-fixture",
+          result: { status: "completed", text: "Result: deliver\nOnly the Worker result." } } } as T;
+        case "acknowledge": return { acknowledged: true } as T;
+        default: throw new Error("Unexpected task host request");
+      }
+    } },
     reactionSender: () => ({ ok: true }),
-    textReplySender: () => ({ ok: true, messageId: "om_fixture_reply", chatId: "oc_fixture", messageAt: null, messageType: "text" })
+    progressSender: async (_id, progress) => {
+      progressEntries.push(progress.entries.map(entry => entry.text));
+      return { ok: true, messageId: "om_fixture_progress", chatId: "oc_fixture", messageAt: null, messageType: "interactive" };
+    },
+    progressUpdater: async (_id, progress) => { progressEntries.push(progress.entries.map(entry => entry.text)); return { ok: true }; },
+    textReplySender: (_id, text) => {
+      sentTexts.push(text);
+      return { ok: true, messageId: `om_fixture_reply_${sentTexts.length}`, chatId: "oc_fixture", messageAt: null, messageType: "text" };
+    }
   });
   let runtime = setup(false);
   const mcp = new Client({ name: "foreground-codex-fixture", version: "1" });
@@ -100,6 +120,8 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
 
     runtime = setup(true, port);
     await runtime.app.listen({ host: "127.0.0.1", port });
+    assert.equal((await runtime.app.inject({ method: "PATCH", url: "/v1/settings",
+      headers: { authorization: "Bearer " + runtimeToken }, payload: { trustedExecutionEnabled: true } })).statusCode, 200);
     assert((await mcp.listTools()).tools.some(t => t.name === "lark_task_orchestration"));
     const newToken = await request(101, "oc_unlisted");
     assert.notEqual(newToken, oldToken);
@@ -121,6 +143,25 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
       headers: { authorization: "Bearer " + bearer }, payload: { tool: "lark_task_orchestration", contextToken: newToken,
         threadId, turnId: turn, input: { action: "list" } } })).statusCode, 403);
     assert.equal(runtime.store.db.prepare("SELECT count(*) FROM lark_orchestration_tasks").pluck().get(), 0);
+
+    await switchGlobal(true);
+    sentTexts.length = 0;
+    const handedOff = await call("lark_task_orchestration", newToken, { action: "dispatch", goal: "Answer the full request",
+      worker: { engine: "dsh" }, delivery: "worker_only" });
+    assert.notEqual(handedOff.isError, true, JSON.stringify(handedOff.content));
+    assert.match(JSON.stringify(handedOff.content), /approved/);
+    assert.equal(runtime.store.db.prepare("SELECT count(*) FROM lark_orchestration_outbox").pluck().get(), 0);
+    nativeActive = false;
+    for (const peer of ws.clients) {
+      peer.send(JSON.stringify({ method: "item/completed", params: { threadId, turnId: turn, item } }));
+      peer.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: turn, status: "completed", items: [item] } } }));
+    }
+    await until(() => runtime.store.db.prepare("SELECT codex_dispatch_phase FROM lark_messages WHERE id=101").pluck().get() === "finalized");
+    await until(() => { runtime.tickPlugins(); return sentTexts.length > 0; });
+    assert.equal(workerStarts, 1);
+    assert.deepEqual(sentTexts, ["Only the Worker result."]);
+    assert.ok(progressEntries.some(entries => entries.includes("已派给 DSH")));
+    assert.equal(runtime.store.db.prepare("SELECT count(*) FROM lark_orchestration_outbox WHERE state='sent' AND receipt IS NOT NULL").pluck().get(), 1);
   } finally {
     await mcp.close();
     await closeRuntime();

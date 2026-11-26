@@ -92,6 +92,27 @@ const dispatch = { action: "dispatch", goal: "Research three approaches", worker
 const approved = async () => "approved" as const;
 const tick = async (f: ReturnType<typeof fixture>, n = 1) => { for (let i = 0; i < n; i++) await f.service.tick(); };
 
+test("worker-only ownership cannot outlive the source turn or a failed admission", async t => {
+  const f = fixture(t);
+  const handoff = { ...dispatch, delivery: "worker_only" };
+  const request = { ...origin, turnId: "foreground" };
+  await assert.rejects(f.service.command(origin, handoff, approved), /bound foreground turn/);
+  let release!: (decision: "approved") => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const pending = f.service.command(request, handoff, () => new Promise(resolve => { release = resolve; entered(); }));
+  await waiting;
+  assert.equal(f.service.ownsForegroundReply(1, "foreground"), false);
+  release("approved");
+  await pending;
+  f.restart();
+  assert.equal(f.service.ownsForegroundReply(1, "foreground"), true);
+  assert.equal(f.service.ownsForegroundReply(1, "new-turn"), false);
+  assert.equal(f.service.ownsForegroundReply(2, "foreground"), false);
+  await f.service.command({ ...request, messageId: 2, turnId: "denied" }, handoff, async () => "rejected");
+  assert.equal(f.service.ownsForegroundReply(2, "denied"), false);
+});
+
 test("operator task reads separate execution, review and verified delivery for the exact result", async t => {
   const f = fixture(t, { artifacts: true });
   f.db.exec(`CREATE TABLE lark_messages (id INTEGER PRIMARY KEY, chat_type TEXT, received_at TEXT);

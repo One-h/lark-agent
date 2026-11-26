@@ -40,7 +40,7 @@ import { externalExecutionForMessage, loadTopicExecutionSession, recordTopicExec
 import { isLarkModelCapacityError, larkCapacityRetryDelayMs } from "./capacityRecovery.js";
 import { isNativeThreadArchived, isNativeThreadLoaded, isNativeThreadMissingError, nativeThreadArchiveSafety, nativeThreadNeedsUnarchive } from "./nativeThreadState.js";
 import { captureLarkExecutionConfig, recordLarkExecutionConfig, type LarkExecutionConfig } from "./executionConfig.js";
-import { conversationCodexModelSettings } from "./context.js";
+import { conversationCodexModelSettings, larkWorkerOwnsReply } from "./context.js";
 import { readNativeTurnState } from "./nativeTurnState.js";
 import { queueLarkCompletionReactions, retryPendingLarkCompletionReactions } from "./completionReactions.js";
 import { quarantineLarkExecution, readCompleteTurnItems, reconcileInterruptedNativeTurns, reconcileLarkCrash, uncertainDelivery } from "./crashRecovery.js";
@@ -2292,7 +2292,12 @@ function finishRun(
 
   const target = responseRunMember(run);
   const approvalOutcome = run.approvalOutcomeReplies.get(target.row.id) ?? null;
-  let finalAnswer = answer;
+  const delegated = larkWorkerOwnsReply(target.row.id, run.turnId);
+  if (delegated) {
+    sendReply = false;
+    run.memberReplies.delete(target.row.id);
+  }
+  let finalAnswer = delegated ? null : answer;
   if (target.row.reply_trigger === "owner_mention" && isLarkNoReplyDecision(answer) && ownerAssistRow(target.row.id)?.decision === "handle") {
     deferOwnerAssistDelivery(target.row.id,"模型最终选择不公开回复，已保留准备好的草稿，请确认是否需要补充。");
   }
@@ -2372,17 +2377,21 @@ function finishRun(
       reply = run.memberReplies.get(target.row.id) ?? run.sentReplies.get(target.row.id) ?? null;
     }
     const artifacts = updateRunMembers(run, finalStatus, finalError);
+    if (delegated) db.prepare("UPDATE lark_messages SET reply_status='skipped',reply_error=NULL WHERE id=? AND reply_status='pending' AND reply_delivery_key IS NULL")
+      .run(target.row.id);
     if (sendReply && ["answered", "no_reply"].includes(finalStatus) && run.approvalOutcomeReplies.size === 0 && ownerAssistPublicAllowed(target.row.id)) {
       queueLarkCompletionReactions([...run.members.values()].filter(p => !otherDeliveryIds.has(p)).map(p => ({ id: p.row.id, messageId: p.messageId })),
         run.turnId, target.row.id, finalTextKey ?? run.sentReplyKeys.get(target.row.id), mediaDeliveryIds, true);
       for (const [member, ids] of otherDeliveryIds) queueLarkCompletionReactions([{ id: member.row.id, messageId: member.messageId }], run.turnId, member.row.id, undefined, ids, true);
     }
-    for (const prepared of run.members.values()) recordExecutionReceipt(prepared.row.id, run.turnId);
+    for (const prepared of run.members.values()) {
+      if (!larkWorkerOwnsReply(prepared.row.id, run.turnId)) recordExecutionReceipt(prepared.row.id, run.turnId);
+    }
     return artifacts;
   })();
   writeArtifacts();
   publishLarkTurnObservation(db, { kind: "turn.finished", runId: run.progressId, turnId: run.turnId,
-    threadId: run.threadId, sourceMessageId: target.row.id, outcome: !sendReply ? "interrupted" : finalStatus === "failed"
+    threadId: run.threadId, sourceMessageId: target.row.id, outcome: delegated ? "completed" : !sendReply ? "interrupted" : finalStatus === "failed"
       ? /interrupt|cancel|aborted/i.test(finalError ?? "") ? "cancelled" : "failed" : "completed" });
   if (sendReply) deliverStagedLarkReply(textMessageId, [...mediaDeliveryIds, ...[...otherDeliveryIds.values()].flat()]);
   if (sendReply) for (const member of run.members.values()) markAttachmentOnlyReplyDelivered(member.row.id);
@@ -2599,8 +2608,9 @@ export function larkFinalTextDeliveryDecision(input: {
 }
 
 function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
-  if (run.settled || !ownerAssistMayExecute(responseRunMember(run).row.id) || !shouldSendLarkInterimReply({ enabled: getAppSettings().larkCodexInterimRepliesEnabled,
-    elapsedMs: Date.now() - run.startedMs, hasStartedSubstantiveWork: run.hasStartedSubstantiveWork })) return;
+  const target = responseRunMember(run);
+  if (run.settled || !ownerAssistMayExecute(target.row.id) || !shouldSendLarkInterimReply({ enabled: getAppSettings().larkCodexInterimRepliesEnabled,
+    elapsedMs: Date.now() - run.startedMs, hasStartedSubstantiveWork: run.hasStartedSubstantiveWork }) || larkWorkerOwnsReply(target.row.id, run.turnId)) return;
   const candidate = run.pendingInterim ?? { id: "work-started", text: "已开始执行，等待结果。" };
   if (
     run.sentInterimEventIds.has(candidate.id)
@@ -2616,7 +2626,6 @@ function maybeSendInterimReply(run: ActiveLarkCodexRun): void {
   }
   run.sentInterimEventIds.add(candidate.id);
   const reply = sanitizeLarkCodexReply(candidate.text, run.trustedSender);
-  const target = responseRunMember(run);
   if (
     isLarkBotSender(target.row)
     ||
@@ -5019,7 +5028,11 @@ export function cancelExternalTopicTurns(chatId: string, threadId: string): numb
 }
 
 function stageExternalTopicMessage(message: LarkMessageRow, status: "answered" | "failed" | "no_reply", text: string, error?: string,
-  final?: { turnId: string; trusted: boolean; selectedSticker?: string }): (() => void) | undefined {
+  final?: { turnId: string; trusted: boolean; selectedSticker?: string }, turnId = final?.turnId ?? message.codex_turn_id): (() => void) | undefined {
+  if (turnId && larkWorkerOwnsReply(message.id, turnId)) {
+    text = "";
+    if (status !== "failed") status = "no_reply";
+  }
   updateCodexState(message.id, { status, reply: text || null, error, finishedAt: nowIso() });
   db.prepare("UPDATE lark_messages SET codex_dispatch_phase='finalized' WHERE id=?").run(message.id);
   if (!text) {
@@ -5239,7 +5252,7 @@ async function dispatchExternalMessage(message: LarkMessageRow, route: ExternalE
         : undefined;
       const deliveries = db.transaction(() => [...run.members.values()].map(member =>
         stageExternalTopicMessage(member, status, member.id === message.id ? reply : "", cancelled ? "External engine turn cancelled" : result ? undefined : "External engine outcome unknown",
-          status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined)))();
+          status === "answered" ? { turnId: progressId, trusted, selectedSticker: member.id === message.id ? selectedSticker : undefined } : undefined, progressId)))();
       publishLarkTurnObservation(db, { kind: "turn.finished", runId: progressId, turnId: progressId, threadId: session.id,
         sourceMessageId: message.id, outcome: cancelled ? "cancelled" : result ? "completed" : "failed" });
       for (const deliver of deliveries) deliver?.();
@@ -5370,6 +5383,7 @@ const safeRecoveryItems = new Set(["userMessage", "agentMessage", "reasoning", "
 
 function restoreInterruptedNativeReply(row: { id: number; threadId: string; turnId: string }, status: string,
   items: Record<string, unknown>[]): boolean {
+  if (larkWorkerOwnsReply(row.id, row.turnId)) return false;
   const message = canDispatchLarkReply(row.id);
   if (!message || message.message_type !== "text" || !["mention", "p2p", "topic"].includes(message.reply_trigger)
     || message.codex_dispatch_context !== dispatchContext(message) || message.reply_delivery_key !== null

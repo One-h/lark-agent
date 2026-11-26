@@ -13,6 +13,7 @@ const resourceList = z.array(z.string().trim().min(1).max(500)).max(12).default(
 const versioned = { taskId: z.uuid(), expectedRevision: z.number().int().positive() };
 export const taskCommand = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("dispatch"), goal: z.string().trim().min(1).max(6000), worker: route,
+    delivery: z.literal("worker_only").optional(),
     reviewer: reviewer.optional(), constraints: resourceList, deliverables: resourceList, resources: resourceList,
     workspace: z.string().trim().min(1).max(1024).optional(), allowReworkOnce: z.boolean().default(false) }),
   z.strictObject({ action: z.literal("list") }),
@@ -27,8 +28,8 @@ export const taskCommand = z.discriminatedUnion("action", [
 export const taskInputSchema = z.toJSONSchema(taskCommand);
 export type TaskCommand = z.infer<typeof taskCommand>;
 type Dispatch = Extract<TaskCommand, { action: "dispatch" }>;
-type Contract = Dispatch & { additions?: string[] };
-export type TaskOrigin = { messageId: number; chatId: string; threadId?: string | null; senderId: string; trusted: boolean; policy: string };
+type Contract = Dispatch & { additions?: string[]; handoffTurnId?: string };
+export type TaskOrigin = { messageId: number; chatId: string; threadId?: string | null; senderId: string; trusted: boolean; policy: string; turnId?: string };
 type Route = { engine: string; model?: string };
 type Job = {
   id: string; task_id: string; source_id: number; kind: "worker" | "reviewer"; route: string;
@@ -221,6 +222,13 @@ export class TaskOrchestration {
   }
 
   private spec(task: Task): Contract { return JSON.parse(task.spec) as Contract; }
+
+  ownsForegroundReply(messageId: number, turnId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM lark_orchestration_tasks t JOIN lark_orchestration_commands c
+      ON c.task_id=t.id AND c.source_id=t.message_id AND c.action='dispatch' AND c.status='approved'
+      WHERE t.message_id=? AND json_extract(t.spec,'$.delivery')='worker_only' AND json_extract(t.spec,'$.handoffTurnId')=?`)
+      .get(messageId, turnId));
+  }
   private sameOwner(task: Task, origin: TaskOrigin): boolean {
     return task.chat_id === origin.chatId && task.sender_id === origin.senderId && task.policy === origin.policy
       && (task.thread_id === null || task.thread_id === (origin.threadId ?? null));
@@ -244,6 +252,8 @@ export class TaskOrchestration {
     this.lifetime.signal.throwIfAborted();
     if (!this.options.allows(origin, "execute")) throw new Error("Task orchestration is unavailable for this conversation");
     const request = taskCommand.parse(raw);
+    if (request.action === "dispatch" && request.delivery === "worker_only" && (!origin.turnId || request.reviewer))
+      throw new Error("Worker-only delivery needs a bound foreground turn and no separate review");
     if (request.action === "list") {
       if (!await beforeCommit()) throw new Error("The original task request is no longer active");
       const rows = this.db.prepare("SELECT id,status,current_result AS resultId,task_revision AS revision,contract_revision AS contractRevision,"
@@ -273,7 +283,8 @@ export class TaskOrchestration {
         const id = randomUUID();
         this.db.prepare("INSERT INTO lark_orchestration_tasks(id,message_id,chat_id,sender_id,trusted,policy,spec,status,thread_id)"
           + " VALUES(?,?,?,?,?,?,?,'authorizing',?)").run(id, origin.messageId, origin.chatId, origin.senderId,
-          Number(origin.trusted), origin.policy, JSON.stringify(request), origin.threadId ?? null);
+          Number(origin.trusted), origin.policy, JSON.stringify({ ...request,
+            ...(request.delivery === "worker_only" ? { handoffTurnId: origin.turnId } : {}) }), origin.threadId ?? null);
         task = this.task(id);
       }
       const hash = digest(JSON.stringify(request));
@@ -339,7 +350,7 @@ export class TaskOrchestration {
       if (authorization === "approved") {
         if (request.action === "dispatch") {
           this.storeContract(task, spec, origin.messageId, false);
-          if (this.options.admissionNotice) this.notify("admission:" + task.id, task.id, "已接单 · 任务 " + task.id);
+          if (this.options.admissionNotice && spec.delivery !== "worker_only") this.notify("admission:" + task.id, task.id, "已接单 · 任务 " + task.id);
         } else this.db.prepare("UPDATE lark_orchestration_tasks SET task_revision=task_revision+1 WHERE id=?").run(task.id);
         if (request.action === "amend_review") {
           this.storeContract(task, { ...spec, reviewer: request.reviewer ?? undefined }, origin.messageId, true);
@@ -546,8 +557,9 @@ export class TaskOrchestration {
       const current = this.task(task.id);
       if (this.spec(current).reviewer && output.label === "deliver" && (output.body || artifacts.length)
         && this.options.allows(taskOrigin(task), "execute")) this.queueReview(current, job.source_id, job.id, output.body);
-      else if (visible && (output.body || artifacts.length))
-        this.publishResult(job.id, task, job.id, "任务 " + task.id + "\n" + output.body);
+      else if (visible && (output.body || artifacts.length || this.spec(current).delivery === "worker_only"))
+        this.publishResult(job.id, task, job.id, this.spec(current).delivery === "worker_only"
+          ? output.body || (artifacts.length ? "" : "Worker 未返回可交付的结果。") : "任务 " + task.id + "\n" + output.body);
     })();
   }
 

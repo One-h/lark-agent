@@ -21,6 +21,18 @@ function row(database: Database.Database, id: string) { return database.prepare(
 function textOf(entries: LarkProgressEntry[], state: LarkProgressState) { return `[任务进度 · ${state}]\n${entries.map(e => e.text).join("\n")}`; }
 
 type ProgressSource = Pick<LarkMessageRow, "id" | "message_id" | "sender_type" | "chat_type">;
+const handoffKey = "worker-handoff";
+const engineLabels: Record<string, string> = { codex: "Codex", claude: "Claude", dsh: "DSH", opencode: "OpenCode", agy: "AGY" };
+
+export function queueLarkWorkerHandoffProgress(messageId: number, turnId: string, engine: string): boolean {
+  const source = db.prepare(`SELECT m.id,m.message_id,m.sender_type,m.chat_type,COALESCE(e.session_id,m.codex_session_id) AS session_id
+    FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id
+    WHERE m.id=? AND COALESCE(e.turn_id,m.codex_turn_id)=?`).get(messageId, turnId) as (ProgressSource & { session_id?: string }) | undefined;
+  const existing = db.prepare("SELECT progress_id,thread_id FROM lark_progress_cards WHERE native_turn_id=? LIMIT 1")
+    .get(turnId) as Pick<ProgressRow, "progress_id" | "thread_id"> | undefined;
+  return source ? queueLarkProgressUpdate({ progressId: existing?.progress_id ?? turnId, turnId,
+    threadId: existing?.thread_id ?? source.session_id ?? turnId, source, eventId: handoffKey, text: `已派给 ${engineLabels[engine] ?? engine}` }) : false;
+}
 
 export function observeLarkProgressCards(database: Database.Database): () => void {
   subscriptions.get(database)?.close();
@@ -56,10 +68,12 @@ export function queueLarkProgressUpdate(input: { progressId: string; turnId: str
   if (entries.some(e => e.id === input.eventId || e.text === text)) return false;
   const now = nowIso();
   entries.push({ id: input.eventId, text, at: now });
+  const handoff = entries.find(entry => entry.id === handoffKey);
+  const shown = handoff ? [...entries.filter(entry => entry.id !== handoffKey).slice(-4), handoff] : entries.slice(-5);
   db.prepare(`INSERT INTO lark_progress_cards(progress_id,native_turn_id,thread_id,lark_message_id,message_id,entries_json,next_attempt_at,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(progress_id) DO UPDATE SET native_turn_id=excluded.native_turn_id,thread_id=excluded.thread_id,
     entries_json=excluded.entries_json,version=version+1,pending=1,updated_at=excluded.updated_at`).run(input.progressId, input.turnId, input.threadId,
-    input.source.id, input.source.message_id, JSON.stringify(entries.slice(-5)), now, now, now);
+    input.source.id, input.source.message_id, JSON.stringify(shown), now, now, now);
   void retryPendingLarkProgressCards();
   return true;
   } catch { console.warn("lark_progress_store_failed"); return false; }
@@ -96,12 +110,16 @@ async function deliver(database: Database.Database, id: string): Promise<void> {
       continue;
     }
     if (current.state === "running" && (config.groupPrivacyEnforced && source.chat_type !== "p2p" || !getAppSettings().larkCodexInterimRepliesEnabled)) return;
-    if (!current.card_message_id && !current.create_attempted && current.state !== "running") {
+    const entries = JSON.parse(current.entries_json) as LarkProgressEntry[];
+    const handoff = entries.some(entry => entry.id === handoffKey);
+    if (!current.card_message_id && !current.create_attempted && current.state !== "running"
+      && (!handoff || source.execution_turn_id !== current.native_turn_id
+        || config.groupPrivacyEnforced && source.chat_type !== "p2p" || !getAppSettings().larkCodexInterimRepliesEnabled)) {
       database.prepare("UPDATE lark_progress_cards SET pending=0,delivered_version=version WHERE progress_id=?").run(id);
       return;
     }
     try {
-      const content: LarkProgressContent = { state: current.state, entries: JSON.parse(current.entries_json) };
+      const content: LarkProgressContent = { state: current.state, entries };
       let cardId = current.card_message_id;
       if (!cardId) {
         database.prepare("UPDATE lark_progress_cards SET create_attempted=1 WHERE progress_id=?").run(id);

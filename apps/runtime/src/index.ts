@@ -1,6 +1,7 @@
 import { GroupPrivacy, registerGroupPrivacyRoutes } from "./groupPrivacy.js";
 import { groupQuestionTarget, type AgentMessaging } from "./agentMessaging.js";
 import { setExternalMessageHandler } from "@lark-agent/conversation-runtime";
+import { queueLarkWorkerHandoffProgress } from "@lark-agent/conversation-runtime";
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { createHash } from "node:crypto";
 import { randomBytes } from "node:crypto";
@@ -206,7 +207,8 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   const trustedSenderIds = new Set(initialTrustedSenderIds);
   if (!storedTrusted) store.setSetting("trustedSenderIds", JSON.stringify([...trustedSenderIds]));
   if (!storedApprover && approverId) store.setSetting("approverId", approverId);
-  configureConversationRuntime({ database: store.db, groupPrivacyEnforced: store.setting("groupPrivacy.enabled", "false") === "true", mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, mcpToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender, progressSender: config.progressSender, progressUpdater: config.progressUpdater });
+  configureConversationRuntime({ database: store.db, groupPrivacyEnforced: store.setting("groupPrivacy.enabled", "false") === "true", mode: config.mode, larkStickerDirectory: path.join(dataDirectory, "stickers"), repoRoot: process.cwd(), workspaceRoot, taskOutputDir: path.join(dataDirectory, "tasks"), approverId, trustedSenderIds: [...trustedSenderIds], runtimeUrl, runtimeToken: attachmentRuntimeToken, mcpToken, textReplySender: config.textReplySender, reactionSender: config.reactionSender, progressSender: config.progressSender, progressUpdater: config.progressUpdater,
+    workerOwnsReply: (messageId, turnId) => taskOrchestration?.ownsForegroundReply(messageId, turnId) ?? false });
   const progress = pluginHost.mount("progress-cards", () => mountProgressCardsPlugin(store.db));
   const completion = pluginHost.mount("completion-reactions", mountCompletionReactionsPlugin);
   const stopProgressObserver = () => { progress?.stop(); };
@@ -1215,7 +1217,9 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
         "Dispatch records the goal, constraints, deliverables, resources and Worker; the existing skill controls worktree use. " +
         "Read list for the current revision before an update. Follow up with the original Worker; reserve rework for an explicit agent decision " +
         "within an unused preauthorized allowance. Only use accept or amend_review for the requester's explicit instruction. " +
-        "A dispatch receipt is sent by the runtime, so do not separately send a second receipt.",
+        "When the Worker alone will answer the user's request and there is no separate review, set delivery to worker_only. " +
+        "After admission, finish the foreground without a public answer: the progress card shows the handoff and the Worker delivers. " +
+        "For independent subtasks or reviews, omit delivery and continue your own analysis or synthesis. The runtime handles the dispatch receipt.",
       inputSchema: { type: "object", required: ["context_token", "input"], additionalProperties: false,
         properties: { context_token: { type: "string", pattern: "^[A-Za-z0-9_-]{32}$" }, input: taskInputSchema } }
     }] : [])] };
@@ -1268,7 +1272,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
           throw new Error("Task source is no longer current");
         const origin: TaskOrigin = { messageId: context.larkMessageId, senderId: source.sender_id, chatId: source.chat_id,
           threadId: source.thread_id,
-          trusted: isTrustedLarkSender(source.sender_id), policy: taskPolicy(source.sender_id) };
+          trusted: isTrustedLarkSender(source.sender_id), policy: taskPolicy(source.sender_id), turnId: context.turnId };
         const current = () => {
           const live = readCurrentContext();
           return taskAllowed(origin) && live?.larkMessageId === origin.messageId && live.turnId === context.turnId
@@ -1281,7 +1285,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
             ? await confirmRetainedLarkMcpTurn(origin.messageId, context.turnId, token)
             : await confirmTurn(origin.messageId, context.turnId)) && current();
           if (!await active()) throw new Error("The original task request is no longer active");
-          return taskOrchestration.command(origin, parsed, async intent => {
+          const result = await taskOrchestration.command(origin, parsed, async intent => {
             if (origin.trusted) return "approved";
             if (!approverId || !current()) return "failed";
             const approval = { messageId: origin.messageId, turnId: context.turnId, senderId: origin.senderId,
@@ -1300,6 +1304,11 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
             if (beforeCommit) await beforeCommit(lifetime);
             return active();
           });
+          if (parsed.action === "dispatch" && parsed.delivery === "worker_only" && taskOrchestration.ownsForegroundReply(origin.messageId, context.turnId)) {
+            try { queueLarkWorkerHandoffProgress(origin.messageId, context.turnId, parsed.worker.engine); }
+            catch { app.log.warn("lark_worker_handoff_progress_failed"); }
+          }
+          return result;
         };
         if (prepare) return { approved: await mcpApprovals.prepare(key, requestSignal, run) };
         const result = await (mcpApprovals.take(key, requestSignal) ?? run(requestSignal));
