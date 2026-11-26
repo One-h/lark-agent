@@ -78,19 +78,30 @@ export function parseLarkSentMessage(stdout: string): LarkSentMessage {
   };
 }
 
+function streamFileUploadArgs(relativePath: string): string[] {
+  return ["im", "files", "create", "--as", "bot",
+    "--data", JSON.stringify({ file_name: path.basename(relativePath), file_type: "stream" }),
+    "--file", "file=" + relativePath, "--format", "json"];
+}
+
+function uploadedFileKey(stdout: string): string | null {
+  const envelope = jsonFromCliOutput(stdout) as { ok?: boolean; identity?: string; code?: number; data?: { file_key?: unknown } } | null;
+  const key = envelope?.data?.file_key;
+  if (envelope?.ok === false || envelope?.identity && envelope.identity !== "bot" || envelope?.code && envelope.code !== 0
+    || typeof key !== "string" || !/^file_[A-Za-z0-9_-]{1,150}$/.test(key)) return null;
+  return key;
+}
+
 export async function uploadLarkReplyFile(name: string, bytes: Buffer, signal: AbortSignal): Promise<string> {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.(?:md|txt|csv|tsv|json|pdf|xlsx|ods)$/i.test(name)
     || !bytes.length || bytes.length > 4 * 1024 * 1024) throw new Error("Invalid task reply file");
   const dir = await mkdtemp(path.join(os.tmpdir(), "lark-reply-file-"));
   try {
     await writeFile(path.join(dir, name), bytes, { mode: 0o600, flag: "wx" });
-    const { stdout } = await promisify(execFile)("lark-cli", ["im", "files", "create", "--as", "bot",
-      "--data", JSON.stringify({ file_name: name, file_type: "stream" }), "--file", "file=" + name, "--format", "json"],
-    { cwd: dir, signal, timeout: 30_000, maxBuffer: 256 * 1024 });
-    const envelope = jsonFromCliOutput(stdout) as { ok?: boolean; identity?: string; code?: number; data?: { file_key?: unknown } } | null;
-    const key = envelope?.data?.file_key;
-    if (envelope?.ok === false || envelope?.identity && envelope.identity !== "bot" || envelope?.code && envelope.code !== 0
-      || typeof key !== "string" || !/^file_[A-Za-z0-9_-]{1,150}$/.test(key)) throw new Error("No confirmed file upload receipt");
+    const { stdout } = await promisify(execFile)("lark-cli", streamFileUploadArgs(name),
+      { cwd: dir, signal, timeout: 30_000, maxBuffer: 256 * 1024 });
+    const key = uploadedFileKey(stdout);
+    if (!key) throw new Error("No confirmed file upload receipt");
     return key;
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
@@ -137,6 +148,8 @@ export function sendLarkTextMessage(recipientId: string, text: string, idempoten
 }
 
 const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+// The CLI infers an mp4 upload for these extensions even when the message type is file.
+const videoAttachmentExtensions = new Set([".mp4", ".mov", ".avi", ".mkv", ".webm"]);
 
 export function larkReplyMediaFlag(relativePath: string): "--image" | "--file" {
   return imageExtensions.has(path.extname(relativePath).toLowerCase()) ? "--image" : "--file";
@@ -163,6 +176,24 @@ export function sendLarkMediaReply(
   relativePath: string,
   idempotencyKey: string
 ): { ok: true; messageId?: string | null } | { ok: false; error: string } {
+  if (videoAttachmentExtensions.has(path.extname(relativePath).toLowerCase())) {
+    if (path.isAbsolute(relativePath) || relativePath.split(/[\\/]/).includes("..")) {
+      return { ok: false, error: "Invalid video attachment path" };
+    }
+    const upload = spawnSync("lark-cli", streamFileUploadArgs(relativePath), {
+      cwd: taskDir, encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024
+    });
+    if (upload.status !== 0) {
+      return { ok: false, error: (upload.stderr || upload.stdout || upload.error?.message || "Video attachment upload failed").trim() };
+    }
+    const key = uploadedFileKey(upload.stdout);
+    if (!key) return { ok: false, error: "No confirmed video attachment upload receipt" };
+
+    const sent = sendLarkFileReply(messageId, key, idempotencyKey);
+    if (!sent.ok) return sent;
+    return sent.messageId ? { ok: true, messageId: sent.messageId } : { ok: false, error: "No confirmed video attachment reply receipt" };
+  }
+
   const result = spawnSync("lark-cli", buildLarkMediaReplyArgs(messageId, relativePath, idempotencyKey), {
     cwd: taskDir,
     encoding: "utf8"
