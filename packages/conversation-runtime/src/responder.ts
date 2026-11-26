@@ -2146,7 +2146,9 @@ function sendApprovalOutcomeToRequester(
   updateCodexState(row.lark_message_id, { status: "running", reply, sessionId: run.threadId });
 }
 
-function executionReceiptEntry(row: { capability_id: string; title: string; status: string; result_json: string | null; error: string | null }): LarkExecutionReceiptEntry {
+function executionReceiptEntry(row: { capability_id: string; title: string; status: string; result_json: string | null; error: string | null; host_request_id: string | null }): LarkExecutionReceiptEntry {
+  if (row.status === "unknown" || row.status === "running" && row.host_request_id)
+    return { capability: row.capability_id, title: row.title, status: "unknown", summary: "未能确认原宿主操作的结果；没有重新执行。", evidence: [] };
   if (row.status !== "completed") return { capability: row.capability_id, title: row.title, status: "failed", summary: row.error ?? "工具调用失败", evidence: [] };
   let result: Record<string, unknown> | null = null;
   try {
@@ -2167,6 +2169,7 @@ function executionReceiptEntry(row: { capability_id: string; title: string; stat
 }
 
 function executionReceiptStatus(entries: LarkExecutionReceiptEntry[]): LarkExecutionReceiptEntry["status"] {
+  if (entries.some((entry) => entry.status === "unknown")) return "unknown";
   if (entries.some((entry) => entry.status === "failed")) return "failed";
   if (entries.some((entry) => entry.status === "executed")) return "executed";
   if (entries.some((entry) => entry.status === "verified")) return "verified";
@@ -2175,12 +2178,12 @@ function executionReceiptStatus(entries: LarkExecutionReceiptEntry[]): LarkExecu
 
 export function recordExecutionReceipt(larkMessageId: number, turnId: string): void {
   const rows = db.prepare(`
-    SELECT inv.capability_id, capabilities.title, capabilities.risk, inv.status, inv.result_json, inv.error
+    SELECT inv.capability_id, capabilities.title, capabilities.risk, inv.status, inv.result_json, inv.error, inv.host_request_id
     FROM lark_capability_invocations inv
     JOIN capabilities ON capabilities.id = inv.capability_id
     WHERE inv.lark_message_id = ? AND inv.turn_id = ? AND capabilities.risk != 'read'
     ORDER BY inv.id
-  `).all(larkMessageId, turnId) as Array<{ capability_id: string; title: string; risk: string; status: string; result_json: string | null; error: string | null }>;
+  `).all(larkMessageId, turnId) as Array<{ capability_id: string; title: string; risk: string; status: string; result_json: string | null; error: string | null; host_request_id: string | null }>;
   const observed = db.prepare("SELECT kind, operation, status, evidence_json FROM lark_observed_operations WHERE lark_message_id=? AND turn_id=? ORDER BY id").all(larkMessageId, turnId) as Array<{ kind: string; operation: string; status: string; evidence_json: string }>;
   if (rows.length === 0 && observed.length === 0) return;
   const entries = [

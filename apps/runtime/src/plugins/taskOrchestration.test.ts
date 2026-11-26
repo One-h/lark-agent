@@ -96,7 +96,7 @@ const tick = async (f: ReturnType<typeof fixture>, n = 1) => { for (let i = 0; i
 test("the worker card distinguishes unconfirmed delivery and a later receipt without resending", async t => {
   const progress: string[] = [];
   const f = fixture(t, { handoffProgress: progress });
-  await f.service.command({ ...origin, turnId: "foreground" }, { ...dispatch, delivery: "worker_only" }, approved);
+  const handoff = await f.service.command({ ...origin, turnId: "foreground" }, { ...dispatch, delivery: "worker_only" }, approved);
   await tick(f, 2);
   assert.ok(progress.includes("worker_running"));
   f.uncertainSend();
@@ -110,6 +110,10 @@ test("the worker card distinguishes unconfirmed delivery and a later receipt wit
   await tick(f);
   assert.equal(progress.at(-1), "worker_sent");
   assert.equal(f.sent.length, 1);
+  const id = taskId(handoff);
+  await f.service.command({ ...origin, messageId: 2 }, { action: "follow_up", taskId: id, expectedRevision: f.revision(id),
+    text: "Continue with the same Worker", expandsScope: false }, approved);
+  assert.equal(progress.at(-1), "worker_queued");
 });
 
 test("worker-only ownership cannot outlive the source turn or a failed admission", async t => {

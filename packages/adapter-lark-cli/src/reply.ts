@@ -378,7 +378,7 @@ export function buildLarkExecutionApprovalResultCard(input: LarkExecutionApprova
 export type LarkExecutionReceiptEntry = {
   capability: string;
   title: string;
-  status: "queried" | "executed" | "verified" | "failed";
+  status: "queried" | "executed" | "verified" | "failed" | "unknown";
   summary: string;
   evidence: string[];
 };
@@ -390,9 +390,9 @@ export function buildLarkExecutionReceiptCard(input: { status: LarkExecutionRece
       ? { label: "已执行", template: "blue" }
       : input.status === "queried"
         ? { label: "仅查询", template: "grey" }
-        : { label: "执行失败", template: "red" };
+        : input.status === "unknown" ? { label: "结果未确认", template: "orange" } : { label: "执行失败", template: "red" };
   const content = input.entries.slice(0, 8).map((entry, index) => {
-    const label = entry.status === "verified" ? "已验证" : entry.status === "executed" ? "已执行" : entry.status === "queried" ? "仅查询" : "失败";
+    const label = entry.status === "verified" ? "已验证" : entry.status === "executed" ? "已执行" : entry.status === "queried" ? "仅查询" : entry.status === "unknown" ? "未确认" : "失败";
     const evidence = entry.evidence.slice(0, 3).map((item) => `  - ${compactCardText(item, 240)}`).join("\n");
     return `${index + 1}. **${compactCardText(entry.title, 120)}** · ${label}\n   ${compactCardText(entry.summary, 400)}${evidence ? `\n${evidence}` : ""}`;
   }).join("\n\n");

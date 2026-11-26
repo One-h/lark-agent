@@ -36,7 +36,6 @@ export function queueLarkWorkerHandoffProgress(messageId: number, turnId: string
     threadId: existing?.thread_id ?? source.session_id ?? turnId, source, eventId: handoffKey, text: `已派给 ${engineLabels[engine] ?? engine}` });
   const current = row(db, progressId);
   if (!current || !JSON.parse(current.entries_json).some((entry: LarkProgressEntry) => entry.id === handoffKey) || current.state === state) return added;
-  if (["worker_sent", "worker_blocked"].includes(current.state)) return added;
   db.prepare("UPDATE lark_progress_cards SET state=?,version=version+1,pending=1,attempts=0,next_attempt_at=?,updated_at=? WHERE progress_id=?")
     .run(state, nowIso(), nowIso(), progressId);
   void retryPendingLarkProgressCards();

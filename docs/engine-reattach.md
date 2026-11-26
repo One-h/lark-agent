@@ -119,7 +119,8 @@ Transient attachment or sticker state, legacy per-operation cards, and Lark MCP
 calls without receipt support are not reattached. The engine host itself cannot
 be hot restarted.
 
-Forge host operations called through the updated Lark MCP helper can recover
+Forge host operations on the independent Codex connection, using its stable
+MCP bearer and an updated Lark MCP helper, can recover
 their original result across a Lark runtime restart. Forge claims a request ID
 before executing and retains its response; Lark persists that ID before the only
 submission. A disconnected helper reads the same receipt instead of submitting

@@ -47,7 +47,7 @@ export class ForgeHostReceipts {
       const receipt = await this.read(key);
       if (!receipt) throw Error(unknown);
       if (receipt.status === "completed") return JSON.parse(receipt.result_json ?? "null");
-      if (receipt.status === "failed") throw Error(receipt.error ?? unknown);
+      if (receipt.status === "failed" || receipt.status === "unknown") throw Error(receipt.error ?? unknown);
       await delay(1_000, undefined, { signal: waitSignal });
     }
   }
@@ -56,7 +56,7 @@ export class ForgeHostReceipts {
     if (!this.db.open || this.lifetime.aborted) return;
     const row = () => this.db.prepare("SELECT host_request_id,status,result_json,error,host_started_at FROM lark_capability_invocations WHERE host_receipt_key=?").get(key) as Receipt | undefined;
     const receipt = row();
-    if (receipt?.status !== "running") return receipt;
+    if (!receipt || !["running", "unknown"].includes(receipt.status)) return receipt;
     await this.refresh(receipt);
     return this.db.open && !this.lifetime.aborted ? row() : undefined;
   }
@@ -81,17 +81,26 @@ export class ForgeHostReceipts {
     const age = Date.now() - Date.parse(receipt.host_started_at);
     const finished = result?.state === "finished" && typeof result.httpStatus === "number" && Number.isInteger(result.httpStatus);
     const success = finished && Number(result.httpStatus) >= 200 && Number(result.httpStatus) < 300;
-    if (!finished && result?.state !== "unknown" && !(missing && age > 30_000) && age < 1_200_000) return;
+    const checkedAt = new Date().toISOString();
+    const unresolved = result?.state === "unknown" || missing && age > 30_000 || result?.state !== "running" && age >= 1_800_000;
+    if (!finished && !unresolved) {
+      this.db.prepare(`UPDATE lark_capability_invocations SET status=CASE WHEN ? THEN 'running' ELSE status END,
+        host_checked_at=? WHERE host_request_id=? AND status IN ('running','unknown')`)
+        .run(result?.state === "running" ? 1 : 0, checkedAt, receipt.host_request_id);
+      return;
+    }
     const error = success ? null : finished ? JSON.stringify(result.body ?? null) : unknown;
-    this.db.prepare(`UPDATE lark_capability_invocations SET status=?,result_json=?,error=?,finished_at=?
-      WHERE host_request_id=? AND status='running'`).run(success ? "completed" : "failed",
-      success ? JSON.stringify(result.body ?? null) : null, error, new Date().toISOString(), receipt.host_request_id);
+    this.db.prepare(`UPDATE lark_capability_invocations SET status=?,result_json=?,error=?,finished_at=?,host_checked_at=?
+      WHERE host_request_id=? AND status IN ('running','unknown')`).run(finished ? success ? "completed" : "failed" : "unknown",
+      success ? JSON.stringify(result.body ?? null) : null, error, finished ? checkedAt : null, checkedAt, receipt.host_request_id);
   }
 
   tick(): void {
     if (!this.db.open || this.lifetime.aborted || this.reading.size) return;
     const pending = this.db.prepare(`SELECT host_request_id,status,host_started_at FROM lark_capability_invocations
-      WHERE host_request_id IS NOT NULL AND status='running' ORDER BY host_started_at LIMIT 8`).all() as Receipt[];
+      WHERE host_request_id IS NOT NULL AND (status='running' OR (status='unknown' AND host_started_at>?
+        AND (host_checked_at IS NULL OR host_checked_at<=?))) ORDER BY COALESCE(host_checked_at,host_started_at) LIMIT 8`)
+      .all(new Date(Date.now() - 86_400_000).toISOString(), new Date(Date.now() - 60_000).toISOString()) as Receipt[];
     for (const receipt of pending) void this.refresh(receipt).catch(() => console.warn("lark_host_receipt_readback_failed"));
   }
 }

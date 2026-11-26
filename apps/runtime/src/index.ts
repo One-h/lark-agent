@@ -781,7 +781,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
         if (id === "lark.chat.list_managed") return requireManagedChats().list(input);
         return JSON.parse(existing.result_json ?? "null");
       }
-      if (existing.status === "failed") throw new Error(existing.error ?? "Previous capability invocation failed");
+      if (existing.status === "failed" || existing.status === "unknown") throw new Error(existing.error ?? "Previous capability result is unconfirmed");
       throw new Error("The same capability invocation is already running in this turn");
     }
     const trustedConversation = expectedScope === "trusted" && message.reply_trigger !== "owner_mention";
@@ -841,26 +841,23 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
           ? `${capability.title}: ${JSON.stringify({ ...questionTarget!, text: questionText })}`
           : `${capability.title}: ${textResult(input)}`, signal, assertActive, exactManualOnly: groupQuestion,
         sessionId: message.codex_session_id, stillCurrent: contextStillCurrent, legacyOnly: message.reply_trigger === "owner_mention" });
+      const reviewApprover = approverId;
+      const plan = currentApprovalPlan(store.db, approvalInput);
+      const { hostReceiptKey, ...hostContext } = context;
+      const durable = Boolean(forgeReceipts && hostReceiptKey && id.startsWith("forge.") && await forgeReceipts.supported());
       assertActive();
       if (!await confirmTurn(larkMessageId, turnId)) throw new Error("无法确认原生 turn 仍有效，未执行操作。");
       assertActive();
       if (beforeExecution) {
-        const reviewApprover = approverId;
-        const plan = currentApprovalPlan(store.db, approvalInput);
         await beforeExecution(signal);
         assertActive();
         if (!await confirmTurn(larkMessageId, turnId)) throw new Error("MCP 审批对应回合已结束，未执行操作。");
         assertActive();
-        if (reviewApprover !== approverId || plan !== currentApprovalPlan(store.db, approvalInput)) {
-          throw new Error("MCP 审批身份或任务计划已变化，未执行操作。");
-        }
-        if (approvalRequired && (ownerMessageApproved && !isOwnerMessageExempt() || approval.legacyRevoked()))
-          throw new Error("MCP 授权条件已变化，未执行操作。");
       }
-      approval.validate();
-      const { hostReceiptKey, ...hostContext } = context;
-      const durable = Boolean(forgeReceipts && hostReceiptKey && id.startsWith("forge.") && await forgeReceipts.supported());
-      assertActive();
+      if ((beforeExecution || durable) && (reviewApprover !== approverId || plan !== currentApprovalPlan(store.db, approvalInput)))
+        throw new Error("MCP 审批身份或任务计划已变化，未执行操作。");
+      if (approvalRequired && (ownerMessageApproved && !isOwnerMessageExempt() || approval.legacyRevoked()))
+        throw new Error("MCP 授权条件已变化，未执行操作。");
       approval.validate();
       call.started = true;
       const hostResult = id === groupAskCapability
@@ -1334,7 +1331,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     };
     const input = payload.input ?? {};
     const key = mcpApprovalKey(token, payload.tool, payload.input);
-    const boundCall = { ...bound, callId: payload.callId ?? null, hostReceiptKey: key };
+    const boundCall = { ...bound, callId: payload.callId ?? null, hostReceiptKey: viaCodexSocket ? key : undefined };
     if (prepare) return withToolConnection(request, reply, async signal => ({
       approved: await mcpApprovals.prepare(key, signal, (lifetime, beforeExecution) =>
         executeCapability(capabilityId, input, boundCall, lifetime, stillCurrent, beforeExecution))
@@ -1358,7 +1355,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     if (!receipt && runtimeClosing.signal.aborted) return reply.code(503).send({ error: "runtime is restarting" });
     if (!receipt) return reply.code(404).send({ error: "receipt not found" });
     if (receipt.status === "running") return { status: "running" };
-    if (receipt.status === "failed") return { status: "failed", error: receipt.error };
+    if (receipt.status === "failed" || receipt.status === "unknown") return { status: receipt.status, error: receipt.error };
     const result: unknown = JSON.parse(receipt.result_json ?? "null");
     const visible = result && typeof result === "object" && !Array.isArray(result)
       ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "_receipt")) : result;

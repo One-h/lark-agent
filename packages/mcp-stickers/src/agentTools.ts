@@ -23,7 +23,7 @@ async function recoverForgeReceipt(call: { tool: string; contextToken: string; i
       if (result.ok) {
         const item = JSON.parse(result.body) as { status: string; text?: string; error?: string };
         if (item.status === "completed" && typeof item.text === "string") return { isError: false, text: item.text };
-        if (item.status === "failed") return { isError: true, text: item.error ?? "无法确认原宿主操作的回执。" };
+        if (item.status === "failed" || item.status === "unknown") return { isError: true, text: item.error ?? "无法确认原宿主操作的回执。" };
         if (item.status === "running") observed = true;
       }
     } catch { /* Read again after the local runtime reconnects. Never retry the tool call. */ }

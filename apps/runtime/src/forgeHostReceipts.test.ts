@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
+import { buildLarkExecutionReceiptCard } from "@lark-agent/adapter-lark-cli";
 import { reconcileLarkCrash } from "../../../packages/conversation-runtime/src/crashRecovery.js";
 import { ForgeHostReceipts } from "./forgeHostReceipts.js";
 
@@ -27,7 +28,7 @@ test("an admitted Forge request is read after Lark restart, never submitted agai
   let store = new SqliteAgentStore(databasePath);
   const old = new AbortController();
   const fresh = new AbortController();
-  let posts = 0, requestId = "", finished = false;
+  let posts = 0, requestId = "", finished = false, uncertain = false;
   let admitted!: () => void;
   const admittedAtHost = new Promise<void>(resolve => { admitted = resolve; });
   const forge = await localServer((req, res) => {
@@ -41,7 +42,7 @@ test("an admitted Forge request is read after Lark restart, never submitted agai
       return;
     }
     assert.equal(req.url, "/api/lark-agent/requests/" + requestId);
-    res.end(JSON.stringify(finished ? { state: "finished", httpStatus: 200, body: { result: "fixture revision" } } : { state: "running" }));
+    res.end(JSON.stringify(finished ? { state: "finished", httpStatus: 200, body: { result: "fixture revision" } } : { state: uncertain ? "unknown" : "running" }));
   });
   try {
     const first = new ForgeHostReceipts(store.db, forge.url, "fixture-host-token", old.signal);
@@ -58,7 +59,15 @@ test("an admitted Forge request is read after Lark restart, never submitted agai
     reconcileLarkCrash(store.db, new Date().toISOString());
     const second = new ForgeHostReceipts(store.db, forge.url, "fixture-host-token", fresh.signal);
     assert.equal(await second.read("different-context"), undefined);
+    store.db.prepare("UPDATE lark_capability_invocations SET host_started_at=?").run(new Date(Date.now() - 25 * 60_000).toISOString());
     assert.equal((await second.read("exact-context"))?.status, "running");
+    uncertain = true;
+    const unresolved = await second.read("exact-context");
+    assert.equal(unresolved?.status, "unknown");
+    const card = JSON.stringify(buildLarkExecutionReceiptCard({ status: "unknown", entries: [{ capability: "forge.deploy.production",
+      title: "Fixture operation", status: "unknown", summary: unresolved.error!, evidence: [] }] }));
+    assert.match(card, /结果未确认/);
+    assert.doesNotMatch(card, /执行失败/);
     finished = true;
     const receipt = await second.read("exact-context");
     assert.equal(receipt?.host_request_id, requestId);

@@ -62,9 +62,15 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
   server.listen(codexSocket);
   await once(server, "listening");
   let originalHostId = "", hostSubmissions = 0, hostFinished = false;
+  let delayProbe = false;
+  let pendingProbe: http.ServerResponse | undefined;
   const forge = http.createServer((req, res) => {
     assert.equal(req.headers.authorization, "Bearer fixture-host-token");
-    if (req.url === "/api/lark-agent/requests/protocol") { res.end('{"version":1}'); return; }
+    if (req.url === "/api/lark-agent/requests/protocol") {
+      if (delayProbe) pendingProbe = res;
+      else res.end('{"version":1}');
+      return;
+    }
     if (req.method === "POST") {
       assert.equal(req.url, "/api/lark-agent/capabilities/forge.deploy.production");
       req.resume();
@@ -199,7 +205,22 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
 
     runtime.store.registerCapabilities([{ id: "forge.deploy.production", title: "Fixture operation", description: "Isolated fake host",
       inputSchema: { type: "object" }, risk: "external-write" }]);
-    const hostMessageId = 201;
+    const expiredContext = await request(201);
+    delayProbe = true;
+    const expiredCall = call("forge__deploy__production", expiredContext, { expectedRevision: "expired-fixture" });
+    void expiredCall.catch(() => {});
+    const response = await until(() => pendingProbe);
+    nativeActive = false;
+    delayProbe = false;
+    response.end('{"version":1}');
+    assert.equal((await expiredCall).isError, true);
+    assert.equal(hostSubmissions, 0);
+    for (const peer of ws.clients) {
+      peer.send(JSON.stringify({ method: "item/completed", params: { threadId, turnId: turn, item } }));
+      peer.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: turn, status: "completed", items: [item] } } }));
+    }
+    await until(() => runtime.store.db.prepare("SELECT codex_dispatch_phase FROM lark_messages WHERE id=201").pluck().get() === "finalized");
+    const hostMessageId = 301;
     const hostContext = await request(hostMessageId);
     const hostCall = call("forge__deploy__production", hostContext, { expectedRevision: "fixture" });
     void hostCall.catch(() => {});
