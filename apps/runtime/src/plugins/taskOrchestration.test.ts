@@ -16,7 +16,7 @@ type Native = {
   inputs: { id: string; state: string }[]; approvals: { id: string }[];
 };
 
-function fixture(t: { after(fn: () => void): void }, options: { concurrent?: boolean; artifacts?: boolean } = {}) {
+function fixture(t: { after(fn: () => void): void }, options: { concurrent?: boolean; artifacts?: boolean; handoffProgress?: string[] } = {}) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "lark-task-orchestration-"));
   const db = new Database(path.join(dir, "test.sqlite"));
   const starts: Record<string, unknown>[] = [];
@@ -65,6 +65,7 @@ function fixture(t: { after(fn: () => void): void }, options: { concurrent?: boo
     }
   };
   const mount = () => new TaskOrchestration({ db, host, workspace: () => dir, allows: () => allowed,
+    handoffProgress: (_message, _turn, _engine, state) => { options.handoffProgress?.push(state); },
     ...(options.concurrent ? { concurrency: { global: 2, perEngine: 1 } } : {}),
     ...(options.artifacts ? { artifacts } : {}),
     send: (_id, text) => { sent.push(text); return { receipt: sendReceipt }; },
@@ -91,6 +92,25 @@ function fixture(t: { after(fn: () => void): void }, options: { concurrent?: boo
 const dispatch = { action: "dispatch", goal: "Research three approaches", worker: { engine: "codex" } };
 const approved = async () => "approved" as const;
 const tick = async (f: ReturnType<typeof fixture>, n = 1) => { for (let i = 0; i < n; i++) await f.service.tick(); };
+
+test("the worker card distinguishes unconfirmed delivery and a later receipt without resending", async t => {
+  const progress: string[] = [];
+  const f = fixture(t, { handoffProgress: progress });
+  await f.service.command({ ...origin, turnId: "foreground" }, { ...dispatch, delivery: "worker_only" }, approved);
+  await tick(f, 2);
+  assert.ok(progress.includes("worker_running"));
+  f.uncertainSend();
+  f.finish(0, "Result: deliver\nWorker text");
+  await tick(f, 2);
+  assert.equal(progress.at(-1), "worker_delivery_unknown");
+  assert.deepEqual(f.sent, ["Worker text"]);
+  f.restart();
+  f.db.prepare("UPDATE lark_orchestration_outbox SET attempted_at='2000-01-01'").run();
+  f.readback();
+  await tick(f);
+  assert.equal(progress.at(-1), "worker_sent");
+  assert.equal(f.sent.length, 1);
+});
 
 test("worker-only ownership cannot outlive the source turn or a failed admission", async t => {
   const f = fixture(t);

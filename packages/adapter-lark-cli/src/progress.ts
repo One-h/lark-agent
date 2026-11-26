@@ -2,11 +2,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { jsonFromCliOutput, parseLarkSentMessage, type LarkSentMessage } from "./reply.js";
 
-export type LarkProgressState = "running" | "completed" | "failed" | "cancelled" | "interrupted";
+export type LarkWorkerProgressState = "worker_queued" | "worker_running" | "worker_delivering" | "worker_sent" | "worker_delivery_unknown" | "worker_unknown" | "worker_blocked";
+export type LarkProgressState = "running" | "completed" | "failed" | "cancelled" | "interrupted" | LarkWorkerProgressState;
 export type LarkProgressEntry = { id: string; at: string; text: string };
 export type LarkProgressContent = { state: LarkProgressState; entries: LarkProgressEntry[] };
-const labels: Record<LarkProgressState, string> = { running: "处理中", completed: "已结束", failed: "失败", cancelled: "已取消", interrupted: "已中断" };
-const colors: Record<LarkProgressState, string> = { running: "blue", completed: "green", failed: "red", cancelled: "grey", interrupted: "orange" };
+const labels: Record<LarkProgressState, string> = { running: "处理中", completed: "已结束", failed: "失败", cancelled: "已取消", interrupted: "已中断",
+  worker_queued: "待 Worker 执行", worker_running: "Worker 执行中", worker_delivering: "待投递结果", worker_sent: "结果已送达",
+  worker_delivery_unknown: "投递未确认", worker_unknown: "Worker 状态未确认", worker_blocked: "Worker 未完成" };
+const colors: Record<LarkProgressState, string> = { running: "blue", completed: "green", failed: "red", cancelled: "grey", interrupted: "orange",
+  worker_queued: "blue", worker_running: "blue", worker_delivering: "blue", worker_sent: "green", worker_delivery_unknown: "orange", worker_unknown: "orange", worker_blocked: "red" };
 const escape = (text: string) => text.replace(/[&<>*_\[\]`~]/g, c => `&#${c.charCodeAt(0)};`);
 
 export function buildLarkProgressCard(input: LarkProgressContent) {

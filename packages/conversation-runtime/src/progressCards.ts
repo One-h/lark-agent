@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { larkReplyIdempotencyKey, type LarkProgressContent, type LarkProgressEntry, type LarkProgressState } from "@lark-agent/adapter-lark-cli";
+import { larkReplyIdempotencyKey, type LarkProgressContent, type LarkProgressEntry, type LarkProgressState, type LarkWorkerProgressState } from "@lark-agent/adapter-lark-cli";
 import { larkBuiltinPluginEnabled } from "./builtinPlugins.js";
 import { config, db, getAppSettings, larkProgressSender, larkProgressUpdater, nowIso, recordOutboundLarkMessage, type LarkMessageRow } from "./context.js";
 import { ownerAssistMayExecute } from "./ownerMentionAssist.js";
@@ -24,14 +24,23 @@ type ProgressSource = Pick<LarkMessageRow, "id" | "message_id" | "sender_type" |
 const handoffKey = "worker-handoff";
 const engineLabels: Record<string, string> = { codex: "Codex", claude: "Claude", dsh: "DSH", opencode: "OpenCode", agy: "AGY" };
 
-export function queueLarkWorkerHandoffProgress(messageId: number, turnId: string, engine: string): boolean {
+export function queueLarkWorkerHandoffProgress(messageId: number, turnId: string, engine: string, state: LarkWorkerProgressState = "worker_queued"): boolean {
   const source = db.prepare(`SELECT m.id,m.message_id,m.sender_type,m.chat_type,COALESCE(e.session_id,m.codex_session_id) AS session_id
     FROM lark_messages m LEFT JOIN lark_topic_engine_runs e ON e.lark_message_id=m.id
     WHERE m.id=? AND COALESCE(e.turn_id,m.codex_turn_id)=?`).get(messageId, turnId) as (ProgressSource & { session_id?: string }) | undefined;
   const existing = db.prepare("SELECT progress_id,thread_id FROM lark_progress_cards WHERE native_turn_id=? LIMIT 1")
     .get(turnId) as Pick<ProgressRow, "progress_id" | "thread_id"> | undefined;
-  return source ? queueLarkProgressUpdate({ progressId: existing?.progress_id ?? turnId, turnId,
-    threadId: existing?.thread_id ?? source.session_id ?? turnId, source, eventId: handoffKey, text: `已派给 ${engineLabels[engine] ?? engine}` }) : false;
+  if (!source) return false;
+  const progressId = existing?.progress_id ?? turnId;
+  const added = queueLarkProgressUpdate({ progressId, turnId,
+    threadId: existing?.thread_id ?? source.session_id ?? turnId, source, eventId: handoffKey, text: `已派给 ${engineLabels[engine] ?? engine}` });
+  const current = row(db, progressId);
+  if (!current || !JSON.parse(current.entries_json).some((entry: LarkProgressEntry) => entry.id === handoffKey) || current.state === state) return added;
+  if (["worker_sent", "worker_blocked"].includes(current.state)) return added;
+  db.prepare("UPDATE lark_progress_cards SET state=?,version=version+1,pending=1,attempts=0,next_attempt_at=?,updated_at=? WHERE progress_id=?")
+    .run(state, nowIso(), nowIso(), progressId);
+  void retryPendingLarkProgressCards();
+  return true;
 }
 
 export function observeLarkProgressCards(database: Database.Database): () => void {
@@ -109,7 +118,8 @@ async function deliver(database: Database.Database, id: string): Promise<void> {
       database.prepare("UPDATE lark_progress_cards SET state=?,version=version+1,next_attempt_at=? WHERE progress_id=? AND state='running'").run(state, nowIso(), id);
       continue;
     }
-    if (current.state === "running" && (config.groupPrivacyEnforced && source.chat_type !== "p2p" || !getAppSettings().larkCodexInterimRepliesEnabled)) return;
+    if ((current.state === "running" || current.state.startsWith("worker_")) &&
+      (config.groupPrivacyEnforced && source.chat_type !== "p2p" || !getAppSettings().larkCodexInterimRepliesEnabled)) return;
     const entries = JSON.parse(current.entries_json) as LarkProgressEntry[];
     const handoff = entries.some(entry => entry.id === handoffKey);
     if (!current.card_message_id && !current.create_attempted && current.state !== "running"

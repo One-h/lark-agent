@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { unicodeSafePrefix } from "@lark-agent/adapter-codex-app-server";
+import type { LarkWorkerProgressState } from "@lark-agent/adapter-lark-cli";
 import { TaskArtifacts, type TaskArtifact } from "./taskArtifacts.js";
 
 const engine = z.enum(["codex", "claude", "dsh", "opencode", "agy"]);
@@ -67,6 +68,7 @@ type Options = {
   artifacts?: TaskArtifacts;
   concurrency?: { global: number; perEngine: number };
   admissionNotice?: boolean;
+  handoffProgress?: (messageId: number, turnId: string, engine: string, state: LarkWorkerProgressState) => void;
   allows: (origin: TaskOrigin, operation: "execute" | "deliver") => boolean;
   send: (messageId: number, text: string, key: string) => { receipt?: string | null };
   upload?: (name: string, bytes: Buffer, signal: AbortSignal) => Promise<string>;
@@ -109,6 +111,7 @@ export class TaskOrchestration {
   private readonly db: Database.Database;
   private readonly lifetime = new AbortController();
   private busy = false;
+  private restoreHandoffProgress = true;
 
   constructor(private readonly options: Options) {
     this.db = options.db;
@@ -229,6 +232,28 @@ export class TaskOrchestration {
       WHERE t.message_id=? AND json_extract(t.spec,'$.delivery')='worker_only' AND json_extract(t.spec,'$.handoffTurnId')=?`)
       .get(messageId, turnId));
   }
+
+  private reportHandoff(taskId: string): void {
+    if (!this.options.handoffProgress || this.lifetime.signal.aborted) return;
+    const task = this.task(taskId), spec = this.spec(task);
+    if (!spec.handoffTurnId || !this.ownsForegroundReply(task.message_id, spec.handoffTurnId)) return;
+    let state: LarkWorkerProgressState;
+    if (task.status === "uncertain") state = "worker_unknown";
+    else if (["failed", "blocked"].includes(task.status)) state = "worker_blocked";
+    else if (task.status === "running") state = this.db.prepare(`SELECT 1 FROM lark_orchestration_jobs
+      WHERE task_id=? AND kind='worker' AND state='submitted' AND native_session_id IS NOT NULL LIMIT 1`).get(task.id)
+      ? "worker_running" : "worker_queued";
+    else if (task.status !== "finished") state = "worker_queued";
+    else {
+      const delivery = this.db.prepare("SELECT state,receipt FROM lark_orchestration_outbox WHERE task_id=? AND (id=? OR artifact_id=?)")
+        .all(task.id, task.current_result, task.current_result) as Array<{ state: string; receipt: string | null }>;
+      state = delivery.length && delivery.every(row => row.state === "sent" && row.receipt) ? "worker_sent"
+        : delivery.some(row => ["sending", "uploading", "invalid_artifact"].includes(row.state) || row.state === "sent")
+          ? "worker_delivery_unknown" : "worker_delivering";
+    }
+    try { this.options.handoffProgress(task.message_id, spec.handoffTurnId, spec.worker.engine, state); }
+    catch (error) { this.options.report(error); }
+  }
   private sameOwner(task: Task, origin: TaskOrigin): boolean {
     return task.chat_id === origin.chatId && task.sender_id === origin.senderId && task.policy === origin.policy
       && (task.thread_id === null || task.thread_id === (origin.threadId ?? null));
@@ -325,7 +350,7 @@ export class TaskOrchestration {
     } catch (error) { this.options.report(error); }
     if (this.lifetime.signal.aborted || !this.db.open) return { taskId: command.id, status: "failed" };
     if (!this.options.allows(origin, "execute")) authorization = "failed";
-    return this.db.transaction(() => {
+    const response = this.db.transaction(() => {
       let task = this.task(command.id);
       const spec = this.spec(task);
       let reason: string | undefined;
@@ -390,6 +415,8 @@ export class TaskOrchestration {
         .run(authorization, JSON.stringify(response), origin.messageId, command.id, request.action);
       return response;
     })();
+    this.reportHandoff(command.id);
+    return response;
   }
 
   private async flush() {
@@ -405,6 +432,7 @@ export class TaskOrchestration {
         const item = this.frozen(event.artifact_id).find(candidate => candidate.name === event.artifact_name);
         if (!item?.bytes || digestBytes(item.bytes) !== item.checksum) {
           this.db.prepare("UPDATE lark_orchestration_outbox SET state='invalid_artifact' WHERE id=?").run(event.id);
+          this.reportHandoff(event.task_id);
           continue;
         }
         if (!this.db.prepare("UPDATE lark_orchestration_outbox SET state='uploading' WHERE id=? AND state='queued'").run(event.id).changes) continue;
@@ -415,6 +443,7 @@ export class TaskOrchestration {
           this.db.prepare("UPDATE lark_orchestration_outbox SET state='queued',file_key=? WHERE id=?").run(key, event.id);
         } catch (error) {
           if (!signal.aborted) this.options.report(error);
+          this.reportHandoff(event.task_id);
           continue;
         }
         if (!this.options.allows(taskOrigin(task), "deliver")) continue;
@@ -429,6 +458,7 @@ export class TaskOrchestration {
         if (receipt) this.db.prepare("UPDATE lark_orchestration_outbox SET state='sent',receipt=? WHERE id=?").run(receipt, event.id);
       } catch (error) { this.options.report(error); }
       // A lost receipt is not proof of non-delivery. Do not retry a started send.
+      this.reportHandoff(event.task_id);
     }
     if (!this.options.readback) return;
     const cutoff = new Date(Date.now() - 20_000).toISOString();
@@ -445,6 +475,7 @@ export class TaskOrchestration {
         if (signal.aborted) return;
         if (id) this.db.prepare("UPDATE lark_orchestration_outbox SET state='sent',receipt=? WHERE id=?").run(id, event.id);
       } catch (error) { if (!signal.aborted) this.options.report(error); }
+      this.reportHandoff(event.task_id);
     }
   }
 
@@ -488,7 +519,7 @@ export class TaskOrchestration {
         artifacts = frozen.artifacts;
       } catch (error) { this.options.report(error); artifactError = true; }
     }
-    return this.db.transaction(() => {
+    this.db.transaction(() => {
       const result = job.kind === "worker" && output.label && !artifactError ? "Result: " + output.label + "\n" + output.body : text ?? null;
       if (!this.db.prepare("UPDATE lark_orchestration_jobs SET state=?,session_id=?,result=?,needs_ack=? WHERE id=? AND state='submitted'")
         .run(state, sessionId, result, Number(state !== "uncertain"), job.id).changes) return;
@@ -561,6 +592,7 @@ export class TaskOrchestration {
         this.publishResult(job.id, task, job.id, this.spec(current).delivery === "worker_only"
           ? output.body || (artifacts.length ? "" : "Worker 未返回可交付的结果。") : "任务 " + task.id + "\n" + output.body);
     })();
+    this.reportHandoff(job.task_id);
   }
 
   async tick() {
@@ -568,6 +600,12 @@ export class TaskOrchestration {
     if (signal.aborted || this.busy) return;
     this.busy = true;
     try {
+      if (this.restoreHandoffProgress && this.options.handoffProgress) {
+        this.restoreHandoffProgress = false;
+        const handoffs = this.db.prepare(`SELECT id FROM lark_orchestration_tasks WHERE json_extract(spec,'$.delivery')='worker_only'
+          ORDER BY (status IN ('queued','running','uncertain')) DESC,rowid DESC LIMIT 50`).pluck().all() as string[];
+        for (const id of handoffs) this.reportHandoff(id);
+      }
       await this.flush();
       if (signal.aborted) return;
       const acks = this.db.prepare("SELECT id,generation FROM lark_orchestration_jobs WHERE needs_ack=1 LIMIT 8").all() as Job[];
@@ -603,8 +641,9 @@ export class TaskOrchestration {
             const completed = status.result?.status === "completed";
             this.finish(job, completed ? "completed" : "failed", status.sessionId ?? null, status.result?.text, snapshot.sessionProof);
             await this.acknowledge(job, signal);
-          } else if (status.state === "active" && this.options.allows(taskOrigin(task), "execute")) {
-            await this.offerFollowUp(job, snapshot, signal);
+          } else {
+            this.reportHandoff(job.task_id);
+            if (status.state === "active" && this.options.allows(taskOrigin(task), "execute")) await this.offerFollowUp(job, snapshot, signal);
           }
         } catch (error) {
           if (signal.aborted) return;
@@ -665,12 +704,14 @@ export class TaskOrchestration {
           this.setStatus(task.id, job.kind === "reviewer" ? "awaiting_review" : "blocked");
           if (this.options.allows(taskOrigin(task), "deliver"))
             this.notify(job.id + ":artifact", task.id, `任务 ${task.id} 无法准备输入或读取产物，未启动该回合。`);
+          this.reportHandoff(task.id);
           continue;
         }
         this.db.transaction(() => {
           this.db.prepare("UPDATE lark_orchestration_jobs SET state='submitted',generation=?,workspace=? WHERE id=?").run(host.generation, workspace, job.id);
           this.setStatus(task.id, job.kind === "worker" ? "running" : "awaiting_review");
         })();
+        this.reportHandoff(task.id);
         const proof = job.kind === "worker" ? task.worker_proof : job.resume_proof;
         try {
           await this.options.host.call({ method: "start", generation: host.generation, id: job.id, engineId: route.engine,
@@ -689,6 +730,7 @@ export class TaskOrchestration {
               if (this.options.allows(taskOrigin(task), "deliver"))
                 this.notify(job.id + ":policy", task.id, "任务 " + task.id + " 的引擎无法确认原会话、工作区或执行权限，未启动。");
             })();
+            this.reportHandoff(task.id);
             continue;
           }
         }

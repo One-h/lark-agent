@@ -35,7 +35,9 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
   let turn = "", nativeActive = false;
   const sentTexts: string[] = [];
   const progressEntries: string[][] = [];
+  const progressStates: string[] = [];
   let workerStarts = 0;
+  let workerFinished = false;
   const tokens: string[] = [];
   ws.on("connection", peer => peer.on("message", data => {
     const rpc = JSON.parse(data.toString());
@@ -45,7 +47,10 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
     if (rpc.method === "thread/turns/list") return send({ data: [{ id: turn, status: nativeActive ? "inProgress" : "completed" }] });
     if (rpc.method === "thread/items/list") return send({ data: nativeActive ? [] : [{ turnId: turn, item }], nextCursor: null });
     if (rpc.method === "turn/start") {
-      const token = JSON.stringify(rpc.params.input).match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
+      const input = JSON.stringify(rpc.params.input);
+      assert.equal(input.match(/简单问题直接答/g)?.length, 1);
+      assert.ok(input.includes("并行分工"));
+      const token = input.match(/context_token=([A-Za-z0-9_-]{32})/)?.[1];
       assert(token);
       tokens.push(token);
       turn = "fixture-turn-" + tokens.length;
@@ -56,20 +61,43 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
   }));
   server.listen(codexSocket);
   await once(server, "listening");
+  let originalHostId = "", hostSubmissions = 0, hostFinished = false;
+  const forge = http.createServer((req, res) => {
+    assert.equal(req.headers.authorization, "Bearer fixture-host-token");
+    if (req.url === "/api/lark-agent/requests/protocol") { res.end('{"version":1}'); return; }
+    if (req.method === "POST") {
+      assert.equal(req.url, "/api/lark-agent/capabilities/forge.deploy.production");
+      req.resume();
+      req.on("end", () => {
+        hostSubmissions++;
+        originalHostId = String(req.headers["x-lark-request-id"]);
+        res.writeHead(202).end('{"state":"running"}');
+      });
+      return;
+    }
+    assert.equal(req.url, `/api/lark-agent/requests/${originalHostId}`);
+    res.end(JSON.stringify(hostFinished ? { state: "finished", httpStatus: 200, body: { result: "verified fixture" } } : { state: "running" }));
+  });
+  forge.listen(0, "127.0.0.1");
+  await once(forge, "listening");
+  const address = forge.address();
+  assert.ok(address && typeof address !== "string");
   const runtimeToken = randomBytes(32).toString("base64url");
   const bearer = codexForegroundMcpBearer(runtimeToken);
   assert(bearer && bearer !== runtimeToken && bearer === codexForegroundMcpBearer(runtimeToken));
   assert.equal(codexForegroundMcpBearer("short"), undefined);
   const setup = (enabled: boolean, port?: number) => createRuntime({
     databasePath: path.join(root, "test.sqlite"), workspaceRoot: root, mode: "active", codexSocket, port,
+    hostBaseUrl: `http://127.0.0.1:${address.port}`, hostToken: "fixture-host-token",
     trustedSenderIds: ["ou_fixture"], runtimeToken, taskOrchestrationEnabled: enabled,
     taskOrchestrationChatIds: ["oc_fixture"],
     taskEngineHost: { supports: engine => engine === "dsh", async call<T>(request: Record<string, unknown>) {
       switch (request.method) {
         case "status": return { generation: "fixture", workspace: root, engines: [{ id: "dsh", models: [], trusted: true, restricted: false }] } as T;
         case "start": workerStarts++; return {} as T;
-        case "attach": return { engineId: "dsh", approvals: [], status: { state: "finished", sessionId: "worker-fixture",
-          result: { status: "completed", text: "Result: deliver\nOnly the Worker result." } } } as T;
+        case "attach": return { engineId: "dsh", approvals: [], status: workerFinished
+          ? { state: "finished", sessionId: "worker-fixture", result: { status: "completed", text: "Result: deliver\nOnly the Worker result." } }
+          : { state: "active", sessionId: "worker-fixture" } } as T;
         case "acknowledge": return { acknowledged: true } as T;
         default: throw new Error("Unexpected task host request");
       }
@@ -77,9 +105,10 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
     reactionSender: () => ({ ok: true }),
     progressSender: async (_id, progress) => {
       progressEntries.push(progress.entries.map(entry => entry.text));
+      progressStates.push(progress.state);
       return { ok: true, messageId: "om_fixture_progress", chatId: "oc_fixture", messageAt: null, messageType: "interactive" };
     },
-    progressUpdater: async (_id, progress) => { progressEntries.push(progress.entries.map(entry => entry.text)); return { ok: true }; },
+    progressUpdater: async (_id, progress) => { progressEntries.push(progress.entries.map(entry => entry.text)); progressStates.push(progress.state); return { ok: true }; },
     textReplySender: (_id, text) => {
       sentTexts.push(text);
       return { ok: true, messageId: `om_fixture_reply_${sentTexts.length}`, chatId: "oc_fixture", messageAt: null, messageType: "text" };
@@ -150,6 +179,7 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
       worker: { engine: "dsh" }, delivery: "worker_only" });
     assert.notEqual(handedOff.isError, true, JSON.stringify(handedOff.content));
     assert.match(JSON.stringify(handedOff.content), /approved/);
+    await until(() => progressStates.includes("worker_queued"));
     assert.equal(runtime.store.db.prepare("SELECT count(*) FROM lark_orchestration_outbox").pluck().get(), 0);
     nativeActive = false;
     for (const peer of ws.clients) {
@@ -157,16 +187,38 @@ test("the original Codex MCP client discovers the new catalog after a Lark resta
       peer.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: turn, status: "completed", items: [item] } } }));
     }
     await until(() => runtime.store.db.prepare("SELECT codex_dispatch_phase FROM lark_messages WHERE id=101").pluck().get() === "finalized");
+    assert.equal(runtime.store.db.prepare("SELECT state FROM lark_progress_cards WHERE lark_message_id=101").pluck().get(), "worker_queued");
+    await until(() => { runtime.tickPlugins(); return progressStates.includes("worker_running"); });
+    workerFinished = true;
     await until(() => { runtime.tickPlugins(); return sentTexts.length > 0; });
+    await until(() => progressStates.includes("worker_sent"));
     assert.equal(workerStarts, 1);
     assert.deepEqual(sentTexts, ["Only the Worker result."]);
     assert.ok(progressEntries.some(entries => entries.includes("已派给 DSH")));
     assert.equal(runtime.store.db.prepare("SELECT count(*) FROM lark_orchestration_outbox WHERE state='sent' AND receipt IS NOT NULL").pluck().get(), 1);
+
+    runtime.store.registerCapabilities([{ id: "forge.deploy.production", title: "Fixture operation", description: "Isolated fake host",
+      inputSchema: { type: "object" }, risk: "external-write" }]);
+    const hostMessageId = 201;
+    const hostContext = await request(hostMessageId);
+    const hostCall = call("forge__deploy__production", hostContext, { expectedRevision: "fixture" });
+    void hostCall.catch(() => {});
+    await until(() => originalHostId || false);
+    await closeRuntime();
+    runtime = setup(true, port);
+    await runtime.app.listen({ host: "127.0.0.1", port });
+    hostFinished = true;
+    const recovered = await hostCall;
+    assert.notEqual(recovered.isError, true, JSON.stringify(recovered.content));
+    assert.match(JSON.stringify(recovered.content), /verified fixture/);
+    assert.equal(hostSubmissions, 1);
+    assert.equal(runtime.store.db.prepare("SELECT host_request_id FROM lark_capability_invocations WHERE lark_message_id=?").pluck().get(hostMessageId), originalHostId);
   } finally {
     await mcp.close();
     await closeRuntime();
     for (const peer of ws.clients) peer.terminate();
     await Promise.all([new Promise<void>(resolve => ws.close(() => resolve())), new Promise<void>(resolve => server.close(() => resolve()))]);
+    await new Promise<void>(resolve => forge.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(socketRoot, { recursive: true, force: true });
   }

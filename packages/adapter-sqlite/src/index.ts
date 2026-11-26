@@ -273,6 +273,10 @@ export class SqliteAgentStore {
     this.ensureColumn("lark_messages", "reply_recovery_checked_at", "TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_lark_messages_recovery_queue ON lark_messages(id) WHERE codex_status='queued' AND codex_dispatch_phase='queued'");
     this.ensureColumn("lark_capability_approvals", "approval_scope", "TEXT NOT NULL DEFAULT 'once'");
+    this.ensureColumn("lark_capability_invocations", "host_request_id", "TEXT");
+    this.ensureColumn("lark_capability_invocations", "host_receipt_key", "TEXT");
+    this.ensureColumn("lark_capability_invocations", "host_started_at", "TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_lark_host_receipt_key ON lark_capability_invocations(host_receipt_key) WHERE host_receipt_key IS NOT NULL");
     this.ensureColumn("lark_capability_approvals", "error", "TEXT");
     this.ensureColumn("lark_capability_approvals", "requester_id", "TEXT");
     this.ensureColumn("lark_capability_approvals", "thread_id", "TEXT");

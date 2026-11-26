@@ -32,11 +32,11 @@ export function reconcileLarkCrash(database: Database.Database, at: string, reta
             OR (?=1 AND EXISTS(SELECT 1 FROM lark_native_socket_members turn WHERE turn.turn_id=link.turn_id
               AND turn.state!='pending' AND turn.message_id=lark_capability_approvals.lark_message_id)))
       )`).run(interruptedApproval, at, Number(retainHostTurns), Number(retainNativeTurns));
-    const inFlightCalls = database.prepare("SELECT DISTINCT lark_message_id FROM lark_capability_invocations WHERE status='running'")
+    const inFlightCalls = database.prepare("SELECT DISTINCT lark_message_id FROM lark_capability_invocations WHERE status='running' AND host_request_id IS NULL")
       .pluck().all() as number[];
     for (const id of inFlightCalls) quarantineLarkExecution(database, id, at);
     database.prepare(`UPDATE lark_capability_invocations SET status='failed',error=?,finished_at=?
-      WHERE status='running'`).run(larkUncertainExecution, at);
+      WHERE status='running' AND host_request_id IS NULL`).run(larkUncertainExecution, at);
 
     const messages = database.prepare(`SELECT id,codex_dispatch_phase phase,codex_dispatch_context context,reply_trigger
       FROM lark_messages WHERE codex_status IN ('queued','running') AND (?=0 OR NOT EXISTS (

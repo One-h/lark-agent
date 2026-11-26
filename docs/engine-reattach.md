@@ -115,9 +115,18 @@ acceptance after an acknowledgement or native input observation, and checks
 native input IDs to reconstruct the final reply's target after reconnect.
 An ambiguous steer is never resubmitted or turned into a fresh prompt.
 Independent requests, detached turns, and hosted ACP still serialize input.
-Hosted ACP does not mount Lark MCP tools. In-flight Lark MCP callbacks, transient
-attachment or sticker state, and legacy Codex per-operation cards are not
-reattached. The engine host itself cannot be hot restarted.
+Transient attachment or sticker state, legacy per-operation cards, and Lark MCP
+calls without receipt support are not reattached. The engine host itself cannot
+be hot restarted.
+
+Forge host operations called through the updated Lark MCP helper can recover
+their original result across a Lark runtime restart. Forge claims a request ID
+before executing and retains its response; Lark persists that ID before the only
+submission. A disconnected helper reads the same receipt instead of submitting
+again. An unknown result is not success and will not re-execute the operation.
+Upgrade Forge first; versions without the protocol keep the legacy synchronous
+path. A running MCP helper must reload its code before it can wait across a
+disconnect. If Forge itself is lost, it cannot adopt an already-running child.
 
 To return to stdio, drain hosted turns and verify pending replies before
 removing the opt-in settings. Never drop the recovery rows to force a replay.

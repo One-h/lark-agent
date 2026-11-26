@@ -42,6 +42,7 @@ import { approvalPlanToolName, confirmExternalLarkMcpTurn, confirmExternalLarkNa
   boundedReadApprovalPlan, listLarkMcpTools, setExternalNativeApprovalHandler, setWholeTurnNativeApprovalHandler, submitLarkMcpApprovalPlan,
   approvalStatusToolName, readLarkMcpApprovalStatus, wholeTurnScope } from "@lark-agent/conversation-runtime";
 import { McpApprovalBridge, mcpApprovalKey } from "./mcpApprovalBridge.js";
+import { ForgeHostReceipts } from "./forgeHostReceipts.js";
 import { TaskOrchestration, taskCommand, taskInputSchema, type TaskEngineHost, type TaskOrigin } from "./plugins/taskOrchestration.js";
 import { registerTaskOrchestrationReadRoutes } from "./plugins/taskOrchestrationReadRoutes.js";
 import { TaskArtifacts } from "./plugins/taskArtifacts.js";
@@ -258,6 +259,8 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   app.addHook("onClose", async () => { removeOwnerContextListener(); });
   let activeCapabilityCalls = 0;
   const runtimeClosing = new AbortController();
+  const forgeReceipts = config.hostBaseUrl && config.hostToken
+    ? new ForgeHostReceipts(store.db, config.hostBaseUrl, config.hostToken, runtimeClosing.signal) : undefined;
   const taskSource = (id: number) => store.db.prepare(`SELECT message_id,chat_id,chat_type,thread_id,sender_id,
     sender_type,direction,reply_trigger,content FROM lark_messages WHERE id=?`).get(id) as {
     message_id: string; chat_id: string; chat_type: string; thread_id: string | null; sender_id: string;
@@ -280,6 +283,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   const taskOrchestration = taskHost && pluginHost.mount("task-orchestration", () => new TaskOrchestration({
     db: store.db, host: taskHost, workspace: () => workspaceRoot, allows: taskAllowed,
     artifacts: new TaskArtifacts(path.join(dataDirectory, "orchestration-artifacts")), admissionNotice: true,
+    handoffProgress: queueLarkWorkerHandoffProgress,
     concurrency: config.taskOrchestrationConcurrency ?? { global: 3, perEngine: 1 },
     upload: (name, bytes, signal) => {
       if (process.env.LARK_AGENT_TEST_DATABASE === "1") throw new Error("Test runtime cannot upload a real file");
@@ -707,7 +711,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     try { return JSON.parse(body); } catch { return body; }
   };
   const executeCapabilityInternal = async (id: string, input: unknown,
-    context: { larkMessageId?: unknown; chatId?: unknown; trustScope?: unknown; turnId?: unknown; callId?: unknown },
+    context: { larkMessageId?: unknown; chatId?: unknown; trustScope?: unknown; turnId?: unknown; callId?: unknown; hostReceiptKey?: string },
     requestSignal?: AbortSignal, contextStillCurrent?: () => boolean,
     beforeExecution?: (signal: AbortSignal) => Promise<void>): Promise<unknown> => {
     const capability = capabilities().find((entry) => entry.id === id);
@@ -854,12 +858,19 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
           throw new Error("MCP 授权条件已变化，未执行操作。");
       }
       approval.validate();
+      const { hostReceiptKey, ...hostContext } = context;
+      const durable = Boolean(forgeReceipts && hostReceiptKey && id.startsWith("forge.") && await forgeReceipts.supported());
+      assertActive();
+      approval.validate();
       call.started = true;
       const hostResult = id === groupAskCapability
         ? await agentMessaging!.askGroup({ source: questionSource(), sourceCwd: workspaceRoot, target: questionTarget!,
           requestKey: createHash("sha256").update(JSON.stringify([larkMessageId, turnId, questionText])).digest("hex"),
           text: questionText, assertActive: () => { assertActive(); approval.validate(); } })
-        : await invokeHost(capability, input, { ...context, senderId: message.sender_id, chatType: message.chat_type ?? null });
+        : durable ? await forgeReceipts!.execute(id, turnId, inputHash, hostReceiptKey!, {
+          input, context: { ...hostContext, senderId: message.sender_id, chatType: message.chat_type ?? null }
+        }, signal)
+        : await invokeHost(capability, input, { ...hostContext, senderId: message.sender_id, chatType: message.chat_type ?? null });
       const result = ownerMessageApproved
         ? { ...(hostResult as Record<string, unknown>), _authorization: { mode: "explicit-owner-message", policyVersion: 1 } }
         : hostResult;
@@ -867,7 +878,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
       return result;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      if (store.db.open) store.db.prepare("UPDATE lark_capability_invocations SET status='failed', error=?, finished_at=? WHERE turn_id=? AND capability_id=? AND input_hash=?").run(messageText, new Date().toISOString(), turnId, id, inputHash);
+      if (store.db.open) store.db.prepare("UPDATE lark_capability_invocations SET status='failed', error=?, finished_at=? WHERE turn_id=? AND capability_id=? AND input_hash=? AND host_request_id IS NULL").run(messageText, new Date().toISOString(), turnId, id, inputHash);
       throw error;
     } finally { signal.removeEventListener("abort", cancelled); authorizations.delete(call); }
   };
@@ -1199,7 +1210,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     if (!config.runtimeToken || !authenticated(request)) return reply.code(401).send({ error: "runtime token required" });
     const payload = request.body as { input?: unknown; context?: Record<string, unknown> };
     return withToolConnection(request, reply, signal =>
-      executeCapability((request.params as { id: string }).id, payload?.input ?? {}, payload?.context ?? {}, signal));
+      executeCapability((request.params as { id: string }).id, payload?.input ?? {}, { ...payload?.context, hostReceiptKey: undefined }, signal));
   };
   app.post("/v1/capabilities/:id/invoke", capabilityRoute);
   app.post("/v1/internal/capabilities/:id/execute", capabilityRoute);
@@ -1304,10 +1315,6 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
             if (beforeCommit) await beforeCommit(lifetime);
             return active();
           });
-          if (parsed.action === "dispatch" && parsed.delivery === "worker_only" && taskOrchestration.ownsForegroundReply(origin.messageId, context.turnId)) {
-            try { queueLarkWorkerHandoffProgress(origin.messageId, context.turnId, parsed.worker.engine); }
-            catch { app.log.warn("lark_worker_handoff_progress_failed"); }
-          }
           return result;
         };
         if (prepare) return { approved: await mcpApprovals.prepare(key, requestSignal, run) };
@@ -1327,7 +1334,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
     };
     const input = payload.input ?? {};
     const key = mcpApprovalKey(token, payload.tool, payload.input);
-    const boundCall = { ...bound, callId: payload.callId ?? null };
+    const boundCall = { ...bound, callId: payload.callId ?? null, hostReceiptKey: key };
     if (prepare) return withToolConnection(request, reply, async signal => ({
       approved: await mcpApprovals.prepare(key, signal, (lifetime, beforeExecution) =>
         executeCapability(capabilityId, input, boundCall, lifetime, stillCurrent, beforeExecution))
@@ -1341,6 +1348,22 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   };
   app.post("/v1/internal/mcp/tools/call", (request, reply) => mcpToolRoute(request, reply, false));
   app.post("/v1/internal/mcp/tools/approve", (request, reply) => mcpToolRoute(request, reply, true));
+  app.post("/v1/internal/mcp/tools/receipt", async (request, reply) => {
+    if (!authenticatedMcp(request) && !codexSocketMcp(request)) return reply.code(403).send({ error: "local MCP token required" });
+    const body = request.body as { tool?: unknown; contextToken?: unknown; input?: unknown } | null;
+    if (!body || typeof body.tool !== "string" || typeof body.contextToken !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.contextToken)
+      || !("input" in body) || Object.keys(body).some(k => !["tool", "contextToken", "input"].includes(k))) return reply.code(400).send({ error: "invalid receipt query" });
+    if (!larkMcpHostCapabilityId(body.tool)?.startsWith("forge.")) return reply.code(404).send({ error: "receipt not found" });
+    const receipt = await forgeReceipts?.read(mcpApprovalKey(body.contextToken, body.tool, body.input));
+    if (!receipt && runtimeClosing.signal.aborted) return reply.code(503).send({ error: "runtime is restarting" });
+    if (!receipt) return reply.code(404).send({ error: "receipt not found" });
+    if (receipt.status === "running") return { status: "running" };
+    if (receipt.status === "failed") return { status: "failed", error: receipt.error };
+    const result: unknown = JSON.parse(receipt.result_json ?? "null");
+    const visible = result && typeof result === "object" && !Array.isArray(result)
+      ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "_receipt")) : result;
+    return { status: "completed", text: JSON.stringify(visible ?? null) };
+  });
   app.post("/v1/internal/owner-assist/decision", async (request, reply) => {
     if (request.headers.authorization !== `Bearer ${attachmentRuntimeToken}` || !["127.0.0.1", "::1"].includes(request.ip)) return reply.code(403).send({ error: "local runtime token required" });
     const payload = request.body as { contextToken?: unknown; input?: unknown } | null;
@@ -1451,7 +1474,7 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   if (config.mode === "active" && process.env.LARK_AGENT_TEST_DATABASE !== "1") groupPrivacy.start();
   pluginHost.start();
   return { app, store, decideApprovalFromCard, expireApprovals: expirePendingApprovals, recoverOrphanedRuns: reconcileOrphanedLarkCodexRuns, startListener,
-    tickPlugins: pluginHost.tick, stop: () => { runtimeClosing.abort(); pluginHost.close(); stopRetainedLarkRecovery(); stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); removeDetachListener(); store.close(); } };
+    tickPlugins: () => { pluginHost.tick(); forgeReceipts?.tick(); }, stop: () => { runtimeClosing.abort(); pluginHost.close(); stopRetainedLarkRecovery(); stopListener(); setAdditionalLarkApprovalHandler(null); removeExternalNativeApprovalHandler(); removeWholeTurnHandler(); wholeTasks.clear(); stopLarkCodexResponder(); stopProgressObserver(); removeTurnListener(); removeDetachListener(); store.close(); } };
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {
