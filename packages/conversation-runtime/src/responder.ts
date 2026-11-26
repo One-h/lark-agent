@@ -700,7 +700,7 @@ export function extractLarkReplyMedia(answer: string, taskDir: string, chatId: s
 }
 
 function larkToolExecutionPrompt(trustedSender: boolean): string {
-  const workflow = "工作区流程：遵守当前工作区的指令和适用工作流，按用户明确限定的任务范围直接调用适当工具。权限不足时按实际工具结果说明，工作区指令本身不授予额外权限。";
+  const workflow = "工作区流程：遵守当前工作区的指令和适用工作流，按用户明确限定的任务范围直接调用适当工具。权限不足时按实际工具结果说明，工作区指令本身不授予额外权限。网页查询优先用已授权的 API 或浏览器扩展；连不上就说明阻碍，不接管桌面窗口。";
   if (trustedSender) return workflow;
   return `${workflow}\n\n受限模式工具调用：本地检索可直接进行；联网、隧道或系统凭据等操作，使用工具支持的原生参数（如 sandbox_permissions=require_escalated）提交实际命令。由工具处理是否可执行，按结果继续；历史拒绝只约束当时请求及明确拒绝的范围。账号认证失败、业务权限拒绝或来源白名单拦截不能通过提权、换账号或导出凭据绕过。`;
 }
