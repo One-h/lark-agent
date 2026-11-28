@@ -163,7 +163,7 @@ export async function listenRetainedExecutionHost(options: {
         || !timingSafeEqual(Buffer.from(call.resumeProof, "hex"), Buffer.from(proof(taskScope, call.sessionId), "hex"))))
         return send(422, { error: "cannot prove the original task session and workspace" });
       const policy = larkExecutionPolicy(cwd, call.trusted);
-      if (!engine || !engine.supportsPolicy(policy) || call.model !== null && !engine.descriptor.models.includes(call.model)) {
+      if (!engine || !engine.supportsPolicy(policy) || engine.descriptor.id === "codex" && call.model !== null && !engine.descriptor.models.includes(call.model)) {
         return send(422, { error: "engine cannot enforce requested execution policy" });
       }
       const duration = call.deadline ? Date.parse(call.deadline) - Date.now() : undefined;

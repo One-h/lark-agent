@@ -213,10 +213,12 @@ test("delegation and plain-text reviewer result survive a runtime restart", asyn
   for (const engine of engines) await t.test(engine, async t => {
     const f = fixture(t);
     f.loseStart();
-    const result = await f.service.command(origin, { ...dispatch, worker: { engine }, reviewer: { engine: "claude", criteria: "verify sources" } }, approved);
+    const model = engine === "codex" ? undefined : "provider/unlisted-model";
+    const result = await f.service.command(origin, { ...dispatch, worker: { engine, ...(model && { model }) }, reviewer: { engine: "claude", criteria: "verify sources", model: "provider/unlisted-reviewer" } }, approved);
     assert.match(taskId(result), /^[a-f0-9-]+$/);
     await tick(f);
     assert.equal(f.starts.length, 1);
+    assert.equal(f.starts[0].model, model ?? null);
     f.restart();
     f.finish(0, "Result: deliver\nResearch report");
     await tick(f);

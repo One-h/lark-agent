@@ -84,7 +84,8 @@ test("retained steering survives a new subscriber and settles before the termina
   const engine: ExecutionEngine = {
     descriptor: { id: "fixture", label: "Fixture", models: [] },
     supportsPolicy: () => true,
-    async open() {
+    async open({ model }) {
+      assert.equal(model, "provider/unlisted-model");
       return {
         id: "fixture-session",
         async run(_text, _signal, event) {
@@ -109,7 +110,7 @@ test("retained steering survives a new subscriber and settles before the termina
     const identity = { generation, id: "turn-one" };
     const attach = (afterSequence = 0) => recovered.call<Snapshot>({ ...identity, method: "attach", afterSequence });
     const steer = (inputId: string, text: string) => client.call<RetainedInputStatus>({ ...identity, method: "steer", inputId, text });
-    await client.call({ ...identity, method: "start", engineId: "fixture", text: "original", sessionId: null, model: null, trusted: true });
+    await client.call({ ...identity, method: "start", engineId: "fixture", text: "original", sessionId: null, model: "provider/unlisted-model", trusted: true });
     const active = await eventually(async () => {
       const snapshot = await attach();
       return snapshot.status.state === "active" ? snapshot : undefined;

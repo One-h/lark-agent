@@ -142,8 +142,9 @@ test("group and direct chat execution settings share the registry without mixing
     await oldDirect.started(); await f.complete(oldDirect.id);
     assert.equal((await read(group)).json().effective.engineId, "codex");
     assert.equal((await select(group, { engineId: "codex", model: "fixture-original-codex" })).statusCode, 200);
-    assert.equal((await select(group, { engineId: "fixture", model: "unlisted" })).statusCode, 409);
-    assert.equal((await select(group, { engineId: "fixture", model: "fixture-model[1m]" })).statusCode, 200);
+    assert.equal((await select(group, { engineId: "missing", model: "unlisted" })).statusCode, 409);
+    assert.equal((await select(group, { engineId: "fixture", model: "invalid model" })).statusCode, 400);
+    assert.equal((await select(group, { engineId: "fixture", model: "provider/unlisted-model[1m]" })).statusCode, 200);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: historical.event })).statusCode, 401);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${historical.row().id}/retry`, headers })).statusCode, 409);
     const blocked = await send(group, "cannot run", { sender_id: "ou_member" });
@@ -155,7 +156,7 @@ test("group and direct chat execution settings share the registry without mixing
     release!(); await waitForReply(first);
     assert.match(prompts[0], /Use only the fixture style/);
     assert.doesNotMatch(prompts[0], /historical group message/);
-    assert.deepEqual(opened[0], { engineId: "fixture", sessionId: null, model: "fixture-model[1m]", policy: larkExecutionPolicy(f.root, true) });
+    assert.deepEqual(opened[0], { engineId: "fixture", sessionId: null, model: "provider/unlisted-model[1m]", policy: larkExecutionPolicy(f.root, true) });
 
     assert.equal((await select(direct, { engineId: "another", model: null })).statusCode, 200);
     const dm = await send(direct, "first external direct turn");
@@ -222,8 +223,8 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     const select = (model: string) => f.runtime().app.inject({ method: "PUT", url: topicPath, headers, payload: { override: { engineId: "fixture", model } } });
     assert.equal((await f.runtime().app.inject({ url: topicPath })).statusCode, 401);
     const before = await f.message({ content: "private history not sent to the new engine" });
-    assert.equal((await select("not-registered")).statusCode, 409);
-    assert.equal((await select("fixture-model")).statusCode, 200);
+    assert.equal((await select("invalid model")).statusCode, 400);
+    assert.equal((await select("provider/unlisted-topic-model")).statusCode, 200);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: "/v1/messages", payload: before.event })).statusCode, 401);
     assert.equal((await f.runtime().app.inject({ method: "POST", url: `/v1/messages/${before.row().id}/retry`, headers })).statusCode, 409);
     const outside = await f.message({ thread_id: "omt_other", root_id: "om_other", mentions: mention });
@@ -271,7 +272,7 @@ test("topic engine routes are protected, isolated and persistent; live steering 
     const next = await f.message({ content: "continue after restart" });
     await until(() => prompts.length === 2);
     const policy = larkExecutionPolicy(f.root, true);
-    assert.deepEqual(opened, [{ sessionId: null, model: "fixture-model", policy }, { sessionId: "fixture-session-1", model: "fixture-next", policy }]);
+    assert.deepEqual(opened, [{ sessionId: null, model: "provider/unlisted-topic-model", policy }, { sessionId: "fixture-session-1", model: "fixture-next", policy }]);
     const cancellation = await f.runtime().app.inject({ method: "POST", url: `${topicPath}/cancel`, headers });
     assert.deepEqual(cancellation.json(), { requested: 1 });
     await until(() => next.row().codex_status === "failed");

@@ -95,7 +95,7 @@ createInterface({input:process.stdin}).on('line', line => {
 });
 `, { mode: 0o700 });
   const controller = new AbortController();
-  const engine = createClaudeExecutionEngine({ launcher, models: ["fixture"] });
+  const engine = createClaudeExecutionEngine({ launcher, models: [] });
   const policy = larkExecutionPolicy(cwd, true);
   const previousToken = process.env.LARK_AGENT_RUNTIME_TOKEN;
   const previousMcp = process.env.LARK_AGENT_MCP_TOKEN;

@@ -42,16 +42,16 @@ test("managed group creation validates, persists, configures and deduplicates wi
     const requestId = randomUUID();
     const input = { requestId, name: "  Example group  ",
       persona: { mode: "custom", name: "Fixture persona", instructions: "Respond concisely." },
-      execution: { engineId: "example", model: "fixture-model" } };
+      execution: { engineId: "example", model: "provider/unlisted-model" } };
     assert.equal((await runtime.app.inject({ url })).statusCode, 401);
     assert.equal((await runtime.app.inject({ method: "POST", url, payload: input })).statusCode, 401);
     assert.equal((await runtime.app.inject({ url, headers, remoteAddress: "192.0.2.1" })).statusCode, 401);
     assert.equal((await create({ ...input, ownerId: "ou_other" })).statusCode, 400);
     assert.equal((await create({ ...input, persona: { ...input.persona, instructions: "" } })).statusCode, 400);
-    assert.equal((await create({ ...input, execution: { ...input.execution, model: "missing" } })).statusCode, 400);
+    assert.equal((await create({ ...input, execution: { ...input.execution, model: "" } })).statusCode, 400);
     assert.equal((await create({ ...input, execution: { engineId: "missing", model: null } })).statusCode, 400);
     assert.equal((await create({ ...input, execution: { engineId: "default-only" } })).statusCode, 400);
-    assert.equal((await create({ ...input, execution: { engineId: "default-only", model: "not-in-catalog" } })).statusCode, 400);
+    assert.equal((await create({ ...input, execution: { engineId: "default-only", model: "" } })).statusCode, 400);
     assert.equal(calls.length, 0);
     assert.deepEqual((await list()).json().items, []);
     const pending = create(input);

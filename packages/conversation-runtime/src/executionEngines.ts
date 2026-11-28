@@ -14,6 +14,7 @@ export function larkExecutionPolicy(cwd: string, trustedSender: boolean): LarkEx
 export type ExecutionEngineDescriptor = {
   id: string;
   label: string;
+  // External engine model IDs are selector suggestions, not an admission allowlist.
   models: readonly string[];
 };
 
@@ -62,8 +63,6 @@ export class ExecutionEngineRegistry {
   }
 
   resolve(route: ExecutionEngineRoute): ExecutionEngine | undefined {
-    const engine = this.engines.get(route.engineId);
-    if (!engine || route.model !== null && !engine.descriptor.models.includes(route.model)) return;
-    return engine;
+    return this.engines.get(route.engineId);
   }
 }

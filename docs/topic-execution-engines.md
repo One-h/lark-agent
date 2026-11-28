@@ -24,8 +24,10 @@ operator-owned wrapper uses the supplied working directory and existing
 authentication; the runtime never installs a CLI or signs in at startup. The
 previous Claude pilot launcher and workspace settings are not used. An invalid
 launcher leaves only that engine unavailable. Each optional
-`LARK_AGENT_<ENGINE>_ACP_MODELS` value is a comma-separated allowlist of exact
-engine model IDs. Omit it to offer the engine's configured default only.
+`LARK_AGENT_<ENGINE>_ACP_MODELS` value is a comma-separated list of suggested
+engine model IDs for selectors. Explicit model IDs do not require registration;
+they are passed to the native engine, which must confirm the requested selection.
+Omit the list to advertise only the engine's configured default.
 
 The configured Codex workspace and sender trust settings also govern these engines.
 The ordinary launcher is used only for trusted senders. To admit other senders,
@@ -100,8 +102,8 @@ and a Markdown attachment for content that exceeds display limits.
 
 `GET` and `PUT /v1/chats/:chatId/topics/:threadId/execution` use the runtime
 token, as do `GET` and `PUT /v1/chats/:chatId/execution` for chat settings.
-A PUT accepts `{"override":{"engineId":"claude","model":null}}` or an
-allowlisted model ID in place of null. A null override inherits the group
+A PUT accepts `{"override":{"engineId":"claude","model":null}}` or a
+valid explicit model ID in place of null. A null override inherits the group
 selection for a topic, or restores the global Codex model for a chat.
 Choosing Codex at chat level updates the existing per-chat Codex model rather
 than creating a separate model setting. Selecting an external engine preserves

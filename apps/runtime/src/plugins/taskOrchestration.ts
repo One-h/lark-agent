@@ -221,7 +221,7 @@ export class TaskOrchestration {
     const engines = workspace && workspace !== host.workspace ? host.taskWorkspaces?.find(entry => entry.cwd === workspace)?.engines : host.engines;
     return host.workspace === this.options.workspace()
       && (engines ?? []).some(engine => engine.id === route.engine
-      && (trusted ? engine.trusted : engine.restricted) && (!route.model || engine.models.includes(route.model)));
+      && (trusted ? engine.trusted : engine.restricted) && (engine.id !== "codex" || !route.model || engine.models.includes(route.model)));
   }
 
   private spec(task: Task): Contract { return JSON.parse(task.spec) as Contract; }
