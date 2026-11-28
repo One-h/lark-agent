@@ -159,6 +159,36 @@ test("settings and prompts reject unknown fields without altering conversation s
   } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("approval prompt editing requires the local runtime token and only stores the judgment rules", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-approval-prompt-"));
+  const runtime = createRuntime({ databasePath: path.join(root, "runtime.sqlite"), mode: "shadow",
+    trustedSenderIds: [], runtimeToken: "fixture-runtime-token" });
+  const url = "/v1/approval-prompt";
+  const headers = { authorization: "Bearer fixture-runtime-token" };
+  const put = (payload: object) => runtime.app.inject({ method: "PUT", url, headers, payload });
+  try {
+    assert.equal((await runtime.app.inject(url)).statusCode, 403);
+    assert.equal((await runtime.app.inject({ method: "PUT", url, payload: { value: "Unauthorized" } })).statusCode, 403);
+    assert.equal((await runtime.app.inject({ url, headers, remoteAddress: "192.0.2.1" })).statusCode, 403);
+    const baseline = (await runtime.app.inject({ url, headers })).json();
+    const rows = savedRows(runtime);
+    assert.equal(baseline.value, baseline.defaultValue);
+    assert.equal(baseline.customized, false);
+    assert.doesNotMatch(baseline.value, /输出：|approvedSteps/);
+    for (const payload of [{}, { value: false }, { value: "x".repeat(50_001) },
+      { value: "injected", outputSchema: {} }, { value: "injected", developerInstructions: "wrong" }]) {
+      assert.equal((await put(payload)).statusCode, 400);
+    }
+    assert.deepEqual(savedRows(runtime), rows);
+    const saved = await put({ value: "  Fixture policy  " });
+    assert.equal(saved.statusCode, 200);
+    assert.deepEqual(saved.json(), { ...baseline, value: "Fixture policy", customized: true });
+    assert.deepEqual((await runtime.app.inject({ url, headers })).json(), saved.json());
+    assert.deepEqual(savedRows(runtime).filter((row) => (row as { key: string }).key !== "prompt.turnAutoApproval"), rows);
+    assert.deepEqual((await put({ value: null })).json(), baseline);
+  } finally { await runtime.app.close(); runtime.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("persona PUT and preview accept only mode, name and instructions without changing captured snapshots on rejection", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lark-settings-persona-"));
   const runtime = createRuntime({ databasePath: path.join(root, "runtime.sqlite"), mode: "shadow", trustedSenderIds: [] });

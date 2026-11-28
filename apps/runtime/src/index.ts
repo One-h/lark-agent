@@ -54,7 +54,7 @@ import { configureOwnerMentionAssist, reconcileOwnerMentionAssists, retryOwnerAs
   onOwnerAssistContextChanged, refreshOwnerAssistPolicies, cancelOwnerAssistPendingApprovals, drainOwnerAssistNotifications, activeOwnerAssistRequests, ownerMentionAssistSettings } from "@lark-agent/conversation-runtime";
 import { registerOwnerMentionAssistRoutes } from "./ownerMentionAssistRoutes.js";
 import { configuredOwnerMentionAssistBotIds } from "@lark-agent/conversation-runtime";
-import { configuredTurnAutoApprovalDataSources } from "@lark-agent/conversation-runtime";
+import { configuredTurnAutoApprovalDataSources, configuredTurnAutoApprovalPrompt, maxTurnAutoApprovalPromptChars, turnAutoApprovalPromptSetting } from "@lark-agent/conversation-runtime";
 import { topicNativeModeEnabled, resetTopicNativeEnrollmentEpoch } from "@lark-agent/conversation-runtime";
 import { approvalTask, deploymentOperationMatchesTask, configureAutoApprovalNotificationSender, retryPendingAutoApprovalNotifications, configureTurnApprovalReviewer, configuredTurnAutoApprovalModel, markTurnAutoApprovalApplied, reviewLarkTurnAutoApproval, type TurnApprovalReviewer, type AutoApprovalNotificationSender } from "@lark-agent/conversation-runtime";
 import { applyPlanAuthorization, approvalPlanSummary, currentApprovalPlan, currentApprovalPlanGrant,
@@ -1147,6 +1147,27 @@ export function createRuntime(config: RuntimeConfig & RuntimeAdapters) {
   app.post("/v1/contacts/sync", async () => syncLarkContactsFromCli());
   pluginHost.mount("stickers", () => mountStickerLibraryPlugin({ app, store, dataDirectory, authenticated, hasRuntimeToken: Boolean(config.runtimeToken) }));
   app.get("/v1/prompts", async () => { const custom = store.setting("prompt.larkAssistant", "").trim(); const defaultValue = defaultConfigurablePrompt("larkAssistant"); return { larkAssistant: custom || defaultValue, defaultLarkAssistant: defaultValue, customized: Boolean(custom) }; });
+  app.route({
+    method: ["GET", "PUT"],
+    url: "/v1/approval-prompt",
+    handler: async (request, reply) => {
+      reply.header("Cache-Control", "no-store");
+      if (!config.runtimeToken || !authenticated(request) || !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+        return reply.code(403).send({ error: "local runtime token required" });
+      }
+      if (request.method === "PUT") {
+        let value: unknown;
+        try {
+          value = strictSettingsObject(request.body, ["value"], "approval prompt").value;
+          if (value !== null && (typeof value !== "string" || value.length > maxTurnAutoApprovalPromptChars)) {
+            throw new Error("value must be null or a prompt up to 50000 characters");
+          }
+        } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
+        store.setSetting(turnAutoApprovalPromptSetting, typeof value === "string" ? value.trim() : "");
+      }
+      return configuredTurnAutoApprovalPrompt(store.db);
+    }
+  });
   app.put("/v1/prompts", async (request, reply) => {
     let payload: Record<string, unknown>;
     try {

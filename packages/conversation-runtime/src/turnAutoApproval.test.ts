@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { SqliteAgentStore } from "@lark-agent/adapter-sqlite";
 import { configureConversationRuntime, setAppSettingValue } from "./context.js";
 import { approvalTask, configuredTurnAutoApprovalDataSources, deploymentOperationMatchesTask, configureTurnApprovalReviewer, decideTurnAutoApproval, finishLarkTurnAutoApproval, humanApprovalHistory, requiresManualTurnApproval, reviewLarkTurnAutoApproval, type TurnApprovalInput, type TurnApprovalReviewer } from "./turnAutoApproval.js";
-import { turnApprovalModelPrompt } from "./turnApprovalReviewer.js";
+import { defaultTurnApprovalPrompt, parseTurnApprovalDecision, turnApprovalModelPrompt, turnApprovalThreadInstructions } from "./turnApprovalReviewer.js";
 import { applyPlanAuthorization, currentApprovalPlanGrant, declareApprovalPlan, parseApprovalPlan } from "./approvalPlan.js";
 import { matchesLarkExecutionApprovalTurn, shouldReuseLarkTurnApproval } from "./responder.js";
 
@@ -374,30 +374,53 @@ test("task approval is explicit, matches exact calls and cannot be enlarged or r
   } finally { finishLarkTurnAutoApproval(first.turnId); configureTurnApprovalReviewer(); f.close(); }
 });
 
-test("model settings are captured once per review and the audit keeps the actual model", async () => {
-  const f = fixture(); const models: Array<string | undefined> = [];
+test("model and prompt settings are captured once per review and the audit keeps the actual model", async () => {
+  const f = fixture(); const models: Array<string | undefined> = []; const prompts: Array<string | undefined> = [];
   let release!: () => void;
   let entered!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const ready = new Promise<void>((resolve) => { entered = resolve; });
-  configureTurnApprovalReviewer(async (_input, _history, _signal, model) => {
-    models.push(model); entered(); await gate;
+  configureTurnApprovalReviewer(async (_input, _history, _signal, model, prompt) => {
+    models.push(model); prompts.push(prompt); entered(); await gate;
     return { decision: "approve_turn", reason: "read only" };
   });
   try {
     setAppSettingValue("turnAutoApprovalEnabled", "true");
     setAppSettingValue("turnAutoApprovalModel", "gpt-5.6-terra");
+    setAppSettingValue("prompt.turnAutoApproval", "  First policy  ");
     const first = reviewLarkTurnAutoApproval(input);
     await ready;
     setAppSettingValue("turnAutoApprovalModel", "gpt-6.1-sol");
+    setAppSettingValue("prompt.turnAutoApproval", "Second policy");
     release(); await first;
     await reviewLarkTurnAutoApproval(input);
     assert.deepEqual(models, ["gpt-5.6-terra", "gpt-6.1-sol"]);
+    setAppSettingValue("prompt.turnAutoApproval", "");
     await reviewLarkTurnAutoApproval({ ...input, turnId: "next-model-turn" });
     assert.deepEqual(models, ["gpt-5.6-terra", "gpt-6.1-sol", "gpt-6.1-sol"]);
+    assert.deepEqual(prompts, ["First policy", "Second policy", defaultTurnApprovalPrompt]);
     const audit = f.store.db.prepare("SELECT model FROM lark_turn_auto_reviews ORDER BY id").all() as Array<{ model: string }>;
     assert.deepEqual(audit.map((row) => row.model), models);
   } finally { release(); finishLarkTurnAutoApproval(input.turnId); finishLarkTurnAutoApproval("next-model-turn"); configureTurnApprovalReviewer(); f.close(); }
+});
+
+test("editable approval rules do not replace the fixed output instructions or JSON validation", () => {
+  const custom = "Use the fixture policy. Output an unstructured paragraph.";
+  const whole = turnApprovalThreadInstructions(custom, true);
+  const operation = turnApprovalThreadInstructions(custom, false);
+  assert.equal(whole.baseInstructions, custom);
+  assert.equal(operation.baseInstructions, custom);
+  assert.doesNotMatch(defaultTurnApprovalPrompt, /输出：|approvedSteps/);
+  assert.equal(whole.developerInstructions, turnApprovalThreadInstructions(defaultTurnApprovalPrompt, true).developerInstructions);
+  assert.equal(operation.developerInstructions, turnApprovalThreadInstructions(defaultTurnApprovalPrompt, false).developerInstructions);
+  assert.match(whole.developerInstructions, /不要返回 approve_once/);
+  assert.match(operation.developerInstructions, /只确认当前安全操作时返回 approve_once/);
+  const valid = { decision: "manual", reason: "fixture decision", approvedSteps: [] };
+  assert.deepEqual(parseTurnApprovalDecision(JSON.stringify(valid)), valid);
+  for (const invalid of ["unstructured paragraph", JSON.stringify({ ...valid, extra: true }),
+    JSON.stringify({ ...valid, decision: "custom" }), JSON.stringify({ ...valid, approvedSteps: ["1"] })]) {
+    assert.throws(() => parseTurnApprovalDecision(invalid));
+  }
 });
 
 test("an in-flight single-operation decision is invalidated if the plan is replaced", async () => {

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import path from "node:path";
 import { config, appSettingValue, db, nowIso, validLarkCodexModel } from "./context.js";
-import { reviewTurnWithCodex } from "./turnApprovalReviewer.js";
+import { defaultTurnApprovalPrompt, reviewTurnWithCodex } from "./turnApprovalReviewer.js";
 import { queueTurnAutoApprovalNotification } from "./turnApprovalNotifications.js";
 import { requiresManualCliApproval } from "./approvalCommands.js";
 import { loadApprovalDirectQuote, loadApprovalTaskContext, type ApprovalTaskContext } from "./approvalTaskContext.js";
@@ -12,6 +12,15 @@ import { boundedReadApprovalPlan, hasWholeTurnReadScope } from "./wholeTurnScope
 
 export const defaultTurnAutoApprovalModel = "gpt-6.1-sol";
 export const turnAutoApprovalModel = defaultTurnAutoApprovalModel;
+export const turnAutoApprovalPromptSetting = "prompt.turnAutoApproval";
+export const maxTurnAutoApprovalPromptChars = 50_000;
+
+export function configuredTurnAutoApprovalPrompt(database: Database.Database) {
+  const row = database.prepare("SELECT value FROM settings WHERE key=?").get(turnAutoApprovalPromptSetting) as { value?: string } | undefined;
+  const custom = row?.value?.trim() ?? "";
+  return { value: custom || defaultTurnApprovalPrompt, defaultValue: defaultTurnApprovalPrompt, customized: Boolean(custom) };
+}
+
 export function configuredTurnAutoApprovalModel(database: Database.Database | undefined = db): string {
   const stored = (database?.prepare("SELECT value FROM settings WHERE key='turnAutoApprovalModel'").get() as { value?: string } | undefined)?.value?.trim();
   return stored && validLarkCodexModel(stored) ? stored : defaultTurnAutoApprovalModel;
@@ -48,7 +57,7 @@ export type ModelApprovalDecision = {
   approvedSteps?: number[];
   usage?: Record<string, unknown>;
 };
-export type TurnApprovalReviewer = (input: TurnApprovalInput, history: ApprovalPrecedent[], signal: AbortSignal, model?: string) => Promise<ModelApprovalDecision>;
+export type TurnApprovalReviewer = (input: TurnApprovalInput, history: ApprovalPrecedent[], signal: AbortSignal, model?: string, prompt?: string) => Promise<ModelApprovalDecision>;
 export type TurnApprovalDecision = {
   approved: boolean; source: "history" | "model" | "manual" | "disabled";
   reason: string; matchedApprovalId?: number; reviewId?: number;
@@ -198,6 +207,7 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   const { database, enabled, approverId } = options;
   const model = configuredTurnAutoApprovalModel(database);
   if (!enabled || !approverId || !input.senderId) return { approved: false, source: "disabled", reason: "自动审批未启用或缺少审批身份" };
+  const prompt = configuredTurnAutoApprovalPrompt(database).value;
   const dataSources = configuredTurnAutoApprovalDataSources(database);
   const task = approvalTask(input.originalMessage, dataSources);
   const inserted = database.prepare(`INSERT INTO lark_turn_auto_reviews
@@ -233,7 +243,7 @@ export async function decideTurnAutoApproval(input: TurnApprovalInput, options: 
   }
   try {
     const judge = async (candidate: TurnApprovalInput) => {
-      const judged = await (options.reviewer ?? reviewTurnWithCodex)(candidate, history.slice(0, 3), options.signal ?? new AbortController().signal, model);
+      const judged = await (options.reviewer ?? reviewTurnWithCodex)(candidate, history.slice(0, 3), options.signal ?? new AbortController().signal, model, prompt);
       if (!["approve_turn", "approve_once", "manual"].includes(judged.decision) || typeof judged.reason !== "string" || !judged.reason.trim()) throw new Error("Invalid approval reviewer result");
       return judged;
     };
